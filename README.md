@@ -29,12 +29,12 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
 
 ```bibtex
 @misc{teoh2026nextlatentpredictiontransformerslearn,
-    title   = {Next-Latent Prediction Transformers Learn Compact World Models}, 
+    title   = {Next-Latent Prediction Transformers Learn Compact World Models},
     author  = {Jayden Teoh and Manan Tomar and Kwangjun Ahn and Edward S. Hu and Tim Pearce and Pratyusha Sharma and Akshay Krishnamurthy and Riashat Islam and Alex Lamb and John Langford},
     year    = {2026},
     eprint  = {2511.05963},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url     = {https://arxiv.org/abs/2511.05963}, 
+    url     = {https://arxiv.org/abs/2511.05963},
 }
 ```

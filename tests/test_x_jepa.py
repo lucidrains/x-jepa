@@ -1,12 +1,28 @@
 import pytest
 import torch
-param = pytest.mark.parametrize
+from x_jepa.x_jepa import WorldModel, Transformer
 
-def test_x_jepa():
-    from x_jepa.x_jepa import WorldModel
+def test_world_model():
+    model = Transformer(
+        dim = 512,
+        depth = 4,
+        causal = True
+    )
 
-    state = torch.randn(10)
+    world_model = WorldModel(
+        state_encoder = torch.nn.Linear(128, 512),
+        action_encoder = torch.nn.Linear(64, 512),
+        model = model
+    )
 
-    model = WorldModel()
+    states = torch.randn(2, 10, 128)
+    actions = torch.randn(2, 10, 64)
 
-    pred = model(state)
+    loss = world_model(states, actions)
+
+    assert loss.ndim == 0
+    loss.backward()
+
+    # optimizer code
+
+    world_model.update() # maybe update ema
