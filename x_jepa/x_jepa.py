@@ -195,6 +195,6 @@ class WorldModel(Module):
 
         next_state_pred = self.state_transition(state_action_latents[:, :-1])
 
-        loss = F.smooth_l1_loss(next_state_pred, next_target_state_latents)
+        loss = F.smooth_l1_loss(next_state_pred, next_target_state_latents.detach())
 
         return loss
