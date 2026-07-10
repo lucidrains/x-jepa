@@ -191,9 +191,9 @@ class WorldModel(Module):
 
         # now we predict the next latent from (s_t, a_t) -> s_t+1
 
-        state_latents, action_latents = rearrange(latents, 'b (n sa) d -> sa b n d', sa = 2)
+        state_latents, action_latents = rearrange(latents[:, :-2], 'b (n sa) d -> sa b n d', sa = 2)
 
-        next_state_pred = state_latents[:, :-1] + self.state_transition((state_latents[:, :-1], action_latents[:, :-1]))
+        next_state_pred = state_latents + self.state_transition((state_latents, action_latents))
 
         loss = F.smooth_l1_loss(next_state_pred, next_target_state_latents.detach())
 
