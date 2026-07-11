@@ -5,7 +5,7 @@ from functools import partial
 import torch
 import torch.nn.functional as F
 from torch import nn, cat, stack, tensor, is_tensor, Tensor
-from torch.nn import Module, ModuleList, Linear
+from torch.nn import Module, ModuleList, Linear, RMSNorm, Sequential
 
 from einops import einsum, rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
@@ -48,7 +48,7 @@ class Attention(Module):
         dim_inner = dim_head * heads
         self.causal = causal
 
-        self.norm = nn.RMSNorm(dim) if prenorm else nn.Identity()
+        self.norm = RMSNorm(dim) if prenorm else nn.Identity()
 
         self.to_q = LinearNoBias(dim, dim_inner)
         self.to_kv = LinearNoBias(dim, dim_inner * 2)
@@ -99,7 +99,7 @@ def SwiGLUFeedForward(
 ):
     dim_inner = int(dim * expand_factor * 2 / 3)
     return nn.Sequential(
-        nn.RMSNorm(dim) if prenorm else nn.Identity(),
+        RMSNorm(dim) if prenorm else nn.Identity(),
         Linear(dim, dim_inner * 2),
         SwiGLUGate(),
         Linear(dim_inner, dim)
@@ -116,8 +116,7 @@ class Transformer(Module):
         causal = True,
         dim_head = 64,
         heads = 8,
-        ff_expand_factor = 4.,
-        final_norm = False
+        ff_expand_factor = 4.
     ):
         super().__init__()
         self.dim = dim
@@ -133,8 +132,6 @@ class Transformer(Module):
 
         self.layers = layers
 
-        self.norm = nn.RMSNorm(dim) if final_norm else nn.Identity()
-
     def forward(
         self,
         tokens
@@ -144,7 +141,7 @@ class Transformer(Module):
             tokens = attn(tokens) + tokens
             tokens = ff(tokens) + tokens
 
-        return self.norm(tokens)
+        return tokens
 
 # classes
 
@@ -154,30 +151,54 @@ class WorldModel(Module):
         *,
         state_encoder: Module,
         action_encoder: Module,
+        action_decoder: Module,
         model: Module,
         state_transition: Module | None = None,
-        ema_beta = 0.95
+        dim_action_latent = None,
+        dim_state_latent = None,
+        ema_beta = 0.95,
+        action_recon_loss_weight = 1.
     ):
         super().__init__()
 
+        # dimensions
+
+        dim = model.dim
+        dim_state_latent = default(dim_state_latent, dim)
+        dim_action_latent = default(dim_action_latent, dim)
+
+        self.dim_state_latent = dim_state_latent
+        self.dim_action_latent = dim_action_latent
+
+        # state and action encoder / decoder
+
         self.state_encoder = state_encoder
+
         self.action_encoder = action_encoder
+        self.action_decoder = action_decoder
 
         if not exists(state_transition):
             # following Teoh, learn the residual with a 3 layer mlp
 
-            dim = model.dim
-
-            state_transition = MLP(dim * 2, *((dim * 4,) * 2), dim)
+            state_transition = MLP(dim_state_latent + dim_action_latent, *((dim * 2,) * 2), dim)
 
         self.state_transition = state_transition
         self.model = model
+
+        # projection to latents
+
+        self.to_state_latent = Sequential(RMSNorm(dim), LinearNoBias(dim, dim_state_latent), nn.Tanh())
+        self.to_action_latent = Sequential(RMSNorm(dim), LinearNoBias(dim, dim_action_latent), nn.Tanh())
 
         # in my experiments, EMA model still outperforms this hyped sigreg regularization.. but i may be seeing an improvement with EMA + sigreg, so lets just allow for all possibilities.
 
         self.ema_model = EMA(model, beta = ema_beta)
 
         self.ema_state_transition = EMA(state_transition, beta = ema_beta)
+
+        # loss related
+
+        self.action_recon_loss_weight = action_recon_loss_weight
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
@@ -201,12 +222,14 @@ class WorldModel(Module):
         elite_frac = 0.1,
         generations = 5,
         eps = 1e-5,
-        clamp_state_latent_to_range = True
+        clamp_state_latent_to_range = True,
+        return_action_latent = False
     ):
         device = self.device
 
         batch = states.shape[0]
         state_len, action_len = states.shape[1], actions.shape[1]
+        dim_action_latent = self.dim_action_latent
 
         assert action_len == (state_len - 1)
         assert generations > 0
@@ -221,9 +244,12 @@ class WorldModel(Module):
 
         tokens = rearrange([state_tokens, action_tokens], 'sa b n d -> b (n sa) d')
 
-        latents = self.ema_model(tokens).tanh()
+        embeds = self.ema_model(tokens)
 
-        state_latents = latents[:, -2] # (b d)
+        state_embeds = embeds[:, -2] # (b d)
+
+        state_latents = self.to_state_latent(state_embeds)
+
         state_latents = repeat(state_latents, 'b d -> b p d', p = pop_size)
 
         # start with naive cross entropy method
@@ -235,7 +261,7 @@ class WorldModel(Module):
 
         dim_latent = state_latents.shape[-1]
 
-        shape = (batch, 1, horizon, dim_latent)
+        shape = (batch, 1, horizon, dim_action_latent)
 
         means = torch.rand(shape, device = device) * 2. - 1.
         stds = torch.rand(shape, device = device)
@@ -247,7 +273,7 @@ class WorldModel(Module):
 
             # instantiate population
 
-            action_latents = means + stds * torch.randn((batch, pop_size, horizon, dim_latent), device = device)
+            action_latents = means + stds * torch.randn((batch, pop_size, horizon, dim_action_latent), device = device)
             action_latents.clamp_(-1., 1.)
 
             pred_state_latents = []
@@ -291,9 +317,16 @@ class WorldModel(Module):
 
         # return the top winner
 
-        winner = fittest_action_latents[:, 0]
+        winning_action_latents = fittest_action_latents[:, 0]
 
-        return winner
+        decoded_actions = self.action_decoder(winning_action_latents)
+
+        # return
+
+        if not return_action_latent:
+            return decoded_actions
+
+        return decoded_actions, winning_action_latents
 
     def forward(
         self,
@@ -302,6 +335,8 @@ class WorldModel(Module):
     ):
         state_len, action_len = states.shape[1], actions.shape[1]
         assert action_len in {state_len, state_len - 1}
+
+        orig_actions = actions
 
         actions = pad_right_at_dim_to(actions, state_len, dim = 1)
 
@@ -320,23 +355,25 @@ class WorldModel(Module):
 
         # we will follow Teoh et al's lead and use the post-norm space as the latent
 
-        latents = self.model(tokens)
+        embeds = self.model(tokens)
 
-        target_latents = self.ema_model(tokens)
+        target_embeds = self.ema_model(tokens)
 
-        # bound the latents to -1. to 1., shown to work adequately in dreamer4
+        # split out the state and action embeds
 
-        latents, target_latents = map(torch.tanh, (latents, target_latents))
+        target_state_embeds, _ = rearrange(target_embeds, 'b (n sa) d -> sa b n d', sa = 2)
 
-        # split out the state and action latents
+        next_target_state_embeds = target_state_embeds[:, 1:]
 
-        target_state_latents, _ = rearrange(target_latents, 'b (n sa) d -> sa b n d', sa = 2)
-
-        next_target_state_latents = target_state_latents[:, 1:]
+        next_target_state_latents = self.to_state_latent(next_target_state_embeds)
 
         # now we predict the next latent from (s_t, a_t) -> s_t+1
 
-        state_latents, action_latents = rearrange(latents[:, :-2], 'b (n sa) d -> sa b n d', sa = 2)
+        state_embeds, action_embeds = rearrange(embeds[:, :-2], 'b (n sa) d -> sa b n d', sa = 2)
+
+        state_latents = self.to_state_latent(state_embeds)
+
+        action_latents = self.to_action_latent(action_embeds)
 
         # prediction
 
@@ -346,4 +383,22 @@ class WorldModel(Module):
 
         loss = F.smooth_l1_loss(next_state_pred, next_target_state_latents.detach())
 
-        return loss
+        # action decoder
+
+        decoded_actions = self.action_decoder(action_latents)
+
+        action_recon_loss = F.mse_loss(
+            orig_actions,
+            decoded_actions[:, :action_len]
+        )
+
+        # losses
+
+        total_loss = (
+            loss +
+            action_recon_loss * self.action_recon_loss_weight
+        )
+
+        loss_breakdown = (loss, action_recon_loss)
+
+        return total_loss, loss_breakdown

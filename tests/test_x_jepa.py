@@ -1,5 +1,6 @@
 import pytest
 import torch
+from torch import nn
 from x_jepa.x_jepa import WorldModel, Transformer
 
 from einops import reduce
@@ -12,15 +13,17 @@ def test_world_model():
     )
 
     world_model = WorldModel(
-        state_encoder = torch.nn.Linear(128, 512),
-        action_encoder = torch.nn.Linear(64, 512),
+        state_encoder = nn.Linear(128, 512),
+        action_encoder = nn.Linear(20, 512),
+        action_decoder = nn.Linear(32, 20),
+        dim_action_latent = 32,
         model = model
     )
 
     states = torch.randn(2, 10, 128)
-    actions = torch.randn(2, 9, 64)
+    actions = torch.randn(2, 9, 20)
 
-    loss = world_model(states, actions)
+    loss, _ = world_model(states, actions)
 
     assert loss.ndim == 0
     loss.backward()
@@ -35,4 +38,4 @@ def test_world_model():
 
     planned_actions = world_model.plan(states[:, :2], actions[:, :1], fitness_fn, horizon = 5)
 
-    assert planned_actions.shape == (2, 5, 512)
+    assert planned_actions.shape == (2, 5, 20)
