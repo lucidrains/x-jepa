@@ -1,6 +1,6 @@
 [project]
 name = "x-jepa"
-version = "0.0.5"
+version = "0.0.6"
 description = "Explorations into JEPA"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -29,7 +29,7 @@ dependencies = [
     "einops>=0.8.1",
     "ema-pytorch",
     "torch>=2.4",
-    "torch-einops-utils>=0.1.0",
+    "torch-einops-utils>=0.1.7",
     "x-mlps-pytorch"
 ]
 

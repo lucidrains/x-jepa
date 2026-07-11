@@ -1,17 +1,24 @@
 from __future__ import annotations
+from typing import Callable
 from functools import partial
 
 import torch
-from torch import nn, stack
 import torch.nn.functional as F
+from torch import nn, cat, stack, tensor, is_tensor, Tensor
 from torch.nn import Module, ModuleList, Linear
 
-from einops import einsum, rearrange
+from einops import einsum, rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 
 from ema_pytorch import EMA
 
 from x_mlps_pytorch import MLP
+
+from torch_einops_utils import (
+    pad_right_at_dim_to,
+    temp_eval,
+    batched_index_select
+)
 
 # constants
 
@@ -169,14 +176,133 @@ class WorldModel(Module):
 
         self.ema_model = EMA(model, beta = ema_beta)
 
+        self.ema_state_transition = EMA(state_transition, beta = ema_beta)
+
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
+    @property
+    def device(self):
+        self.zero.device
+
     def update(self):
         self.ema_model.update()
+        self.ema_state_transition.update()
+
+    @torch.no_grad()
+    @temp_eval
+    def plan(
+        self,
+        states,
+        actions,
+        fitness_fn: Callable[[Tensor], Tensor],
+        horizon = 1,
+        pop_size = 1024,
+        elite_frac = 0.1,
+        generations = 5,
+        eps = 1e-5
+    ):
+        device = self.device
+
+        batch = states.shape[0]
+        state_len, action_len = states.shape[1], actions.shape[1]
+
+        assert action_len == (state_len - 1)
+        assert generations > 0
+        assert horizon >= 1
+
+        actions = pad_right_at_dim_to(actions, state_len, dim = 1)
+
+        # get the state and action latents
+
+        state_tokens = self.state_encoder(states)
+        action_tokens = self.action_encoder(actions)
+
+        tokens = rearrange([state_tokens, action_tokens], 'sa b n d -> b (n sa) d')
+
+        latents = self.ema_model(tokens).tanh()
+
+        state_latents = latents[:, -2] # (b d)
+        state_latents = repeat(state_latents, 'b d -> b p d', p = pop_size)
+
+        # start with naive cross entropy method
+
+        # means and std
+
+        num_elites = int(elite_frac * pop_size)
+        assert num_elites >= 1
+
+        dim_latent = state_latents.shape[-1]
+
+        shape = (batch, 1, horizon, dim_latent)
+
+        means = torch.rand(shape, device = device) * 2. - 1.
+        stds = torch.rand(shape, device = device)
+
+        # iterate
+
+        for generation in range(generations):
+            is_last = generation == generations - 1
+
+            # instantiate population
+
+            action_latents = means + stds * torch.randn((batch, pop_size, horizon, dim_latent), device = device)
+            action_latents.clamp_(-1., 1.)
+
+            pred_state_latents = []
+
+            # step through the learnt world model
+
+            step_state_latents = state_latents
+
+            for step_action_latents in action_latents.unbind(dim = 2):
+
+                step_residual = self.ema_state_transition((step_state_latents, step_action_latents))
+
+                step_state_latents = step_state_latents + step_residual
+
+                pred_state_latents.append(step_state_latents)
+
+            pred_state_latents = rearrange(pred_state_latents, 'h b p d -> b p h d')
+
+            # evaluate
+
+            fitnesses = fitness_fn(pred_state_latents) # (b p)
+
+            # select the fittest
+
+            topk = num_elites if not is_last else 1
+
+            elite_indices = fitnesses.topk(topk, largest = True, dim = -1).indices
+
+            # select the elites
+
+            fittest_action_latents = batched_index_select(action_latents, elite_indices, dim = 1)
+
+            if not is_last:
+                means = reduce(fittest_action_latents, 'b p h d -> b 1 h d', 'mean')
+
+                stds = reduce(fittest_action_latents, 'b p h d -> b 1 h d', partial(torch.std, unbiased = False))
+                stds = stds.clamp_min(eps)
+
+        # return the top winner
+
+        winner = fittest_action_latents[:, 0]
+
+        return winner
 
     def forward(
         self,
         states,
         actions
     ):
+        state_len, action_len = states.shape[1], actions.shape[1]
+        assert action_len in {state_len, state_len - 1}
+
+        actions = pad_right_at_dim_to(actions, state_len, dim = 1)
+
+        # handle last action not being given
+
+        # encode the states and actions, todo: do mixture of transformers, a la VLAs
 
         state_tokens = self.state_encoder(states)
         action_tokens = self.action_encoder(actions)
@@ -193,6 +319,10 @@ class WorldModel(Module):
 
         target_latents = self.ema_model(tokens)
 
+        # bound the latents to -1. to 1., shown to work adequately in dreamer4
+
+        latents, target_latents = map(torch.tanh, (latents, target_latents))
+
         # split out the state and action latents
 
         target_state_latents, _ = rearrange(target_latents, 'b (n sa) d -> sa b n d', sa = 2)
@@ -203,7 +333,11 @@ class WorldModel(Module):
 
         state_latents, action_latents = rearrange(latents[:, :-2], 'b (n sa) d -> sa b n d', sa = 2)
 
-        next_state_pred = state_latents + self.state_transition((state_latents, action_latents))
+        # prediction
+
+        pred_residual = self.state_transition((state_latents, action_latents))
+
+        next_state_pred = state_latents + pred_residual
 
         loss = F.smooth_l1_loss(next_state_pred, next_target_state_latents.detach())
 
