@@ -116,7 +116,8 @@ class Transformer(Module):
         causal = True,
         dim_head = 64,
         heads = 8,
-        ff_expand_factor = 4.
+        ff_expand_factor = 4.,
+        final_norm = False
     ):
         super().__init__()
         self.dim = dim
@@ -132,7 +133,7 @@ class Transformer(Module):
 
         self.layers = layers
 
-        self.norm = nn.RMSNorm(dim)
+        self.norm = nn.RMSNorm(dim) if final_norm else nn.Identity()
 
     def forward(
         self,
