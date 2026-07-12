@@ -1,11 +1,16 @@
 import pytest
+param = pytest.mark.parametrize
+
 import torch
 from torch import nn
 from x_jepa.x_jepa import WorldModel, Transformer
 
 from einops import reduce
 
-def test_world_model():
+@param('use_goal', (False, True))
+def test_world_model(
+    use_goal
+):
     model = Transformer(
         dim = 512,
         depth = 4,
@@ -34,8 +39,13 @@ def test_world_model():
 
     # planning
 
-    fitness_fn = lambda pred_state_latents: reduce(pred_state_latents, 'b p ... -> b p', 'sum')
+    if use_goal:
+        goal_state = torch.randn(2, 128)
+        plan_kwargs = dict(goal_state = goal_state)
+    else:
+        fitness_fn = lambda pred_state_latents: reduce(pred_state_latents, 'b p ... -> b p', 'sum')
+        plan_kwargs = dict(fitness_fn = fitness_fn)
 
-    planned_actions = world_model.plan(states[:, :2], actions[:, :1], fitness_fn, horizon = 5)
+    planned_actions = world_model.plan(states[:, :2], actions[:, :1], horizon = 5, **plan_kwargs)
 
     assert planned_actions.shape == (2, 5, 20)

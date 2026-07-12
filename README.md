@@ -38,3 +38,13 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
     url     = {https://arxiv.org/abs/2511.05963},
 }
 ```
+
+```bibtex
+@inproceedings{saravanos2026learningtooptimize,
+    title   = {Learning-to-Optimize via Deep Unfolded Flows},
+    author  = {Augustinos D Saravanos and Oswin So and H M Sabbir Ahmad and Chuchu Fan},
+    booktitle = {Forty-third International Conference on Machine Learning},
+    year    = {2026},
+    url     = {https://openreview.net/forum?id=ZOtOq7hxJP}
+}
+```

@@ -157,7 +157,8 @@ class WorldModel(Module):
         dim_action_latent = None,
         dim_state_latent = None,
         ema_beta = 0.95,
-        action_recon_loss_weight = 1.
+        action_recon_loss_weight = 1.,
+        next_encoded_state_pred_loss_weight = 1.
     ):
         super().__init__()
 
@@ -185,6 +186,10 @@ class WorldModel(Module):
         self.state_transition = state_transition
         self.model = model
 
+        # the predictive head for goals
+
+        self.to_next_encoded_state_pred = MLP(dim_state_latent + dim_action_latent, *((dim * 2,) * 2), dim)
+
         # projection to latents
 
         self.to_state_latent = Sequential(RMSNorm(dim), LinearNoBias(dim, dim_state_latent), nn.Tanh())
@@ -194,19 +199,24 @@ class WorldModel(Module):
 
         self.ema_model = EMA(model, beta = ema_beta)
 
+        self.ema_state_encoder = EMA(state_encoder, beta = ema_beta)
+
         self.ema_state_transition = EMA(state_transition, beta = ema_beta)
 
         # loss related
 
         self.action_recon_loss_weight = action_recon_loss_weight
 
+        self.next_encoded_state_pred_loss_weight = next_encoded_state_pred_loss_weight
+
         self.register_buffer('zero', tensor(0.), persistent = False)
 
     @property
     def device(self):
-        self.zero.device
+        return self.zero.device
 
     def update(self):
+        self.ema_state_encoder.update()
         self.ema_model.update()
         self.ema_state_transition.update()
 
@@ -216,7 +226,9 @@ class WorldModel(Module):
         self,
         states,
         actions,
-        fitness_fn: Callable[[Tensor], Tensor],
+        fitness_fn: Callable[[Tensor], Tensor] | None = None,
+        goal_state: Tensor | None = None,
+        goal_dist_fn: Callable[[Tensor, Tensor], Tensor] | None = None,
         horizon = 1,
         pop_size = 1024,
         elite_frac = 0.1,
@@ -231,6 +243,7 @@ class WorldModel(Module):
         state_len, action_len = states.shape[1], actions.shape[1]
         dim_action_latent = self.dim_action_latent
 
+        assert exists(fitness_fn) ^ exists(goal_state)
         assert action_len == (state_len - 1)
         assert generations > 0
         assert horizon >= 1
@@ -277,12 +290,15 @@ class WorldModel(Module):
             action_latents.clamp_(-1., 1.)
 
             pred_state_latents = []
+            pred_next_encoded_states = []
 
             # step through the learnt world model
 
             step_state_latents = state_latents
 
             for step_action_latents in action_latents.unbind(dim = 2):
+
+                # state transition
 
                 step_residual = self.ema_state_transition((step_state_latents, step_action_latents))
 
@@ -293,11 +309,30 @@ class WorldModel(Module):
 
                 pred_state_latents.append(step_state_latents)
 
+                # encoded state for goal
+
+                pred_next_encoded_state = self.to_next_encoded_state_pred((step_state_latents, step_action_latents))
+
+                pred_next_encoded_states.append(pred_next_encoded_state)
+
             pred_state_latents = rearrange(pred_state_latents, 'h b p d -> b p h d')
+
+            pred_next_encoded_states = rearrange(pred_next_encoded_states, 'h b p d -> b p h d')
 
             # evaluate
 
-            fitnesses = fitness_fn(pred_state_latents) # (b p)
+            if exists(goal_state):
+                encoded_goal = self.ema_state_encoder(goal_state)
+                encoded_goal = rearrange(encoded_goal, 'b d -> b 1 1 d')
+
+                goal_dist_fn = default(goal_dist_fn, partial(F.smooth_l1_loss, reduction = 'none'))
+
+                distance_to_goal =  goal_dist_fn(pred_next_encoded_states, encoded_goal)
+                distance_to_goal = reduce(distance_to_goal, 'b p h d -> b p', 'sum')
+
+                fitnesses = -distance_to_goal
+            else:
+                fitnesses = fitness_fn(pred_state_latents) # (b p)
 
             # select the fittest
 
@@ -392,13 +427,22 @@ class WorldModel(Module):
             decoded_actions[:, :action_len]
         )
 
+        # goal prediction head - cannot use the next state, as the encoded goal does not know the past sequence that led to it
+
+        pred_next_encoded_state = self.to_next_encoded_state_pred((state_latents, action_latents))
+
+        next_encoded_state = self.ema_state_encoder(states)
+
+        next_encoded_state_pred_loss = F.smooth_l1_loss(pred_next_encoded_state, next_encoded_state[:, 1:])
+
         # losses
 
         total_loss = (
             loss +
-            action_recon_loss * self.action_recon_loss_weight
+            action_recon_loss * self.action_recon_loss_weight +
+            next_encoded_state_pred_loss * self.next_encoded_state_pred_loss_weight
         )
 
-        loss_breakdown = (loss, action_recon_loss)
+        loss_breakdown = (loss, action_recon_loss, next_encoded_state_pred_loss)
 
         return total_loss, loss_breakdown
