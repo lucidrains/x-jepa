@@ -4,6 +4,7 @@ from functools import partial
 
 import torch
 import torch.nn.functional as F
+from torch.distributions import Beta
 from torch import nn, cat, stack, tensor, is_tensor, Tensor
 from torch.nn import Module, ModuleList, Linear, RMSNorm, Sequential
 
@@ -116,7 +117,8 @@ class Transformer(Module):
         causal = True,
         dim_head = 64,
         heads = 8,
-        ff_expand_factor = 4.
+        ff_expand_factor = 4.,
+        final_norm = False
     ):
         super().__init__()
         self.dim = dim
@@ -132,6 +134,8 @@ class Transformer(Module):
 
         self.layers = layers
 
+        self.final_norm = nn.RMSNorm(dim) if final_norm else nn.Identity()
+
     def forward(
         self,
         tokens
@@ -141,7 +145,7 @@ class Transformer(Module):
             tokens = attn(tokens) + tokens
             tokens = ff(tokens) + tokens
 
-        return tokens
+        return self.final_norm(tokens)
 
 # classes
 
@@ -157,8 +161,13 @@ class WorldModel(Module):
         dim_action_latent = None,
         dim_state_latent = None,
         ema_beta = 0.95,
+        bc_model: Module | None = None,
+        dim_action = None,
+        continuous_actions = True,
+        action_eps = 1e-5,
         action_recon_loss_weight = 1.,
-        next_encoded_state_pred_loss_weight = 1.
+        next_encoded_state_pred_loss_weight = 1.,
+        bc_loss_weight = 1.
     ):
         super().__init__()
 
@@ -203,11 +212,30 @@ class WorldModel(Module):
 
         self.ema_state_transition = EMA(state_transition, beta = ema_beta)
 
+        # actor / behavior clone
+
+        self.has_bc = exists(bc_model) and exists(dim_action) and bc_loss_weight > 0.
+
+        self.bc_state_encoder = MLP(dim_state_latent + dim, dim)
+        self.bc_action_encoder = MLP(dim_action_latent + dim, dim)
+
+        self.bc_model = bc_model
+
+        self.to_next_action_pred = None
+
+        if self.has_bc:
+            dim_action_param = (dim_action * 2) if continuous_actions else dim_action
+            self.to_next_action_pred = LinearNoBias(dim, dim_action_param)
+
+        self.continuous_actions = continuous_actions
+        self.action_eps = action_eps
+
         # loss related
 
         self.action_recon_loss_weight = action_recon_loss_weight
 
         self.next_encoded_state_pred_loss_weight = next_encoded_state_pred_loss_weight
+        self.bc_loss_weight = bc_loss_weight
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
@@ -422,10 +450,18 @@ class WorldModel(Module):
 
         decoded_actions = self.action_decoder(action_latents)
 
-        action_recon_loss = F.mse_loss(
-            orig_actions,
-            decoded_actions[:, :action_len]
-        )
+        recon_orig_actions = orig_actions[:, :decoded_actions.shape[1]]
+
+        if self.continuous_actions:
+            action_recon_loss = F.mse_loss(
+                recon_orig_actions,
+                decoded_actions
+            )
+        else:
+            action_recon_loss = F.cross_entropy(
+                rearrange(decoded_actions, 'b n c -> b c n'),
+                recon_orig_actions
+            )
 
         # goal prediction head - cannot use the next state, as the encoded goal does not know the past sequence that led to it
 
@@ -437,14 +473,53 @@ class WorldModel(Module):
 
         next_encoded_state_pred_loss = F.smooth_l1_loss(pred_next_encoded_state, next_ema_encoded_state_target.detach())
 
+        # maybe behavior clone
+
+        bc_loss = self.zero
+
+        if self.has_bc:
+            bc_encoded_states = self.bc_state_encoder(cat((state_tokens[:, :-1], state_latents.detach()), dim = -1))
+            bc_encoded_actions = self.bc_action_encoder(cat((action_tokens[:, :-1], action_latents.detach()), dim = -1))
+
+            bc_tokens = rearrange([bc_encoded_states, bc_encoded_actions], 'sa b n d -> b (n sa) d')
+
+            bc_embed = self.bc_model(bc_tokens)
+
+            bc_state_embed, _ = rearrange(bc_embed, 'b (n sa) d -> sa b n d', sa = 2)
+
+            next_action_pred = self.to_next_action_pred(bc_state_embed)
+
+            # log probs
+
+            next_actions = orig_actions[:, 1:]
+            next_action_pred = next_action_pred[:, :next_actions.shape[1]]
+
+            if self.continuous_actions:
+                # use unimodal beta
+
+                alpha, beta = rearrange(next_action_pred, 'b n (alpha_beta na) -> alpha_beta b n na', alpha_beta = 2)
+                alpha = F.softplus(alpha) + self.action_eps
+                beta = F.softplus(beta) + self.action_eps
+
+                distr = Beta(alpha, beta)
+                next_actions = next_actions.clamp(self.action_eps, 1. - self.action_eps)
+
+                log_probs = distr.log_prob(next_actions).sum(dim = -1)
+
+                bc_loss = -log_probs.mean()
+
+            else:
+                bc_loss = F.cross_entropy(rearrange(next_action_pred, 'b n c -> b c n'), next_actions)
+
         # losses
 
         total_loss = (
             loss +
             action_recon_loss * self.action_recon_loss_weight +
-            next_encoded_state_pred_loss * self.next_encoded_state_pred_loss_weight
+            next_encoded_state_pred_loss * self.next_encoded_state_pred_loss_weight +
+            bc_loss * self.bc_loss_weight
         )
 
-        loss_breakdown = (loss, action_recon_loss, next_encoded_state_pred_loss)
+        loss_breakdown = (loss, action_recon_loss, next_encoded_state_pred_loss, bc_loss)
 
         return total_loss, loss_breakdown
