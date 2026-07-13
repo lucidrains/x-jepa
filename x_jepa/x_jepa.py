@@ -684,8 +684,7 @@ class WorldModel(Module):
 
             # log probs
 
-            next_actions = orig_actions[:, 1:]
-            next_action_pred = next_action_pred[:, :next_actions.shape[1]]
+            next_actions = orig_actions[:, :next_action_pred.shape[1]]
 
             if self.continuous_actions:
                 # use unimodal beta
