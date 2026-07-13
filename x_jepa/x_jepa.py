@@ -21,7 +21,9 @@ from x_mlps_pytorch import MLP
 from torch_einops_utils import (
     pad_right_at_dim_to,
     temp_eval,
-    batched_index_select
+    batched_index_select,
+    tree_map_tensor,
+    pack_with_inverse
 )
 
 from x_jepa.regularizers import sigreg_loss, SigReg, uniform_wasserstein_loss
@@ -77,6 +79,8 @@ class Attention(Module):
         self.to_q = LinearNoBias(dim, dim_inner)
         self.to_kv = LinearNoBias(dim, dim_inner * 2)
 
+        self.to_gates = LinearNoBias(dim, heads)
+
         self.split_heads = Rearrange('b n (h d) -> b h n d', d = dim_head)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
@@ -106,8 +110,46 @@ class Attention(Module):
 
         out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
 
+        gates = self.to_gates(tokens)
+        out = out * rearrange(gates, 'b n h -> b h n 1').sigmoid()
+
         out = self.merge_heads(out)
         return self.to_out(out)
+
+class AttentionResidual(Module):
+    def __init__(
+        self,
+        dim
+    ):
+        super().__init__()
+        self.scale = dim ** -0.5
+
+        self.to_query = LinearNoBias(dim, dim)
+        self.norm_keys = RMSNorm(dim)
+
+    def forward(
+        self,
+        hiddens
+    ):
+        if isinstance(hiddens, list):
+            hiddens = stack(hiddens)
+
+        hiddens, unpack = pack_with_inverse(hiddens, 'l * d')
+
+        last_layer_output = hiddens[-1]
+
+        # cross attention
+
+        queries = self.to_query(last_layer_output)
+        keys = self.norm_keys(hiddens)
+        values = hiddens
+
+        sim = einsum(queries, keys, 'm d, l m d -> m l') * self.scale
+        attn = sim.softmax(dim = -1)
+
+        out = einsum(attn, values, 'm l, l m d -> m d')
+
+        return unpack(out, '* d')
 
 # feedforward
 
@@ -149,23 +191,34 @@ class Transformer(Module):
 
         for _ in range(depth):
             attn = Attention(dim = dim, dim_head = dim_head, heads = heads, causal = causal)
-
+            attn_res = AttentionResidual(dim = dim)
             ff = SwiGLUFeedForward(dim = dim, expand_factor = ff_expand_factor)
 
-            layers.append(ModuleList([attn, ff]))
+            layers.append(ModuleList([attn_res, attn, ff]))
 
         self.layers = layers
 
     def forward(
         self,
-        tokens
+        tokens,
+        prev_hiddens = None,
+        return_hiddens = False
     ):
+        layer_hiddens = list(default(prev_hiddens, []))
+        layer_hiddens.append(tokens)
 
-        for attn, ff in self.layers:
+        for attn_res, attn, ff in self.layers:
             tokens = attn(tokens) + tokens
             tokens = ff(tokens) + tokens
 
-        return tokens
+            layer_hiddens.append(tokens)
+
+            tokens = attn_res(layer_hiddens)
+
+        if not return_hiddens:
+            return tokens
+
+        return tokens, layer_hiddens
 
 # classes
 
@@ -183,6 +236,7 @@ class WorldModel(Module):
         dim_state_latent = None,
         ema_beta = 0.95,
         bc_model: Module | None = None,
+        pass_world_model_hiddens_to_actor = True,
         dim_action = None,
         continuous_actions = True,
         action_eps = 1e-5,
@@ -282,6 +336,7 @@ class WorldModel(Module):
         self.bc_action_encoder = MLP(dim_transition_action_input + dim, dim)
 
         self.bc_model = bc_model
+        self.pass_world_model_hiddens_to_actor = pass_world_model_hiddens_to_actor
 
         self.to_next_action_pred = None
 
@@ -517,7 +572,7 @@ class WorldModel(Module):
 
         # we will follow Teoh et al's lead and use the post-norm space as the latent
 
-        embeds = self.model(tokens)
+        embeds, world_model_hiddens = self.model(tokens, return_hiddens = True)
 
         target_embeds = self.ema_model(tokens)
 
@@ -596,7 +651,13 @@ class WorldModel(Module):
 
             bc_tokens = rearrange([bc_encoded_states, bc_encoded_actions], 'sa b n d -> b (n sa) d')
 
-            bc_embed = self.bc_model(bc_tokens)
+            detached_hiddens = None
+
+            if self.pass_world_model_hiddens_to_actor:
+                seq_len = bc_tokens.shape[1]
+                detached_hiddens = tree_map_tensor(lambda t: t[:, :seq_len].detach(), world_model_hiddens)
+
+            bc_embed = self.bc_model(bc_tokens, prev_hiddens = detached_hiddens)
 
             bc_state_embed, _ = rearrange(bc_embed, 'b (n sa) d -> sa b n d', sa = 2)
 

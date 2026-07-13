@@ -79,10 +79,12 @@ def test_world_model(
 @param('continuous_actions', (True, False))
 @param('action_len', (9, 10))
 @param('transition_action_space', ('raw', 'encoded', 'latent'))
+@param('pass_world_model_hiddens_to_actor', (True, False))
 def test_behavior_cloning(
     continuous_actions,
     action_len,
-    transition_action_space
+    transition_action_space,
+    pass_world_model_hiddens_to_actor
 ):
     if transition_action_space == 'raw' and not continuous_actions:
         pytest.skip('raw state transition action space requires continuous actions')
@@ -109,6 +111,7 @@ def test_behavior_cloning(
         dim_action_latent = 32,
         model = model,
         bc_model = bc_model,
+        pass_world_model_hiddens_to_actor = pass_world_model_hiddens_to_actor,
         dim_action = dim_action,
         continuous_actions = continuous_actions,
         bc_loss_weight = 1.
