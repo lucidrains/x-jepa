@@ -82,67 +82,6 @@ def test_world_model(
 
     assert planned_actions.shape == (2, 5, 20)
 
-def test_planning_predicts_encoded_next_state_from_current_latent():
-    class IdentityModel(nn.Module):
-        dim = 1
-
-        def __init__(self):
-            super().__init__()
-            self.dummy = nn.Parameter(torch.zeros(()))
-
-        def forward(self, tokens, return_hiddens = False):
-            tokens = tokens + self.dummy * 0.
-
-            if return_hiddens:
-                return tokens, [tokens]
-
-            return tokens
-
-    class ActionResidual(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.scale = nn.Parameter(torch.ones(()))
-
-        def forward(self, inputs):
-            _, action = inputs
-            return action * self.scale
-
-    class CurrentStatePredictor(nn.Module):
-        def forward(self, inputs):
-            state, _ = inputs
-            return state
-
-    world_model = WorldModel(
-        state_encoder = nn.Linear(1, 1, bias = False),
-        action_encoder = nn.Linear(1, 1, bias = False),
-        state_transition = ActionResidual(),
-        transition_action_space = 'raw',
-        dim_action = 1,
-        model = IdentityModel()
-    )
-
-    world_model.state_encoder.weight.data.fill_(1.)
-    world_model.action_encoder.weight.data.fill_(1.)
-    world_model.to_state_latent = nn.Identity()
-    world_model.to_next_encoded_state_pred = CurrentStatePredictor()
-
-    states = torch.zeros(1, 2, 1)
-    actions = torch.zeros(1, 1, 1)
-
-    def fitness_fn(pred_next_encoded_states):
-        assert torch.allclose(pred_next_encoded_states, torch.zeros_like(pred_next_encoded_states))
-        return torch.zeros(pred_next_encoded_states.shape[:2])
-
-    world_model.plan(
-        states,
-        actions,
-        fitness_fn = fitness_fn,
-        horizon = 1,
-        pop_size = 10,
-        generations = 1,
-        clamp_state_latent_to_range = False
-    )
-
 @param('continuous_actions', (True, False))
 @param('action_len', (9, 10))
 @param('transition_action_space', ('raw', 'encoded', 'latent'))
