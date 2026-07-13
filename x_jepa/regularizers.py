@@ -19,10 +19,13 @@ def sigreg_loss(
 ):
     dim, device = x.shape[-1], x.device
 
-    rand_projs = torch.randn((num_slices, dim), device = device)
+    compute_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+    x = x.to(compute_dtype)
+
+    rand_projs = torch.randn((num_slices, dim), device = device, dtype = compute_dtype)
     rand_projs = l2norm(rand_projs)
 
-    t = torch.linspace(*domain, num_knots, device = device)
+    t = torch.linspace(*domain, num_knots, device = device, dtype = compute_dtype)
 
     exp_f = (-0.5 * t.square()).exp()
 
