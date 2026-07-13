@@ -1,5 +1,6 @@
 from __future__ import annotations
-from typing import Callable
+
+from typing import Callable, Literal
 from functools import partial
 
 import torch
@@ -32,6 +33,12 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def xnor(x, y):
+    return x == y
+
+def identity(t):
+    return t
 
 # attention
 
@@ -117,8 +124,7 @@ class Transformer(Module):
         causal = True,
         dim_head = 64,
         heads = 8,
-        ff_expand_factor = 4.,
-        final_norm = False
+        ff_expand_factor = 4.
     ):
         super().__init__()
         self.dim = dim
@@ -134,8 +140,6 @@ class Transformer(Module):
 
         self.layers = layers
 
-        self.final_norm = nn.RMSNorm(dim) if final_norm else nn.Identity()
-
     def forward(
         self,
         tokens
@@ -145,7 +149,7 @@ class Transformer(Module):
             tokens = attn(tokens) + tokens
             tokens = ff(tokens) + tokens
 
-        return self.final_norm(tokens)
+        return tokens
 
 # classes
 
@@ -155,9 +159,10 @@ class WorldModel(Module):
         *,
         state_encoder: Module,
         action_encoder: Module,
-        action_decoder: Module,
         model: Module,
+        action_decoder: Module | None = None,
         state_transition: Module | None = None,
+        transition_action_space: Literal['raw', 'encoded', 'latent'] = 'raw',
         dim_action_latent = None,
         dim_state_latent = None,
         ema_beta = 0.95,
@@ -185,19 +190,50 @@ class WorldModel(Module):
         self.state_encoder = state_encoder
 
         self.action_encoder = action_encoder
-        self.action_decoder = action_decoder
+
+        # the learnt state transition that is popularly used for learning the so called world model, but may not be the only prediction needed
+
+        # different types of action spaces for the transition
+
+        if transition_action_space == 'raw': # raw actions from -1. to 1., only for continuous actions
+            assert continuous_actions and exists(dim_action)
+
+            dim_transition_action_input = dim_action
+            need_learned_action_decoder = False
+
+        elif transition_action_space == 'encoded':  # encoded, but uncontextualized
+            dim_transition_action_input = dim_action_latent
+            need_learned_action_decoder = True
+
+        elif transition_action_space == 'latent': # the contextualized action
+            dim_transition_action_input = dim_action_latent
+            need_learned_action_decoder = True
+
+        else:
+            raise ValueError('unknown state transition action space')
+
+        self.transition_action_space = transition_action_space
+
+        assert xnor(need_learned_action_decoder, exists(action_decoder)), 'you need to pass in the action_decoder'
 
         if not exists(state_transition):
             # following Teoh, learn the residual with a 3 layer mlp
 
-            state_transition = MLP(dim_state_latent + dim_action_latent, *((dim * 2,) * 2), dim)
+            state_transition = MLP(dim_state_latent + dim_transition_action_input, *((dim * 2,) * 2), dim)
 
+        self.dim_transition_action_input = dim_transition_action_input
         self.state_transition = state_transition
+
+        self.action_decoder = default(action_decoder, nn.Identity())
+        self.need_learned_action_decoder = need_learned_action_decoder
+
+        # main world model
+
         self.model = model
 
         # the predictive head for goals
 
-        self.to_next_encoded_state_pred = MLP(dim_state_latent + dim_action_latent, *((dim * 2,) * 2), dim)
+        self.to_next_encoded_state_pred = MLP(dim_state_latent + dim_transition_action_input, *((dim * 2,) * 2), dim)
 
         # projection to latents
 
@@ -217,7 +253,7 @@ class WorldModel(Module):
         self.has_bc = exists(bc_model) and exists(dim_action) and bc_loss_weight > 0.
 
         self.bc_state_encoder = MLP(dim_state_latent + dim, dim)
-        self.bc_action_encoder = MLP(dim_action_latent + dim, dim)
+        self.bc_action_encoder = MLP(dim_transition_action_input + dim, dim)
 
         self.bc_model = bc_model
 
@@ -225,7 +261,7 @@ class WorldModel(Module):
 
         if self.has_bc:
             dim_action_param = (dim_action * 2) if continuous_actions else dim_action
-            self.to_next_action_pred = LinearNoBias(dim, dim_action_param)
+            self.to_next_action_pred = Sequential(RMSNorm(dim), LinearNoBias(dim, dim_action_param))
 
         self.continuous_actions = continuous_actions
         self.action_eps = action_eps
@@ -269,7 +305,7 @@ class WorldModel(Module):
 
         batch = states.shape[0]
         state_len, action_len = states.shape[1], actions.shape[1]
-        dim_action_latent = self.dim_action_latent
+        dim_action = self.dim_transition_action_input
 
         assert exists(fitness_fn) ^ exists(goal_state)
         assert action_len == (state_len - 1)
@@ -302,7 +338,7 @@ class WorldModel(Module):
 
         dim_latent = state_latents.shape[-1]
 
-        shape = (batch, 1, horizon, dim_action_latent)
+        shape = (batch, 1, horizon, dim_action)
 
         means = torch.rand(shape, device = device) * 2. - 1.
         stds = torch.rand(shape, device = device)
@@ -314,8 +350,9 @@ class WorldModel(Module):
 
             # instantiate population
 
-            action_latents = means + stds * torch.randn((batch, pop_size, horizon, dim_action_latent), device = device)
-            action_latents.clamp_(-1., 1.)
+            # actions could be in raw, encoded, or contextualized latent space
+            actions = means + stds * torch.randn((batch, pop_size, horizon, dim_action), device = device)
+            actions.clamp_(-1., 1.)
 
             pred_state_latents = []
             pred_next_encoded_states = []
@@ -324,11 +361,11 @@ class WorldModel(Module):
 
             step_state_latents = state_latents
 
-            for step_action_latents in action_latents.unbind(dim = 2):
+            for step_action in actions.unbind(dim = 2):
 
                 # state transition
 
-                step_residual = self.ema_state_transition((step_state_latents, step_action_latents))
+                step_residual = self.ema_state_transition((step_state_latents, step_action))
 
                 step_state_latents = step_state_latents + step_residual
 
@@ -339,7 +376,7 @@ class WorldModel(Module):
 
                 # encoded state for goal
 
-                pred_next_encoded_state = self.to_next_encoded_state_pred((step_state_latents, step_action_latents))
+                pred_next_encoded_state = self.to_next_encoded_state_pred((step_state_latents, step_action))
 
                 pred_next_encoded_states.append(pred_next_encoded_state)
 
@@ -355,7 +392,7 @@ class WorldModel(Module):
 
                 goal_dist_fn = default(goal_dist_fn, partial(F.smooth_l1_loss, reduction = 'none'))
 
-                distance_to_goal =  goal_dist_fn(pred_next_encoded_states, encoded_goal)
+                distance_to_goal = goal_dist_fn(pred_next_encoded_states, encoded_goal)
                 distance_to_goal = reduce(distance_to_goal, 'b p h d -> b p', 'sum')
 
                 fitnesses = -distance_to_goal
@@ -370,26 +407,26 @@ class WorldModel(Module):
 
             # select the elites
 
-            fittest_action_latents = batched_index_select(action_latents, elite_indices, dim = 1)
+            fittest_actions = batched_index_select(actions, elite_indices, dim = 1)
 
             if not is_last:
-                means = reduce(fittest_action_latents, 'b p h d -> b 1 h d', 'mean')
+                means = reduce(fittest_actions, 'b p h d -> b 1 h d', 'mean')
 
-                stds = reduce(fittest_action_latents, 'b p h d -> b 1 h d', partial(torch.std, unbiased = False))
+                stds = reduce(fittest_actions, 'b p h d -> b 1 h d', partial(torch.std, unbiased = False))
                 stds = stds.clamp_min(eps)
 
         # return the top winner
 
-        winning_action_latents = fittest_action_latents[:, 0]
+        winning_actions = fittest_actions[:, 0]
 
-        decoded_actions = self.action_decoder(winning_action_latents)
+        decoded_actions = self.action_decoder(winning_actions)
 
         # return
 
         if not return_action_latent:
             return decoded_actions
 
-        return decoded_actions, winning_action_latents
+        return decoded_actions, winning_actions
 
     def forward(
         self,
@@ -437,11 +474,22 @@ class WorldModel(Module):
 
         state_latents = self.to_state_latent(state_embeds)
 
-        action_latents = self.to_action_latent(action_embeds)
+        # the action conditioning for the state latents that determine its transition
+
+        if self.transition_action_space == 'raw':
+            action_cond = orig_actions
+
+        elif self.transition_action_space == 'encoded':
+            action_cond = self.to_action_latent(action_tokens)
+
+        elif self.transition_action_space == 'latent':
+            action_cond = self.to_action_latent(action_embeds)
+
+        action_cond = action_cond[:, :state_latents.shape[1]]
 
         # prediction
 
-        pred_residual = self.state_transition((state_latents, action_latents))
+        pred_residual = self.state_transition((state_latents, action_cond))
 
         next_state_pred = state_latents + pred_residual
 
@@ -449,24 +497,27 @@ class WorldModel(Module):
 
         # action decoder
 
-        decoded_actions = self.action_decoder(action_latents)
+        action_recon_loss = self.zero
 
-        recon_orig_actions = orig_actions[:, :decoded_actions.shape[1]]
+        if self.need_learned_action_decoder:
+            decoded_actions = self.action_decoder(action_cond)
 
-        if self.continuous_actions:
-            action_recon_loss = F.mse_loss(
-                recon_orig_actions,
-                decoded_actions
-            )
-        else:
-            action_recon_loss = F.cross_entropy(
-                rearrange(decoded_actions, 'b n c -> b c n'),
-                recon_orig_actions
-            )
+            recon_orig_actions = orig_actions[:, :decoded_actions.shape[1]]
+
+            if self.continuous_actions:
+                action_recon_loss = F.mse_loss(
+                    recon_orig_actions,
+                    decoded_actions
+                )
+            else:
+                action_recon_loss = F.cross_entropy(
+                    rearrange(decoded_actions, 'b n c -> b c n'),
+                    recon_orig_actions
+                )
 
         # goal prediction head - cannot use the next state, as the encoded goal does not know the past sequence that led to it
 
-        pred_next_encoded_state = self.to_next_encoded_state_pred((state_latents, action_latents))
+        pred_next_encoded_state = self.to_next_encoded_state_pred((state_latents, action_cond))
 
         ema_encoded_state = self.ema_state_encoder(states)
 
@@ -480,7 +531,7 @@ class WorldModel(Module):
 
         if self.has_bc and behavior_clone:
             bc_encoded_states = self.bc_state_encoder(cat((state_tokens[:, :-1], state_latents.detach()), dim = -1))
-            bc_encoded_actions = self.bc_action_encoder(cat((action_tokens[:, :-1], action_latents.detach()), dim = -1))
+            bc_encoded_actions = self.bc_action_encoder(cat((action_tokens[:, :action_cond.shape[1]], action_cond.detach()), dim = -1))
 
             bc_tokens = rearrange([bc_encoded_states, bc_encoded_actions], 'sa b n d -> b (n sa) d')
 
@@ -503,9 +554,11 @@ class WorldModel(Module):
                 beta = F.softplus(beta) + self.action_eps
 
                 distr = Beta(alpha, beta)
-                next_actions = next_actions.clamp(self.action_eps, 1. - self.action_eps)
 
-                log_probs = distr.log_prob(next_actions).sum(dim = -1)
+                next_actions_zero_one = (next_actions + 1) / 2
+                next_actions_zero_one = next_actions_zero_one.clamp(self.action_eps, 1. - self.action_eps)
+
+                log_probs = distr.log_prob(next_actions_zero_one).sum(dim = -1)
 
                 bc_loss = -log_probs.mean()
 

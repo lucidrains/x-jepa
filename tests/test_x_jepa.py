@@ -8,8 +8,10 @@ from x_jepa.x_jepa import WorldModel, Transformer
 from einops import reduce
 
 @param('use_goal', (False, True))
+@param('transition_action_space', ('raw', 'encoded', 'latent'))
 def test_world_model(
-    use_goal
+    use_goal,
+    transition_action_space
 ):
     model = Transformer(
         dim = 512,
@@ -20,13 +22,15 @@ def test_world_model(
     world_model = WorldModel(
         state_encoder = nn.Linear(128, 512),
         action_encoder = nn.Linear(20, 512),
-        action_decoder = nn.Linear(32, 20),
+        action_decoder = nn.Linear(32, 20) if transition_action_space != 'raw' else None,
+        transition_action_space = transition_action_space,
+        dim_action = 20,
         dim_action_latent = 32,
         model = model
     )
 
     states = torch.randn(2, 10, 128)
-    actions = torch.randn(2, 9, 20)
+    actions = torch.randn(2, 9, 20).tanh()
 
     loss, _ = world_model(states, actions)
 
@@ -52,10 +56,15 @@ def test_world_model(
 
 @param('continuous_actions', (True, False))
 @param('action_len', (9, 10))
+@param('transition_action_space', ('raw', 'encoded', 'latent'))
 def test_behavior_cloning(
     continuous_actions,
-    action_len
+    action_len,
+    transition_action_space
 ):
+    if transition_action_space == 'raw' and not continuous_actions:
+        pytest.skip('raw state transition action space requires continuous actions')
+
     model = Transformer(
         dim = 512,
         depth = 2,
@@ -73,7 +82,8 @@ def test_behavior_cloning(
     world_model = WorldModel(
         state_encoder = nn.Linear(128, 512),
         action_encoder = nn.Linear(dim_action, 512) if continuous_actions else nn.Embedding(dim_action, 512),
-        action_decoder = nn.Linear(32, dim_action),
+        action_decoder = nn.Linear(32, dim_action) if transition_action_space != 'raw' else None,
+        transition_action_space = transition_action_space,
         dim_action_latent = 32,
         model = model,
         bc_model = bc_model,
@@ -85,7 +95,7 @@ def test_behavior_cloning(
     states = torch.randn(2, 10, 128)
 
     if continuous_actions:
-        actions = torch.rand(2, action_len, dim_action)
+        actions = torch.randn(2, action_len, dim_action).tanh()
     else:
         actions = torch.randint(0, dim_action, (2, action_len))
 
