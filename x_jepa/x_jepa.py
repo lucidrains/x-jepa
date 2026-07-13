@@ -552,6 +552,9 @@ class WorldModel(Module):
 
         decoded_actions = self.action_decoder(winning_actions)
 
+        if not self.continuous_actions:
+            decoded_actions = decoded_actions.argmax(dim = -1)
+
         # return
 
         if not return_action_latent:
