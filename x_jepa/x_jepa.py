@@ -24,7 +24,7 @@ from torch_einops_utils import (
     batched_index_select
 )
 
-from x_jepa.regularizers import sigreg_loss, SigReg
+from x_jepa.regularizers import sigreg_loss, SigReg, uniform_wasserstein_loss
 
 # constants
 
@@ -38,7 +38,8 @@ Losses = namedtuple('Losses', [
     'value',
     'sigreg_next_state',
     'sigreg_next_encoded',
-    'sigreg_action'
+    'sigreg_action',
+    'action_wasserstein'
 ])
 
 # helpers
@@ -192,6 +193,7 @@ class WorldModel(Module):
         sigreg_next_state_weight = 0.,
         sigreg_next_encoded_weight = 0.,
         sigreg_action_weight = 0.,
+        action_latent_wasserstein_loss_weight = 0.,
         sigreg: Module | None = None,
         sigreg_loss_kwargs: dict | None = None
     ):
@@ -234,6 +236,9 @@ class WorldModel(Module):
             raise ValueError('unknown state transition action space')
 
         self.transition_action_space = transition_action_space
+        self.has_action_latents = transition_action_space != 'raw'
+
+        assert not (not self.has_action_latents and action_latent_wasserstein_loss_weight > 0.), 'uniform wasserstein loss on action latents can only be used if there are action latents'
 
         assert xnor(need_learned_action_decoder, exists(action_decoder)), 'you need to pass in the action_decoder'
 
@@ -305,6 +310,8 @@ class WorldModel(Module):
         self.sigreg_next_state_weight = sigreg_next_state_weight
         self.sigreg_next_encoded_weight = sigreg_next_encoded_weight
         self.sigreg_action_weight = sigreg_action_weight
+
+        self.action_latent_wasserstein_loss_weight = action_latent_wasserstein_loss_weight
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
@@ -644,6 +651,13 @@ class WorldModel(Module):
         if self.sigreg_action_weight > 0.:
             sigreg_action_loss = self.sigreg(action_cond)
 
+        # action latent uniform loss
+
+        action_wasserstein_loss = self.zero
+
+        if self.action_latent_wasserstein_loss_weight > 0.:
+            action_wasserstein_loss = uniform_wasserstein_loss(action_cond)
+
         # losses
 
         total_loss = (
@@ -654,7 +668,8 @@ class WorldModel(Module):
             value_loss * self.value_loss_weight +
             sigreg_next_state_loss * self.sigreg_next_state_weight +
             sigreg_next_encoded_loss * self.sigreg_next_encoded_weight +
-            sigreg_action_loss * self.sigreg_action_weight
+            sigreg_action_loss * self.sigreg_action_weight +
+            action_wasserstein_loss * self.action_latent_wasserstein_loss_weight
         )
 
         loss_breakdown = Losses(
@@ -665,7 +680,8 @@ class WorldModel(Module):
             value_loss,
             sigreg_next_state_loss,
             sigreg_next_encoded_loss,
-            sigreg_action_loss
+            sigreg_action_loss,
+            action_wasserstein_loss
         )
 
         return total_loss, loss_breakdown

@@ -1,7 +1,8 @@
 import torch
 import torch.nn.functional as F
 from torch.nn import Module
-from einops import rearrange
+
+from einops import rearrange, repeat
 
 # helpers
 
@@ -34,6 +35,19 @@ def sigreg_loss(
     err = ecf.sub(exp_f).abs().square().mul(exp_f)
 
     return torch.trapezoid(err, t, dim = -1).mean()
+
+# for action latents bounded between -1 and 1
+
+def uniform_wasserstein_loss(x):
+    x = rearrange(x, 'b ... d -> (b ...) d')
+    batch, dim, device = *x.shape, x.device
+
+    x_sorted, _ = x.sort(dim=0)
+    target = torch.linspace(-1., 1., batch, device = device)
+    target = repeat(target, 'b -> b d', d = dim)
+    return F.mse_loss(x_sorted, target)
+
+# sig reg module
 
 class SigReg(Module):
     def __init__(

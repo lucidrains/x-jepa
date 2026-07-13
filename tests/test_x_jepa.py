@@ -33,7 +33,8 @@ def test_world_model(
         model = model,
         sigreg_next_state_weight = float(use_sigreg),
         sigreg_next_encoded_weight = float(use_sigreg),
-        sigreg_action_weight = float(use_sigreg)
+        sigreg_action_weight = float(use_sigreg),
+        action_latent_wasserstein_loss_weight = float(use_sigreg and not transition_action_is_raw)
     )
 
     states = torch.randn(2, 10, 128)
@@ -42,7 +43,7 @@ def test_world_model(
 
     loss, loss_breakdown = world_model(states, actions, returns = returns)
 
-    assert len(loss_breakdown) == 8
+    assert len(loss_breakdown) == 9
     assert loss.ndim == 0
     loss.backward()
 
