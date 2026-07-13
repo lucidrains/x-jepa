@@ -58,6 +58,20 @@ def xnor(x, y):
 def identity(t):
     return t
 
+# helper modules
+
+class FracGradient(Module):
+    def __init__(
+        self,
+        frac = 0.
+    ):
+        super().__init__()
+        assert 0. <= frac <= 1.
+        self.frac = frac
+
+    def forward(self, x):
+        return x.detach().lerp(x, self.frac)
+
 # attention
 
 class Attention(Module):
@@ -244,6 +258,7 @@ class WorldModel(Module):
         next_encoded_state_pred_loss_weight = 1.,
         bc_loss_weight = 1.,
         value_loss_weight = 1.,
+        frac_gradients = 0.,
         sigreg_next_state_weight = 0.,
         sigreg_next_encoded_weight = 0.,
         sigreg_action_weight = 0.,
@@ -350,6 +365,7 @@ class WorldModel(Module):
         # value head
 
         self.value_head = MLP(dim_state_latent + dim, *((dim * 2,) * 2), 1)
+        self.frac_gradient = FracGradient(frac_gradients)
 
         # loss related
 
@@ -691,7 +707,7 @@ class WorldModel(Module):
 
         value_loss = self.zero
 
-        pred_values = self.value_head((state_tokens[:, :-1], state_latents.detach()))
+        pred_values = self.value_head((state_tokens[:, :-1], self.frac_gradient(state_latents)))
         pred_values = rearrange(pred_values, '... 1 -> ...')
 
         if exists(returns):
