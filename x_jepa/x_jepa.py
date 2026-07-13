@@ -58,6 +58,9 @@ def xnor(x, y):
 def identity(t):
     return t
 
+def is_empty(t):
+    return len(t) == 0
+
 # helper modules
 
 class FracGradient(Module):
@@ -462,6 +465,7 @@ class WorldModel(Module):
             # instantiate population
 
             # actions could be in raw, encoded, or contextualized latent space
+
             actions = means + stds * torch.randn((batch, pop_size, horizon, dim_action), device = device)
             actions.clamp_(-1., 1.)
 
@@ -522,6 +526,10 @@ class WorldModel(Module):
                     kwargs['pred_values'] = pred_values
                 if 'encoded_goal' in fn_params:
                     kwargs['encoded_goal'] = encoded_goal
+
+                allowed_params = {'pred_state_latents', 'pred_next_encoded_states', 'pred_values', 'encoded_goal'}
+                unknown_params = set(fn_params.keys()) - allowed_params
+                assert is_empty(unknown_params), f"fitness_fn accepts unknown parameters: {unknown_params}. Allowed parameters are: {', '.join(allowed_params)}"
 
                 fitnesses = fitness_fn(**kwargs)
             else:

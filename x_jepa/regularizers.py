@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn import Module
 
+from functools import wraps
 from einops import rearrange, repeat
 
 # helpers
@@ -11,23 +12,43 @@ from einops import rearrange, repeat
 def l2norm(t):
     return F.normalize(t, dim = -1)
 
+# decorators
+
+def cast_compute_dtype(fn):
+    @wraps(fn)
+    def inner(x, *args, **kwargs):
+        compute_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+        x = x.to(compute_dtype)
+        return fn(x, *args, **kwargs)
+    return inner
+
+# for action latents bounded between -1 and 1
+
+@cast_compute_dtype
+def uniform_wasserstein_loss(x):
+    x = rearrange(x, 'b ... d -> (b ...) d')
+    batch, dim, device, dtype = *x.shape, x.device, x.dtype
+
+    x_sorted, _ = x.sort(dim=0)
+    target = torch.linspace(-1., 1., batch, device = device, dtype = dtype)
+    target = repeat(target, 'b -> b d', d = dim)
+    return F.mse_loss(x_sorted, target)
+
 # Randall Balestriero et al.  https://arxiv.org/abs/2511.08544
 
+@cast_compute_dtype
 def sigreg_loss(
     x,
     num_slices = 1024,
     domain = (-5, 5),
     num_knots = 17
 ):
-    dim, device = x.shape[-1], x.device
+    dim, device, dtype = x.shape[-1], x.device, x.dtype
 
-    compute_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
-    x = x.to(compute_dtype)
-
-    rand_projs = torch.randn((num_slices, dim), device = device, dtype = compute_dtype)
+    rand_projs = torch.randn((num_slices, dim), device = device, dtype = dtype)
     rand_projs = l2norm(rand_projs)
 
-    t = torch.linspace(*domain, num_knots, device = device, dtype = compute_dtype)
+    t = torch.linspace(*domain, num_knots, device = device, dtype = dtype)
 
     exp_f = (-0.5 * t.square()).exp()
 
@@ -40,17 +61,6 @@ def sigreg_loss(
     err = ecf.sub(exp_f).abs().square().mul(exp_f)
 
     return torch.trapezoid(err, t, dim = -1).mean()
-
-# for action latents bounded between -1 and 1
-
-def uniform_wasserstein_loss(x):
-    x = rearrange(x, 'b ... d -> (b ...) d')
-    batch, dim, device = *x.shape, x.device
-
-    x_sorted, _ = x.sort(dim=0)
-    target = torch.linspace(-1., 1., batch, device = device)
-    target = repeat(target, 'b -> b d', d = dim)
-    return F.mse_loss(x_sorted, target)
 
 # sig reg module
 
@@ -80,6 +90,7 @@ class SigReg(Module):
 # gaussian quantiles (sliced wasserstein-2 to a standard normal) instead of
 # the empirical characteristic function, plus explicit center and scale terms
 
+@cast_compute_dtype
 def visreg_loss(
     x,
     num_slices = 1024,
@@ -89,7 +100,7 @@ def visreg_loss(
     eps = 1e-6
 ):
     x = rearrange(x, '... d -> (...) d')
-    batch, dim, device = *x.shape, x.device
+    batch, dim, device, dtype = *x.shape, x.device, x.dtype
 
     # center - penalize non-zero feature mean
 
@@ -106,11 +117,11 @@ def visreg_loss(
 
     x_norm = x_centered / std.detach()
 
-    rand_projs = l2norm(torch.randn((num_slices, dim), device = device))
+    rand_projs = l2norm(torch.randn((num_slices, dim), device = device, dtype = dtype))
     projected = torch.einsum('n d, m d -> n m', x_norm, rand_projs)
     projected_sorted, _ = projected.sort(dim = 0)
 
-    quantiles = torch.linspace(1, batch, batch, device = device) / (batch + 1)
+    quantiles = torch.linspace(1, batch, batch, device = device, dtype = dtype) / (batch + 1)
     target = torch.erfinv(2. * quantiles - 1.).mul(math.sqrt(2.))
     target = rearrange(target, 'n -> n 1')
 
