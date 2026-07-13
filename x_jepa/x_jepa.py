@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Callable, Literal
 
 import inspect
+from collections import namedtuple
 from functools import partial
 
 import torch
@@ -23,9 +24,22 @@ from torch_einops_utils import (
     batched_index_select
 )
 
+from x_jepa.regularizers import sigreg_loss, SigReg
+
 # constants
 
 LinearNoBias = partial(Linear, bias = False)
+
+Losses = namedtuple('Losses', [
+    'next_state_latent_pred',
+    'action_recon',
+    'next_encoded_state_pred',
+    'bc',
+    'value',
+    'sigreg_next_state',
+    'sigreg_next_encoded',
+    'sigreg_action'
+])
 
 # helpers
 
@@ -174,7 +188,12 @@ class WorldModel(Module):
         action_recon_loss_weight = 1.,
         next_encoded_state_pred_loss_weight = 1.,
         bc_loss_weight = 1.,
-        value_loss_weight = 1.
+        value_loss_weight = 1.,
+        sigreg_next_state_weight = 0.,
+        sigreg_next_encoded_weight = 0.,
+        sigreg_action_weight = 0.,
+        sigreg: Module | None = None,
+        sigreg_loss_kwargs: dict | None = None
     ):
         super().__init__()
 
@@ -278,6 +297,14 @@ class WorldModel(Module):
         self.next_encoded_state_pred_loss_weight = next_encoded_state_pred_loss_weight
         self.bc_loss_weight = bc_loss_weight
         self.value_loss_weight = value_loss_weight
+
+        # sigreg
+
+        self.sigreg = default(sigreg, SigReg(**default(sigreg_loss_kwargs, dict())))
+
+        self.sigreg_next_state_weight = sigreg_next_state_weight
+        self.sigreg_next_encoded_weight = sigreg_next_encoded_weight
+        self.sigreg_action_weight = sigreg_action_weight
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
@@ -602,6 +629,21 @@ class WorldModel(Module):
         if exists(returns):
             value_loss = F.mse_loss(pred_values, returns)
 
+        # sigreg loss
+
+        sigreg_next_state_loss = self.zero
+        sigreg_next_encoded_loss = self.zero
+        sigreg_action_loss = self.zero
+
+        if self.sigreg_next_state_weight > 0.:
+            sigreg_next_state_loss = self.sigreg(next_state_pred)
+
+        if self.sigreg_next_encoded_weight > 0.:
+            sigreg_next_encoded_loss = self.sigreg(pred_next_encoded_state)
+
+        if self.sigreg_action_weight > 0.:
+            sigreg_action_loss = self.sigreg(action_cond)
+
         # losses
 
         total_loss = (
@@ -609,9 +651,21 @@ class WorldModel(Module):
             action_recon_loss * self.action_recon_loss_weight +
             next_encoded_state_pred_loss * self.next_encoded_state_pred_loss_weight +
             bc_loss * self.bc_loss_weight +
-            value_loss * self.value_loss_weight
+            value_loss * self.value_loss_weight +
+            sigreg_next_state_loss * self.sigreg_next_state_weight +
+            sigreg_next_encoded_loss * self.sigreg_next_encoded_weight +
+            sigreg_action_loss * self.sigreg_action_weight
         )
 
-        loss_breakdown = (loss, action_recon_loss, next_encoded_state_pred_loss, bc_loss, value_loss)
+        loss_breakdown = Losses(
+            loss,
+            action_recon_loss,
+            next_encoded_state_pred_loss,
+            bc_loss,
+            value_loss,
+            sigreg_next_state_loss,
+            sigreg_next_encoded_loss,
+            sigreg_action_loss
+        )
 
         return total_loss, loss_breakdown

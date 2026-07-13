@@ -9,9 +9,11 @@ from einops import reduce
 
 @param('plan_type', ('no_goal', 'goal', 'custom_goal'))
 @param('transition_action_space', ('raw', 'encoded', 'latent'))
+@param('use_sigreg', (False, True))
 def test_world_model(
     plan_type,
-    transition_action_space
+    transition_action_space,
+    use_sigreg
 ):
     model = Transformer(
         dim = 512,
@@ -28,7 +30,10 @@ def test_world_model(
         transition_action_space = transition_action_space,
         dim_action = 20,
         dim_action_latent = 32,
-        model = model
+        model = model,
+        sigreg_next_state_weight = float(use_sigreg),
+        sigreg_next_encoded_weight = float(use_sigreg),
+        sigreg_action_weight = float(use_sigreg)
     )
 
     states = torch.randn(2, 10, 128)
@@ -37,7 +42,7 @@ def test_world_model(
 
     loss, loss_breakdown = world_model(states, actions, returns = returns)
 
-    assert len(loss_breakdown) == 5
+    assert len(loss_breakdown) == 8
     assert loss.ndim == 0
     loss.backward()
 
