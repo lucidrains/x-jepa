@@ -479,6 +479,10 @@ class WorldModel(Module):
 
             for step_action in actions.unbind(dim = 2):
 
+                # encoded state for goal
+
+                pred_next_encoded_state = self.to_next_encoded_state_pred((step_state_latents, step_action))
+
                 # state transition
 
                 step_residual = self.ema_state_transition((step_state_latents, step_action))
@@ -489,10 +493,6 @@ class WorldModel(Module):
                     step_state_latents.clamp_(-1., 1.)
 
                 pred_state_latents.append(step_state_latents)
-
-                # encoded state for goal
-
-                pred_next_encoded_state = self.to_next_encoded_state_pred((step_state_latents, step_action))
 
                 pred_next_encoded_states.append(pred_next_encoded_state)
 
