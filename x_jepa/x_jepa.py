@@ -317,7 +317,7 @@ class WorldModel(Module):
         if not exists(state_transition):
             # following Teoh, learn the residual with a 3 layer mlp
 
-            state_transition = MLP(dim_state_latent + dim_transition_action_input, *((dim * 2,) * 2), dim)
+            state_transition = MLP(dim_state_latent + dim_transition_action_input, *((dim * 2,) * 2), dim_state_latent)
 
         self.dim_transition_action_input = dim_transition_action_input
         self.state_transition = state_transition
