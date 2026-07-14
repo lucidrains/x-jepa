@@ -126,6 +126,77 @@ def test_plan_search_spaces(
 
     assert planned_actions.shape == (2, 5, 20)
 
+@param('transition_action_space', ('raw', 'encoded', 'latent'))
+@param('search_space', ('raw', None))
+def test_plan_scores_representation_of_returned_action(
+    transition_action_space,
+    search_space
+):
+    # https://github.com/lucidrains/x-jepa/issues/14 - the action representation used to score a candidate must correspond to the action returned for execution
+
+    if transition_action_space == 'latent':
+        pytest.skip('latent search candidates cannot yet be projected onto the action encoder image, so the scored representation is not guaranteed to survive decode -> re-encode')
+
+    model = Transformer(
+        dim = 512,
+        depth = 4,
+        causal = True
+    )
+
+    transition_action_is_raw = transition_action_space == 'raw'
+
+    world_model = WorldModel(
+        state_encoder = nn.Linear(128, 512),
+        action_encoder = nn.Linear(20, 512),
+        action_decoder = nn.Linear(32, 20) if not transition_action_is_raw else None,
+        transition_action_space = transition_action_space,
+        dim_action = 20,
+        dim_action_latent = 32,
+        model = model,
+    )
+
+    # record the action representation each candidate is scored with
+
+    scored_action_reps = []
+
+    def record_transition_inputs(module, args, output):
+        _, step_action_cond = args[0]
+        scored_action_reps.append(step_action_cond)
+
+    world_model.ema_state_transition.ema_model.register_forward_hook(record_transition_inputs)
+
+    states = torch.randn(2, 2, 128)
+    actions = torch.randn(2, 1, 20).tanh()
+
+    horizon = 3
+
+    planned_actions = world_model.plan(
+        states,
+        actions,
+        horizon = horizon,
+        pop_size = 32,
+        generations = 2,
+        search_space = search_space,
+        fitness_fn = lambda pred_state_latents: reduce(pred_state_latents, 'b p ... -> b p', 'sum')
+    )
+
+    # the representation the returned action maps back to, computed as during training
+
+    if transition_action_is_raw:
+        executed_action_reps = planned_actions
+    else:
+        executed_action_reps = world_model.to_action_latent(world_model.action_encoder(planned_actions))
+
+    # the returned plan must be among the candidate representations scored in the final generation
+
+    final_generation = torch.stack(scored_action_reps[-horizon:], dim = 2) # (b, p, h, d)
+
+    dists = (final_generation - executed_action_reps.unsqueeze(1)).norm(dim = -1) # (b, p, h)
+
+    closest_candidate_dist = dists.amax(dim = -1).amin(dim = -1) # worst step of the best candidate
+
+    assert (closest_candidate_dist < 1e-4).all()
+
 @param('continuous_actions', (True, False))
 @param('action_len', (9, 10))
 @param('transition_action_space', ('raw', 'encoded', 'latent'))

@@ -433,14 +433,20 @@ class WorldModel(Module):
 
         # search space and some validation while it is still incomplete
 
-        search_space = default(search_space, 'encoded_latent' if not self.continuous_actions or self.transition_action_space != 'raw' else 'raw')
+        # default to searching in raw action space whenever possible, so every candidate is scored with the representation the returned action maps back to - https://github.com/lucidrains/x-jepa/issues/14
+
+        can_search_raw_actions = self.continuous_actions and self.transition_action_space != 'latent' and exists(self.dim_action)
+
+        search_space = default(search_space, 'raw' if can_search_raw_actions else 'encoded_latent')
 
         if self.transition_action_space == 'raw':
             assert search_space == 'raw'
         elif self.transition_action_space == 'latent':
             assert search_space == 'encoded_latent'
         elif search_space == 'raw':
-            assert self.continuous_actions
+            assert self.continuous_actions and exists(self.dim_action), 'searching in raw action space requires continuous actions and `dim_action` to be set'
+
+        # when searching in encoded_latent space (discrete actions or contextualized `latent` transitions), candidates are not constrained to the image of the action encoder, and the scored representation may not survive decode -> re-encode
 
         is_search_space_raw_action = search_space == 'raw'
         dim_action = self.dim_transition_action_input if not is_search_space_raw_action else self.dim_action
@@ -497,8 +503,14 @@ class WorldModel(Module):
             actions_cond = actions
 
             if is_search_space_raw_action and self.transition_action_space == 'encoded':
+                # fold the population into the batch, so the action encoder receives the same (batch, seq, dim) shape as during training
+
+                actions_cond = rearrange(actions_cond, 'b p h d -> (b p) h d')
+
                 actions_cond = self.action_encoder(actions_cond)
                 actions_cond = self.to_action_latent(actions_cond)
+
+                actions_cond = rearrange(actions_cond, '(b p) h d -> b p h d', b = batch)
 
             # accumulating predictions across horizon
 
