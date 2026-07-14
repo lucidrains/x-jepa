@@ -691,8 +691,8 @@ class WorldModel(Module):
                 # use unimodal beta
 
                 alpha, beta = rearrange(next_action_pred, 'b n (alpha_beta na) -> alpha_beta b n na', alpha_beta = 2)
-                alpha = F.softplus(alpha) + self.action_eps
-                beta = F.softplus(beta) + self.action_eps
+                alpha = F.softplus(alpha) + 1. + self.action_eps
+                beta = F.softplus(beta) + 1. + self.action_eps
 
                 distr = Beta(alpha, beta)
 

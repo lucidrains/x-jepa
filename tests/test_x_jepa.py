@@ -134,6 +134,37 @@ def test_behavior_cloning(
     assert loss.ndim == 0
     loss.backward()
 
+
+def test_continuous_behavior_cloning_uses_unimodal_beta():
+    dim = 8
+
+    world_model = WorldModel(
+        state_encoder = nn.Linear(1, dim),
+        action_encoder = nn.Linear(1, dim),
+        model = Transformer(dim = dim, depth = 1, dim_head = dim, heads = 1),
+        transition_action_space = 'raw',
+        dim_action = 1,
+        bc_model = Transformer(dim = dim, depth = 1, dim_head = dim, heads = 1),
+        pass_world_model_hiddens_to_actor = False
+    )
+
+    class ZeroActionParams(nn.Module):
+        def forward(self, x):
+            return torch.zeros((*x.shape[:-1], 2), device = x.device, dtype = x.dtype)
+
+    world_model.to_next_action_pred = ZeroActionParams()
+
+    states = torch.zeros(2, 2, 1)
+    actions = torch.zeros(2, 1, 1)
+
+    _, loss_breakdown = world_model(states, actions)
+
+    concentration = torch.nn.functional.softplus(torch.tensor(0.)) + 1. + world_model.action_eps
+    expected_bc_loss = -torch.distributions.Beta(concentration, concentration).log_prob(torch.tensor(0.5))
+
+    torch.testing.assert_close(loss_breakdown.bc, expected_bc_loss)
+
+
 @param('reg_type', ('sigreg', 'visreg'))
 def test_reg_loss(reg_type):
     from x_jepa.regularizers import sigreg_loss, visreg_loss
