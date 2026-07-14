@@ -699,9 +699,10 @@ class WorldModel(Module):
 
         # now we predict the next latent from (s_t, a_t) -> s_t+1
 
-        state_embeds, action_embeds = rearrange(embeds[:, :-2], 'b (n sa) d -> sa b n d', sa = 2)
+        state_embeds_full, action_embeds_full = rearrange(embeds, 'b (n sa) d -> sa b n d', sa = 2)
+        state_latents_full = self.to_state_latent(state_embeds_full)
 
-        state_latents = self.to_state_latent(state_embeds)
+        state_embeds, state_latents, action_embeds = (t[:, :-1] for t in (state_embeds_full, state_latents_full, action_embeds_full))
 
         # the action conditioning for the state latents that determine its transition
 
@@ -811,7 +812,7 @@ class WorldModel(Module):
 
         value_loss = self.zero
 
-        pred_values = self.value_head((state_tokens[:, :-1], self.frac_gradient(state_latents)))
+        pred_values = self.value_head((state_tokens, self.frac_gradient(state_latents_full)))
         pred_values = rearrange(pred_values, '... 1 -> ...')
 
         if exists(returns):

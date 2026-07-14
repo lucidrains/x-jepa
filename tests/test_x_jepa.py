@@ -9,6 +9,7 @@ from einops import reduce
 
 from x_jepa.x_jepa import WorldModel, Transformer
 from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
+from x_jepa.goals import FlowMatching, GoalGenerator
 
 @param('plan_type', ('no_goal', 'goal', 'custom_goal'))
 @param('transition_action_space', ('raw', 'local', 'global'))
@@ -46,7 +47,7 @@ def test_world_model(
 
     states = torch.randn(2, 10, 128)
     actions = torch.randn(2, 9, 20).tanh()
-    returns = torch.randn(2, 9)
+    returns = torch.randn(2, 10)
 
     loss, loss_breakdown = world_model(states, actions, returns = returns)
 
@@ -228,3 +229,32 @@ def test_linear_rnn_parallel_matches_sequential():
     out_seq = torch.cat(out_seqs, dim = 1)
 
     assert torch.allclose(out, out_seq, atol = 1e-5)
+
+def test_goal_flow_match():
+    dim = 64
+    batch_size = 2
+
+    goal_gen = GoalGenerator(dim = dim)
+
+    flow_matching = FlowMatching(
+        model = goal_gen,
+        noise_std = 10.
+    )
+
+    mock_state_latents = torch.randn(batch_size, dim)
+    mock_returns = torch.randn(batch_size)
+
+    loss = flow_matching(
+        mock_state_latents,
+        returns = mock_returns
+    )
+
+    assert loss.ndim == 0
+
+    sampled_goals = flow_matching.sample(
+        batch_size = batch_size,
+        data_shape = (dim,),
+        returns = mock_returns
+    )
+
+    assert sampled_goals.shape == (batch_size, dim)
