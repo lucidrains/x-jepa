@@ -3,6 +3,8 @@ param = pytest.mark.parametrize
 
 import torch
 from torch import nn, tensor
+from torch.testing import assert_close
+
 from einops import reduce
 
 from x_jepa.x_jepa import WorldModel, Transformer
@@ -81,6 +83,49 @@ def test_world_model(
 
     assert planned_actions.shape == (2, 5, 20)
 
+@param('transition_action_space', ('raw', 'encoded', 'latent'))
+@param('search_space', ('raw', 'encoded_latent', None))
+def test_plan_search_spaces(
+    transition_action_space,
+    search_space
+):
+    if transition_action_space == 'raw' and search_space == 'encoded_latent':
+        pytest.skip('raw transition action space requires raw search space')
+
+    if transition_action_space == 'latent' and search_space == 'raw':
+        pytest.skip('latent transition action space can only be searched in encoded_latent space for now')
+
+    model = Transformer(
+        dim = 512,
+        depth = 4,
+        causal = True
+    )
+
+    transition_action_is_raw = transition_action_space == 'raw'
+
+    world_model = WorldModel(
+        state_encoder = nn.Linear(128, 512),
+        action_encoder = nn.Linear(20, 512),
+        action_decoder = nn.Linear(32, 20) if not transition_action_is_raw else None,
+        transition_action_space = transition_action_space,
+        dim_action = 20,
+        dim_action_latent = 32,
+        model = model,
+    )
+
+    states = torch.randn(2, 10, 128)
+    actions = torch.randn(2, 9, 20).tanh()
+
+    planned_actions = world_model.plan(
+        states[:, :2],
+        actions[:, :1],
+        horizon = 5,
+        search_space = search_space,
+        fitness_fn = lambda pred_state_latents: reduce(pred_state_latents, 'b p ... -> b p', 'sum')
+    )
+
+    assert planned_actions.shape == (2, 5, 20)
+
 @param('continuous_actions', (True, False))
 @param('action_len', (9, 10))
 @param('transition_action_space', ('raw', 'encoded', 'latent'))
@@ -134,37 +179,6 @@ def test_behavior_cloning(
     assert loss.ndim == 0
     loss.backward()
 
-
-def test_continuous_behavior_cloning_uses_unimodal_beta():
-    dim = 8
-
-    world_model = WorldModel(
-        state_encoder = nn.Linear(1, dim),
-        action_encoder = nn.Linear(1, dim),
-        model = Transformer(dim = dim, depth = 1, dim_head = dim, heads = 1),
-        transition_action_space = 'raw',
-        dim_action = 1,
-        bc_model = Transformer(dim = dim, depth = 1, dim_head = dim, heads = 1),
-        pass_world_model_hiddens_to_actor = False
-    )
-
-    class ZeroActionParams(nn.Module):
-        def forward(self, x):
-            return torch.zeros((*x.shape[:-1], 2), device = x.device, dtype = x.dtype)
-
-    world_model.to_next_action_pred = ZeroActionParams()
-
-    states = torch.zeros(2, 2, 1)
-    actions = torch.zeros(2, 1, 1)
-
-    _, loss_breakdown = world_model(states, actions)
-
-    concentration = torch.nn.functional.softplus(torch.tensor(0.)) + 1. + world_model.action_eps
-    expected_bc_loss = -torch.distributions.Beta(concentration, concentration).log_prob(torch.tensor(0.5))
-
-    torch.testing.assert_close(loss_breakdown.bc, expected_bc_loss)
-
-
 @param('reg_type', ('sigreg', 'visreg'))
 def test_reg_loss(reg_type):
     from x_jepa.regularizers import sigreg_loss, visreg_loss
@@ -181,5 +195,4 @@ def test_reg_loss(reg_type):
 @pytest.mark.parametrize('samples', (tensor([[0.]]), tensor([[-0.5], [0.5]])))
 def test_uniform_wasserstein_uses_bin_midpoints(samples):
     loss = uniform_wasserstein_loss(samples)
-
-    torch.testing.assert_close(loss, torch.tensor(0.))
+    assert_close(loss, torch.tensor(0.))

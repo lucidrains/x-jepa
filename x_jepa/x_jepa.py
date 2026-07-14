@@ -283,6 +283,8 @@ class WorldModel(Module):
 
         # dimensions
 
+        self.dim_action = dim_action
+
         dim = model.dim
         dim_state_latent = default(dim_state_latent, dim)
         dim_action_latent = default(dim_action_latent, dim)
@@ -423,13 +425,27 @@ class WorldModel(Module):
         generations = 5,
         eps = 1e-5,
         clamp_state_latent_to_range = True,
-        return_action_latent = False
+        return_action_latent = False,
+        search_space: Literal['raw', 'encoded_latent'] | None = None
     ):
-        device = self.device
-
-        batch = states.shape[0]
+        batch, device = states.shape[0], self.device
         state_len, action_len = states.shape[1], actions.shape[1]
-        dim_action = self.dim_transition_action_input
+
+        # search space and some validation while it is still incomplete
+
+        search_space = default(search_space, 'encoded_latent' if not self.continuous_actions or self.transition_action_space != 'raw' else 'raw')
+
+        if self.transition_action_space == 'raw':
+            assert search_space == 'raw'
+        elif self.transition_action_space == 'latent':
+            assert search_space == 'encoded_latent'
+        elif search_space == 'raw':
+            assert self.continuous_actions
+
+        is_search_space_raw_action = search_space == 'raw'
+        dim_action = self.dim_transition_action_input if not is_search_space_raw_action else self.dim_action
+
+        # validation
 
         assert exists(fitness_fn) or exists(goal_state), 'either fitness_fn or goal_state must be provided'
         assert action_len == (state_len - 1)
@@ -476,6 +492,16 @@ class WorldModel(Module):
             actions = means + stds * torch.randn((batch, pop_size, horizon, dim_action), device = device)
             actions.clamp_(-1., 1.)
 
+            # the action condition into the step
+
+            actions_cond = actions
+
+            if is_search_space_raw_action and self.transition_action_space == 'encoded':
+                actions_cond = self.action_encoder(actions_cond)
+                actions_cond = self.to_action_latent(actions_cond)
+
+            # accumulating predictions across horizon
+
             pred_state_latents = []
             pred_next_encoded_states = []
             pred_values = []
@@ -484,15 +510,15 @@ class WorldModel(Module):
 
             step_state_latents = state_latents
 
-            for step_action in actions.unbind(dim = 2):
+            for step_action_cond in actions_cond.unbind(dim = 2):
 
                 # encoded state for goal
 
-                pred_next_encoded_state = self.to_next_encoded_state_pred((step_state_latents, step_action))
+                pred_next_encoded_state = self.to_next_encoded_state_pred((step_state_latents, step_action_cond))
 
                 # state transition
 
-                step_residual = self.ema_state_transition((step_state_latents, step_action))
+                step_residual = self.ema_state_transition((step_state_latents, step_action_cond))
 
                 step_state_latents = step_state_latents + step_residual
 
@@ -563,7 +589,10 @@ class WorldModel(Module):
 
         winning_actions = fittest_actions[:, 0]
 
-        decoded_actions = self.action_decoder(winning_actions)
+        decoded_actions = winning_actions
+
+        if not is_search_space_raw_action:
+            decoded_actions = self.action_decoder(winning_actions)
 
         if not self.continuous_actions:
             decoded_actions = decoded_actions.argmax(dim = -1)
