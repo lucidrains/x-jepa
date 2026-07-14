@@ -30,7 +30,8 @@ def uniform_wasserstein_loss(x):
     batch, dim, device, dtype = *x.shape, x.device, x.dtype
 
     x_sorted, _ = x.sort(dim=0)
-    target = torch.linspace(-1., 1., batch, device = device, dtype = dtype)
+    quantiles = (torch.arange(batch, device = device, dtype = dtype) + 0.5) / batch
+    target = quantiles * 2. - 1.
     target = repeat(target, 'b -> b d', d = dim)
     return F.mse_loss(x_sorted, target)
 
