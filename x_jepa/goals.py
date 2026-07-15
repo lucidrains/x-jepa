@@ -117,12 +117,13 @@ class GoalGenerator(Module):
         dim,
         dim_hidden = None,
         returns_omega = 1.,
+        returns_norm_momentum = 0.01,
         net: Module | None = None
     ):
         super().__init__()
         dim_hidden = default(dim_hidden, dim * 4)
 
-        self.norm_returns = nn.BatchNorm1d(1, affine = False)
+        self.norm_returns = nn.BatchNorm1d(1, affine = False, momentum = returns_norm_momentum)
 
         self.time_emb = RandomSinusoidalPosEmb(dim)
         self.returns_emb = RandomSinusoidalPosEmb(dim, omega = returns_omega)

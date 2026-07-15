@@ -298,6 +298,7 @@ class WorldModel(Module):
         action_latent_wasserstein_loss_weight = 0.,
         learn_goal_generator = False,
         goal_loss_weight = 1.,
+        returns_norm_momentum = 0.01,
         reg: Module | None = None,
         reg_loss_kwargs: dict | None = None,
         state_linear_rnn_depth = 1,
@@ -437,7 +438,10 @@ class WorldModel(Module):
 
         if learn_goal_generator:
             from x_jepa.goals import GoalGenerator, FlowMatching
-            self.goal_generator = GoalGenerator(dim = dim_state_latent)
+            self.goal_generator = GoalGenerator(
+                dim = dim_state_latent,
+                returns_norm_momentum = returns_norm_momentum # controls how fast the agent ascends the hedonic treadmill
+            )
             self.goal_flow_matching = FlowMatching(model = self.goal_generator)
 
         # regularizer - defaults to sigreg, but any drop-in (ex. visreg) can be passed in
