@@ -2,10 +2,10 @@ import pytest
 param = pytest.mark.parametrize
 
 import torch
-from torch import nn, tensor
+from torch import nn, tensor, cat
 from torch.testing import assert_close
 
-from einops import reduce
+from einops import reduce, rearrange
 
 from x_jepa.x_jepa import WorldModel, Transformer
 from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
@@ -231,7 +231,7 @@ def test_linear_rnn_parallel_matches_sequential():
         out_seqs.append(out_i)
         kwargs.update(memories = memories)
 
-    out_seq = torch.cat(out_seqs, dim = 1)
+    out_seq = cat(out_seqs, dim = 1)
 
     assert torch.allclose(out, out_seq, atol = 1e-5)
 
@@ -280,3 +280,74 @@ def test_transformer(use_pope):
 
     loss = out.sum()
     loss.backward()
+
+@param('use_pope', (False, True))
+def test_transformer_sequential_vs_parallel(use_pope):
+    model = Transformer(dim = 128, depth = 4, causal = True, use_pope = use_pope)
+    model.eval()
+
+    tokens = torch.randn(2, 10, 128)
+
+    parallel_out, parallel_layer_hiddens = model(tokens, return_hiddens = True)
+
+    sequential_out = []
+    memories = None
+
+    for step_tokens in rearrange(tokens, 'b n d -> n b 1 d'):
+        (step_out, step_layer_hiddens), memories = model(
+            step_tokens,
+            return_hiddens = True,
+            memories = memories,
+            return_memories = True
+        )
+        sequential_out.append(step_out)
+
+    sequential_out = cat(sequential_out, dim = -2)
+
+    assert_close(parallel_out, sequential_out, atol = 1e-4, rtol = 1e-4)
+
+    for parallel_hidden, sequential_hidden in zip(parallel_layer_hiddens, step_layer_hiddens):
+        assert_close(parallel_hidden[:, -1:], sequential_hidden, atol = 1e-4, rtol = 1e-4)
+
+@torch.no_grad()
+def test_world_model_sequential_vs_parallel():
+    model = Transformer(
+        dim = 128,
+        depth = 2,
+        causal = True
+    )
+
+    world_model = WorldModel(
+        model = model,
+        dim_action = 4,
+        state_encoder = nn.Linear(128, 128),
+        action_encoder = nn.Linear(4, 128),
+        action_decoder = nn.Linear(128, 4),
+        transition_action_space = 'local',
+        continuous_actions = True
+    )
+
+    world_model.eval()
+
+    states = torch.randn(2, 10, 128)
+    actions = torch.randn(2, 10, 4)
+
+    parallel_out = world_model(states, actions, return_loss = False)
+    parallel_embeds = parallel_out['embeds']
+
+    sequential_embeds = []
+    memories = None
+
+    for step_states, step_actions in zip(rearrange(states, 'b n d -> n b 1 d'), rearrange(actions, 'b n d -> n b 1 d')):
+        step_out, memories = world_model(
+            step_states,
+            step_actions,
+            return_loss = False,
+            memories = memories,
+            return_memories = True
+        )
+        sequential_embeds.append(step_out['embeds'])
+
+    sequential_embeds = cat(sequential_embeds, dim = 1)
+
+    assert_close(parallel_embeds, sequential_embeds, atol = 1e-4, rtol = 1e-4)

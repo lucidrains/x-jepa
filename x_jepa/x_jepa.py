@@ -2,8 +2,8 @@ from __future__ import annotations
 from typing import Callable, Literal
 
 import inspect
-from collections import namedtuple
 from functools import partial
+from collections import namedtuple
 
 import torch
 import torch.nn.functional as F
@@ -124,7 +124,9 @@ class Attention(Module):
     def forward(
         self,
         tokens, # (b n d)
-        pope_pos_emb = None
+        pope_pos_emb = None,
+        memories = None,
+        return_memories = False
     ):
         device = tokens.device
 
@@ -135,6 +137,13 @@ class Attention(Module):
 
         if exists(pope_pos_emb):
             q, k = apply_pope_to_qk(pope_pos_emb, q, k)
+
+        if exists(memories):
+            past_k, past_v = memories
+            k = cat((past_k, k), dim = -2)
+            v = cat((past_v, v), dim = -2)
+
+        next_memories = (k, v) if return_memories else None
 
         q = q * self.scale
 
@@ -153,7 +162,12 @@ class Attention(Module):
         out = out * rearrange(gates, 'b n h -> b h n 1').sigmoid()
 
         out = self.merge_heads(out)
-        return self.to_out(out)
+        out = self.to_out(out)
+
+        if not return_memories:
+            return out
+
+        return out, next_memories
 
 class AttentionResidual(Module):
     def __init__(
@@ -244,28 +258,55 @@ class Transformer(Module):
         self,
         tokens,
         prev_hiddens = None,
-        return_hiddens = False
+        return_hiddens = False,
+        memories = None,
+        return_memories = False
     ):
         seq_len = tokens.shape[-2]
-        pope_pos_emb = self.pope(seq_len) if exists(self.pope) else None
+
+        past_seq_len = 0
+        layer_memories = None
+
+        if exists(memories):
+            past_seq_len, layer_memories = memories
+
+        pope_pos_emb = self.pope(seq_len, offset = past_seq_len) if exists(self.pope) else None
 
         layer_hiddens = list(default(prev_hiddens, []))
         layer_hiddens.append(tokens)
 
+        next_layer_memories = []
+
+        memories_iter = iter(layer_memories) if exists(layer_memories) else None
+
         for attn_res, attn, ff in self.layers:
-            tokens = attn(tokens, pope_pos_emb = pope_pos_emb) + tokens
+            layer_memory = next(memories_iter, None) if exists(memories_iter) else None
+
+            attn_out, next_memory = attn(
+                tokens,
+                pope_pos_emb = pope_pos_emb,
+                memories = layer_memory,
+                return_memories = True
+            )
+
+            if return_memories:
+                next_layer_memories.append(next_memory)
+
+            tokens = attn_out + tokens
             tokens = ff(tokens) + tokens
 
             layer_hiddens.append(tokens)
 
             tokens = attn_res(layer_hiddens)
 
-        if not return_hiddens:
-            return tokens
+        ret = (tokens, layer_hiddens) if return_hiddens else tokens
 
-        return tokens, layer_hiddens
+        if not return_memories:
+            return ret
 
-# distributions
+        next_memories = (past_seq_len + seq_len, next_layer_memories)
+
+        return ret, next_memories
 
 class BetaDistrReadout(Module):
     def __init__(
@@ -796,7 +837,10 @@ class WorldModel(Module):
         states,
         actions,
         returns = None,
-        behavior_clone = True
+        behavior_clone = True,
+        return_loss = True,
+        memories = None,
+        return_memories = False
     ):
         state_len, action_len = states.shape[1], actions.shape[1]
         assert action_len in {state_len, state_len - 1}
@@ -805,6 +849,13 @@ class WorldModel(Module):
 
         actions = pad_right_at_dim_to(actions, state_len, dim = 1)
 
+        # handle memories
+
+        state_rnn_memories = action_rnn_memories = model_memories = None
+
+        if exists(memories):
+            state_rnn_memories, action_rnn_memories, model_memories = memories
+
         # handle last action not being given
 
         # encode the states and actions, todo: do mixture of transformers, a la VLAs
@@ -812,10 +863,19 @@ class WorldModel(Module):
         state_tokens = self.state_encoder(states)
         action_tokens = self.action_encoder(actions)
 
-        # linear rnns for contextualizing states and actions separately
+        # linear rnns for contextualizing states and actions separately, and for potential path integration and idm
 
-        rnn_state_tokens = self.state_linear_rnn(state_tokens)
-        rnn_action_tokens = self.action_linear_rnn(action_tokens)
+        rnn_state_tokens, next_state_rnn_memories = self.state_linear_rnn(
+            state_tokens,
+            memories = state_rnn_memories,
+            return_memories = True
+        )
+
+        rnn_action_tokens, next_action_rnn_memories = self.action_linear_rnn(
+            action_tokens,
+            memories = action_rnn_memories,
+            return_memories = True
+        )
 
         # now we interleave the states and actions
 
@@ -825,7 +885,12 @@ class WorldModel(Module):
 
         # we will follow Teoh et al's lead and use the post-norm space as the latent
 
-        embeds, world_model_hiddens = self.model(tokens, return_hiddens = True)
+        (embeds, world_model_hiddens), next_model_memories = self.model(
+            tokens,
+            return_hiddens = True,
+            memories = model_memories,
+            return_memories = True
+        )
 
         target_embeds = self.ema_model(tokens)
 
@@ -841,6 +906,18 @@ class WorldModel(Module):
 
         state_embeds_full, action_embeds_full = rearrange(embeds, 'b (n sa) d -> sa b n d', sa = 2)
         state_latents_full = self.to_state_latent(state_embeds_full)
+
+        # memories from world model
+
+        next_memories = (next_state_rnn_memories, next_action_rnn_memories, next_model_memories)
+
+        # early return with embed for testing
+
+        if not return_loss:
+            out = dict(embeds = embeds)
+            return (out, next_memories) if return_memories else out
+
+        # now ready to do losses, remove the last token for predictive coding
 
         state_embeds, state_latents, action_embeds = (t[:, :-1] for t in (state_embeds_full, state_latents_full, action_embeds_full))
 
@@ -1029,4 +1106,5 @@ class WorldModel(Module):
             goal_loss
         )
 
-        return total_loss, loss_breakdown
+        out = (total_loss, loss_breakdown)
+        return (out, next_memories) if return_memories else out
