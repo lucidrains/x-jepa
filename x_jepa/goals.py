@@ -40,15 +40,12 @@ class FlowMatching(Module):
         self,
         model: Module,
         data_shape = None,
-        max_timesteps = 100,
         loss_fn = F.mse_loss,
         noise_std = 1.
     ):
         super().__init__()
         self.model = model
         self.data_shape = data_shape
-
-        self.max_timesteps = max_timesteps
 
         self.loss_fn = loss_fn
         self.noise_std = noise_std
@@ -63,7 +60,6 @@ class FlowMatching(Module):
         noise = None,
         **kwargs
     ):
-        assert 1 <= steps <= self.max_timesteps
 
         data_shape = default(data_shape, self.data_shape)
         assert exists(data_shape), 'shape of the data must be passed in, or set at init or during training'
@@ -102,7 +98,6 @@ class FlowMatching(Module):
         batch, device = shape[0], data.device
 
         times = default(times, torch.rand(batch, device = device))
-        times = times * (1. - self.max_timesteps ** -1)
 
         noise = default(noise, torch.randn_like(data) * self.noise_std)
         flow = data - noise

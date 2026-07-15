@@ -51,7 +51,7 @@ def test_world_model(
 
     loss, loss_breakdown = world_model(states, actions, returns = returns)
 
-    assert len(loss_breakdown) == 9
+    assert len(loss_breakdown) == 10
     assert loss.ndim == 0
     loss.backward()
 

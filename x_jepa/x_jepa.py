@@ -44,7 +44,8 @@ Losses = namedtuple('Losses', [
     'value',
     'reg_next_state',
     'reg_next_encoded',
-    'action_wasserstein'
+    'action_wasserstein',
+    'goal'
 ])
 
 # helpers
@@ -295,6 +296,8 @@ class WorldModel(Module):
         reg_next_state_weight = 0.,
         reg_next_encoded_weight = 0.,
         action_latent_wasserstein_loss_weight = 0.,
+        learn_goal_generator = False,
+        goal_loss_weight = 1.,
         reg: Module | None = None,
         reg_loss_kwargs: dict | None = None,
         state_linear_rnn_depth = 1,
@@ -424,6 +427,18 @@ class WorldModel(Module):
         self.action_recon_loss_weight = action_recon_loss_weight
         self.bc_loss_weight = bc_loss_weight
         self.value_loss_weight = value_loss_weight
+
+        self.action_latent_wasserstein_loss_weight = action_latent_wasserstein_loss_weight
+
+        # goal generator
+
+        self.learn_goal_generator = learn_goal_generator
+        self.goal_loss_weight = goal_loss_weight
+
+        if learn_goal_generator:
+            from x_jepa.goals import GoalGenerator, FlowMatching
+            self.goal_generator = GoalGenerator(dim = dim_state_latent)
+            self.goal_flow_matching = FlowMatching(model = self.goal_generator)
 
         # regularizer - defaults to sigreg, but any drop-in (ex. visreg) can be passed in
 
@@ -848,6 +863,17 @@ class WorldModel(Module):
         if self.action_latent_wasserstein_loss_weight > 0.:
             action_wasserstein_loss = uniform_wasserstein_loss(action_cond)
 
+        # goal generator loss
+
+        goal_loss = self.zero
+
+        if self.learn_goal_generator and exists(returns):
+            flat_state_latents = rearrange(state_latents_full.detach(), '... d -> (...) d')
+
+            flat_returns = rearrange(returns, '... -> (...)')
+
+            goal_loss = self.goal_flow_matching(flat_state_latents, returns = flat_returns)
+
         # losses
 
         total_loss = (
@@ -859,7 +885,8 @@ class WorldModel(Module):
             value_loss * self.value_loss_weight +
             reg_next_state_loss * self.reg_next_state_weight +
             reg_next_encoded_loss * self.reg_next_encoded_weight +
-            action_wasserstein_loss * self.action_latent_wasserstein_loss_weight
+            action_wasserstein_loss * self.action_latent_wasserstein_loss_weight +
+            goal_loss * self.goal_loss_weight
         )
 
         loss_breakdown = Losses(
@@ -871,7 +898,8 @@ class WorldModel(Module):
             value_loss,
             reg_next_state_loss,
             reg_next_encoded_loss,
-            action_wasserstein_loss
+            action_wasserstein_loss,
+            goal_loss
         )
 
         return total_loss, loss_breakdown
