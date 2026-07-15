@@ -159,3 +159,36 @@ class VISReg(Module):
             lambda_scale = self.lambda_scale,
             lambda_shape = self.lambda_shape
         )
+
+# Ying Wang et al. https://arxiv.org/abs/2603.12231
+
+@cast_compute_dtype
+def temporal_straightening_loss(
+    latents,
+    eps = 1e-6
+):
+    *_, seq_len, __ = latents.shape
+
+    if seq_len <= 2:
+        return latents.new_zeros(())
+
+    velocities = torch.diff(latents, dim = -2)
+
+    past_vel, future_vel = velocities[..., :-1, :], velocities[..., 1:, :]
+
+    cos_sim = F.cosine_similarity(past_vel, future_vel, dim = -1, eps = eps)
+    return (1. - cos_sim).mean()
+
+class TemporalStraightening(Module):
+    def __init__(
+        self,
+        eps = 1e-6
+    ):
+        super().__init__()
+        self.eps = eps
+
+    def forward(
+        self,
+        latents
+    ):
+        return temporal_straightening_loss(latents, eps = self.eps)

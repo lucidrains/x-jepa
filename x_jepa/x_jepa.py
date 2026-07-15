@@ -31,7 +31,7 @@ from PoPE_pytorch import PoPE, apply_pope_to_qk
 
 from x_jepa.utils import EnvWrapper, Experience
 
-from x_jepa.regularizers import SigReg, uniform_wasserstein_loss
+from x_jepa.regularizers import SigReg, uniform_wasserstein_loss, temporal_straightening_loss
 from x_jepa.min_gru import minGRUBlocks
 
 # constants
@@ -48,7 +48,8 @@ Losses = namedtuple('Losses', [
     'reg_next_state',
     'reg_next_encoded',
     'action_wasserstein',
-    'goal'
+    'goal',
+    'temporal_straightening'
 ])
 
 # helpers
@@ -414,6 +415,7 @@ class WorldModel(Module):
         reg_next_state_weight = 0.,
         reg_next_encoded_weight = 0.,
         action_latent_wasserstein_loss_weight = 0.,
+        temporal_straightening_loss_weight = 0.,
         learn_goal_generator = False,
         goal_loss_weight = 1.,
         returns_norm_momentum = 0.01,
@@ -593,6 +595,7 @@ class WorldModel(Module):
         self.reg_next_encoded_weight = reg_next_encoded_weight
 
         self.action_latent_wasserstein_loss_weight = action_latent_wasserstein_loss_weight
+        self.temporal_straightening_loss_weight = temporal_straightening_loss_weight
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
@@ -1173,6 +1176,13 @@ class WorldModel(Module):
         if self.action_latent_wasserstein_loss_weight > 0.:
             action_wasserstein_loss = uniform_wasserstein_loss(action_cond)
 
+        # temporal straightening loss
+
+        temporal_straightening_loss_val = self.zero
+
+        if self.temporal_straightening_loss_weight > 0.:
+            temporal_straightening_loss_val = temporal_straightening_loss(state_latents_full)
+
         # goal generator loss
 
         goal_loss = self.zero
@@ -1196,6 +1206,7 @@ class WorldModel(Module):
             reg_next_state_loss * self.reg_next_state_weight +
             reg_next_encoded_loss * self.reg_next_encoded_weight +
             action_wasserstein_loss * self.action_latent_wasserstein_loss_weight +
+            temporal_straightening_loss_val * self.temporal_straightening_loss_weight +
             goal_loss * self.goal_loss_weight
         )
 
@@ -1209,7 +1220,8 @@ class WorldModel(Module):
             reg_next_state_loss,
             reg_next_encoded_loss,
             action_wasserstein_loss,
-            goal_loss
+            goal_loss,
+            temporal_straightening_loss_val
         )
 
         out = (total_loss, loss_breakdown)

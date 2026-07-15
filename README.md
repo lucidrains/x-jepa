@@ -129,3 +129,15 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
     url     = {https://arxiv.org/abs/2509.10534},
 }
 ```
+
+```bibtex
+@misc{wang2026temporalstraighteninglatentplanning,
+    title   = {Temporal Straightening for Latent Planning},
+    author  = {Ying Wang and Oumayma Bounou and Gaoyue Zhou and Randall Balestriero and Tim G. J. Rudner and Yann LeCun and Mengye Ren},
+    year    = {2026},
+    eprint  = {2603.12231},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2603.12231},
+}
+```
