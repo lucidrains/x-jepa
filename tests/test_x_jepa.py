@@ -8,7 +8,7 @@ from torch.testing import assert_close
 from einops import reduce, rearrange
 from einops.layers.torch import Rearrange
 
-from x_jepa.x_jepa import WorldModel, Transformer
+from x_jepa.x_jepa import WorldModel, Transformer, exists
 from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
 from x_jepa.goals import FlowMatching, GoalGenerator
 
@@ -418,7 +418,9 @@ def test_interact_with_environment():
         action_encoder = nn.Linear(2, 128),
         action_decoder = nn.Linear(128, 2),
         transition_action_space = 'local',
-        continuous_actions = False
+        continuous_actions = False,
+        value_loss_weight = 1.,
+        discount_factor = 0.99
     )
 
     world_model.eval()
@@ -435,9 +437,11 @@ def test_interact_with_environment():
         horizon = 2
     )
 
-    assert len(experience.states) > 0
-    assert len(experience.actions) == len(experience.states)
-    assert len(experience.rewards) == len(experience.states)
+    assert experience.states.shape[1] > 0
+    assert experience.actions.shape[1] == experience.states.shape[1]
+    assert experience.rewards.shape[1] == experience.states.shape[1]
+    assert exists(experience.returns)
+    assert experience.returns.shape[1] == experience.states.shape[1]
 
 @param('complex_sensory', (False, True))
 def test_multimodal(complex_sensory):
@@ -539,6 +543,56 @@ def test_vljepa_cross_sensory_alignment():
         actions = actions
     )
 
-    print(losses.cross_sensory_align_breakdown)
+    assert len(losses.cross_sensory_align_breakdown) == 2
 
     loss.backward()
+
+@torch.no_grad()
+def test_interact_with_environment_multimodal():
+    import gymnasium as gym
+
+    model = Transformer(
+        dim = 128,
+        depth = 2,
+        causal = True
+    )
+
+    world_model = WorldModel(
+        model = model,
+        dim_action = 2,
+        state_encoder = nn.ModuleList([
+            nn.Linear(4, 128),
+            nn.Sequential(Rearrange('... c h w -> ... (c h w)'), nn.Linear(48, 128))
+        ]),
+        action_encoder = nn.Linear(2, 128),
+        action_decoder = nn.Linear(128, 2),
+        transition_action_space = 'local',
+        continuous_actions = False,
+        value_loss_weight = 1.,
+        discount_factor = 0.99
+    )
+
+    world_model.eval()
+
+    class MultimodalEnvWrapper(gym.ObservationWrapper):
+        def observation(self, obs):
+            return [torch.tensor(obs).float(), torch.randn(3, 4, 4)]
+
+    env = MultimodalEnvWrapper(gym.make('CartPole-v1'))
+
+    def fitness_fn(pred_state_latents):
+        return torch.randn(pred_state_latents.shape[:2])
+
+    experience = world_model.interact_with_environment(
+        env = env,
+        max_steps = 10,
+        fitness_fn = fitness_fn,
+        horizon = 2
+    )
+
+    assert experience.states[0].shape[1] > 0
+    assert experience.actions.shape[1] == experience.states[0].shape[1]
+    assert experience.rewards.shape[1] == experience.states[0].shape[1]
+    assert exists(experience.returns)
+    _, returns_tensor = experience.returns
+    assert returns_tensor.shape[1] == experience.states[0].shape[1]

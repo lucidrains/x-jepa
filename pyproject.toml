@@ -1,6 +1,6 @@
 [project]
 name = "x-jepa"
-version = "0.0.45"
+version = "0.0.46"
 description = "Explorations into JEPA"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -25,6 +25,7 @@ classifiers=[
 ]
 
 dependencies = [
+    "assoc-scan",
     "einops>=0.8.1",
     "einx>=0.3.0",
     "ema-pytorch",

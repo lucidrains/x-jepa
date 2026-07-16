@@ -18,16 +18,18 @@ from einops import einsum, rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 
 from ema_pytorch import EMA
+from assoc_scan import AssocScan
 
 from x_mlps_pytorch import MLP
 
 from torch_einops_utils import (
     pad_right_at_dim_to,
-    pad_right_ndim_to,
     temp_eval,
     batched_index_select,
     tree_map_tensor,
-    pack_with_inverse
+    pack_with_inverse,
+    lens_to_mask,
+    maybe
 )
 
 from PoPE_pytorch import PoPE, apply_pope_to_qk
@@ -91,8 +93,17 @@ def first_tensor(t):
 def first(t):
     return None if is_empty(t) else t[0]
 
+def log(t, eps = 1e-20):
+    return torch.log(t.clamp(min = eps))
+
+def l1norm(t, dim = -1):
+    return F.normalize(t, p = 1, dim = dim)
+
 def batch_repeat(t, r):
     return repeat(t, 'b ... -> (b r) ...', r = r)
+
+def tree_map_tensor_to_device(tree, device):
+    return tree_map_tensor(lambda t: t.to(device), tree)
 
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
@@ -426,6 +437,86 @@ class BetaDistrReadout(Module):
 
         return out, distr.entropy()
 
+# value / cost network section
+
+def calc_returns(
+    rewards,
+    is_done,
+    next_values,
+    discount_factor,
+    mask = None,
+    lens = None
+):
+    seq_len = rewards.shape[1]
+
+    assert not (exists(mask) and exists(lens)), 'either mask or lens is given, but not both'
+
+    mask = default(mask, maybe(lens_to_mask)(lens, seq_len))
+
+    scan = AssocScan(reverse = True)
+
+    if is_tensor(discount_factor) and discount_factor.ndim == 1:
+        discount_factor = rearrange(discount_factor, 'b -> b 1')
+
+    gates = discount_factor * (~is_done).float()
+
+    if exists(mask):
+        gates = torch.where(mask, gates, torch.ones_like(gates))
+        rewards = torch.where(mask, rewards, torch.zeros_like(rewards))
+
+    returns = scan(gates, rewards, prev = next_values)
+
+    if exists(mask):
+        returns = returns.masked_fill(~mask, 0.)
+
+    return returns
+
+class Value(Module):
+    def __init__(
+        self,
+        dim,
+        dim_state_latent,
+        discount_factor = 0.99,
+        ema_beta = 0.999,
+        eps = 1e-20
+    ):
+        super().__init__()
+        self.eps = eps
+
+        self.discount_embedder = Sequential(
+            LinearNoBias(3, dim),
+            nn.SiLU(),
+            LinearNoBias(dim, dim)
+        )
+        self.net = MLP(dim_state_latent + dim + dim, *((dim * 2,) * 2), 1)
+        self.ema_net = EMA(self.net, beta = ema_beta)
+
+        self.register_buffer('discount_factor', tensor(discount_factor), persistent = False)
+
+    def embed_discount(self, discount):
+        cond = stack([
+            discount,
+            1. - discount,
+            -log(1. - discount, eps = self.eps)
+        ], dim = -1)
+        return self.discount_embedder(cond)
+
+    def get_discount_embed(self, state_tokens, discount = None):
+        discount = default(discount, self.discount_factor)
+        discount = discount.broadcast_to(state_tokens.shape[:-1])
+        return self.embed_discount(discount)
+
+    def forward_ema(self, state_tokens, state_latents, discount = None):
+        discount_embed = self.get_discount_embed(state_tokens, discount)
+        return self.ema_net((state_tokens, state_latents, discount_embed))
+
+    def update_ema(self):
+        self.ema_net.update()
+
+    def forward(self, state_tokens, state_latents, discount = None):
+        discount_embed = self.get_discount_embed(state_tokens, discount)
+        return self.net((state_tokens, state_latents, discount_embed))
+
 # classes
 
 class WorldModel(Module):
@@ -453,6 +544,7 @@ class WorldModel(Module):
         plan_state_pred_loss_weight = 1.,
         actor_loss_weight = 1.,
         value_loss_weight = 1.,
+        discount_factor = 0.99,
         pass_sensory_hiddens_to_world_model = False,
         pass_sensory_hiddens_to_actor = False,
         frac_gradients = 0.,
@@ -638,7 +730,7 @@ class WorldModel(Module):
 
         # value head
 
-        self.value_head = MLP(dim_state_latent + dim, *((dim * 2,) * 2), 1)
+        self.value_network = Value(dim, dim_state_latent, discount_factor, ema_beta)
         self.frac_gradient = FracGradient(frac_gradients)
 
         # loss related
@@ -682,8 +774,6 @@ class WorldModel(Module):
                 tgt_dim = self.num_sensory_views[tgt_idx] * dim
                 self.cross_sensory_preds.append(MLP(src_dim, src_dim * 2, src_dim * 2, tgt_dim))
 
-
-
         # goal generator
 
         self.learn_goal_generator = learn_goal_generator
@@ -711,6 +801,7 @@ class WorldModel(Module):
         self.has_reg_next_encoded = reg_next_encoded_weight > 0.
         self.has_action_latent_wasserstein_loss = action_latent_wasserstein_loss_weight > 0.
         self.has_temporal_straightening_loss = temporal_straightening_loss_weight > 0.
+        self.discount_factor = discount_factor
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
@@ -723,6 +814,9 @@ class WorldModel(Module):
         encoder: ModuleList,
         states: States
     ):
+        if is_tensor(states):
+            states = [states]
+
         assert len(encoder) == len(states), 'number of states must match number of state encoders'
 
         encoded = []
@@ -780,9 +874,6 @@ class WorldModel(Module):
         memories = None,
         return_memories = False
     ):
-        if is_tensor(states):
-            states = [states]
-
         batch, device = first_tensor(states).shape[0], self.device
         state_len, action_len = first_tensor(states).shape[1], actions.shape[1]
 
@@ -936,7 +1027,7 @@ class WorldModel(Module):
 
                 pred_next_encoded_states.append(pred_next_encoded_state)
 
-                step_pred_value = self.value_head((pred_next_encoded_state, step_state_latents))
+                step_pred_value = self.value_network(pred_next_encoded_state, step_state_latents)
                 pred_values.append(step_pred_value)
 
             pred_state_latents = rearrange(pred_state_latents, 'h b p d -> b p h d')
@@ -1040,7 +1131,8 @@ class WorldModel(Module):
 
         state, info = env.reset()
 
-        batch, device = state.shape[0], state.device
+        first_state = state[0] if isinstance(state, (list, tuple)) else state
+        batch, device = first_state.shape[0], first_state.device
 
         memories = None
 
@@ -1055,10 +1147,13 @@ class WorldModel(Module):
             infos.append(info)
 
             empty_actions = torch.empty(batch, 0, self.dim_action, device = self.device)
-            state = state.to(self.device)
+            state = tree_map_tensor_to_device(state, self.device)
+
+            # single timestep
+            state_seq = tree_map_tensor(lambda t: rearrange(t, 'b ... -> b 1 ...'), state)
 
             planned_actions, memories = self.plan(
-                states = state.unsqueeze(1),
+                states = state_seq,
                 actions = empty_actions,
                 fitness_fn = fitness_fn,
                 goal_state = goal_state,
@@ -1094,7 +1189,41 @@ class WorldModel(Module):
             if is_done.all():
                 break
 
-        experience = (states, actions, rewards, terminateds, truncateds, infos, episode_len, cumulative_rewards)
+        # calculate returns
+
+        states = tree_map(lambda *t: stack(t, dim = 1), *states)
+        actions, rewards, terminateds, truncateds = tuple(torch.stack(t, dim = 1) for t in (actions, rewards, terminateds, truncateds))
+
+        states, actions, rewards, terminateds, truncateds = tree_map_tensor_to_device((states, actions, rewards, terminateds, truncateds), self.device)
+
+        with torch.no_grad():
+            state = tree_map_tensor_to_device(state, self.device)
+
+            # treat as a single timestep sequence
+
+            state_seq = tree_map_tensor(lambda t: rearrange(t, 'b ... -> b 1 ...'), state)
+
+            # encode state with ema model for bootstrapping value
+
+            ema_encoded_state, _, _ = self.encode_states(self.ema_state_encoder, state_seq)
+
+            ema_state_tokens = rearrange(ema_encoded_state, 'b 1 ... -> b ...')
+            ema_state_latents = self.to_state_latent(ema_state_tokens)
+
+            # get next values
+
+            next_values = self.value_network.forward_ema(ema_state_tokens, ema_state_latents)
+            next_values = rearrange(next_values, '... 1 -> ...')
+
+        returns = calc_returns(rewards, terminateds, next_values, self.discount_factor)
+
+        batch_discount = self.value_network.discount_factor.expand(batch)
+        returns = (batch_discount, returns)
+
+        experience = (states, actions, rewards, terminateds, truncateds, infos, episode_len, cumulative_rewards, returns)
+
+        if return_cpu:
+            experience = tree_map_tensor_to_device(experience, 'cpu')
 
         return Experience(*experience)
 
@@ -1109,9 +1238,6 @@ class WorldModel(Module):
         return_memories = False
     ):
         device = self.device
-
-        if is_tensor(states):
-            states = [states]
 
         (batch, state_len), action_len = first_tensor(states).shape[:2], actions.shape[1]
         assert action_len in {state_len, state_len - 1}
@@ -1406,11 +1532,21 @@ class WorldModel(Module):
 
         value_loss = self.zero
 
-        pred_values = self.value_head((state_tokens, self.frac_gradient(state_latents_full)))
-        pred_values = rearrange(pred_values, '... 1 -> ...')
+        discounts = None
+        returns_tensor = None
 
         if exists(returns):
-            value_loss = F.mse_loss(pred_values, returns)
+            if isinstance(returns, tuple):
+                discounts, returns_tensor = returns
+            else:
+                returns_tensor = returns
+
+        pred_values = self.value_network(state_tokens, self.frac_gradient(state_latents_full), discounts)
+        pred_values = rearrange(pred_values, '... 1 -> ...')
+
+        if exists(returns_tensor):
+            assert pred_values.shape == returns_tensor.shape, f'predicted values shape {pred_values.shape} must match returns shape {returns_tensor.shape}'
+            value_loss = F.mse_loss(pred_values, returns_tensor)
 
         # regularizer loss
 
