@@ -45,7 +45,7 @@ Losses = namedtuple('Losses', [
     'plan_state_pred',
     'action_recon',
     'next_encoded_state_pred',
-    'bc',
+    'actor',
     'value',
     'reg_next_state',
     'reg_next_encoded',
@@ -76,6 +76,9 @@ def first(t):
 
 def batch_repeat(t, r):
     return repeat(t, 'b ... -> (b r) ...', r = r)
+
+def max_neg_value(t):
+    return -torch.finfo(t.dtype).max
 
 # helper modules
 
@@ -161,7 +164,7 @@ class Attention(Module):
         if self.causal:
             i, j = sim.shape[-2:]
             causal_mask = torch.ones((i, j), dtype = torch.bool, device = device).triu(j - i + 1)
-            sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
+            sim = sim.masked_fill(causal_mask, max_neg_value(sim))
 
         attn = sim.softmax(dim = -1)
 
@@ -191,7 +194,8 @@ class AttentionResidual(Module):
 
     def forward(
         self,
-        hiddens
+        hiddens,
+        mask = None
     ):
         if isinstance(hiddens, list):
             hiddens = stack(hiddens)
@@ -207,6 +211,18 @@ class AttentionResidual(Module):
         values = hiddens
 
         sim = einsum(queries, keys, 'm d, l m d -> m l') * self.scale
+
+        if exists(mask):
+            if isinstance(mask, list):
+                mask = stack(mask)
+
+            mask, _ = pack_with_inverse(mask, 'l *')
+            mask = rearrange(mask, 'l m -> m l')
+
+            mask = pad_right_at_dim_to(mask, sim.shape[-1], value = True)
+
+            sim = sim.masked_fill(~mask, max_neg_value(sim))
+
         attn = sim.softmax(dim = -1)
 
         out = einsum(attn, values, 'm l, l m d -> m d')
@@ -266,7 +282,8 @@ class Transformer(Module):
     def forward(
         self,
         tokens,
-        prev_hiddens = None,
+        past_layers = None,
+        past_layers_mask = None,
         return_hiddens = False,
         memories = None,
         return_memories = False
@@ -281,7 +298,7 @@ class Transformer(Module):
 
         pope_pos_emb = self.pope(seq_len, offset = past_seq_len) if exists(self.pope) else None
 
-        layer_hiddens = list(default(prev_hiddens, []))
+        layer_hiddens = list(default(past_layers, []))
         layer_hiddens.append(tokens)
 
         next_layer_memories = []
@@ -306,7 +323,7 @@ class Transformer(Module):
 
             layer_hiddens.append(tokens)
 
-            tokens = attn_res(layer_hiddens)
+            tokens = attn_res(layer_hiddens, mask = past_layers_mask)
 
         ret = (tokens, layer_hiddens) if return_hiddens else tokens
 
@@ -406,7 +423,7 @@ class WorldModel(Module):
         dim_state_latent = None,
         state_latent_clamp_value = 10.,
         ema_beta = 0.95,
-        bc_model: Module | None = None,
+        actor_model: Module | None = None,
         pass_world_model_hiddens_to_actor = True,
         dim_action = None,
         continuous_actions = True,
@@ -414,8 +431,10 @@ class WorldModel(Module):
         action_recon_loss_weight = 1.,
         next_encoded_state_pred_loss_weight = 1.,
         plan_state_pred_loss_weight = 1.,
-        bc_loss_weight = 1.,
+        actor_loss_weight = 1.,
         value_loss_weight = 1.,
+        pass_sensory_hiddens_to_world_model = False,
+        pass_sensory_hiddens_to_actor = False,
         frac_gradients = 0.,
         reg_next_state_weight = 0.,
         reg_next_encoded_weight = 0.,
@@ -453,6 +472,9 @@ class WorldModel(Module):
             state_encoder = ModuleList(state_encoder)
 
         self.state_encoder = state_encoder
+
+        if pass_sensory_hiddens_to_world_model or pass_sensory_hiddens_to_actor:
+            assert len(self.state_encoder) > 1, 'passing sensory layers to attention residual requires more than one modality'
 
         self.action_encoder = action_encoder
 
@@ -547,19 +569,30 @@ class WorldModel(Module):
 
         # actor / behavior clone
 
-        self.has_bc = exists(bc_model) and exists(dim_action) and bc_loss_weight > 0.
+        self.has_actor = exists(actor_model) and exists(dim_action) and actor_loss_weight > 0.
 
-        self.bc_state_encoder = MLP(dim_state_latent + dim, dim)
-        self.bc_action_encoder = MLP(dim_transition_action_input + dim, dim)
+        self.actor_state_encoder = MLP(dim_state_latent + dim, dim)
+        self.actor_action_encoder = MLP(dim_transition_action_input + dim, dim)
 
-        self.bc_model = bc_model
+        if not isinstance(actor_model, (list, tuple, ModuleList)) and exists(actor_model):
+            actor_model = [actor_model]
+
+        if isinstance(actor_model, (list, tuple)):
+            actor_model = ModuleList(actor_model)
+
+        self.actor_models = actor_model
         self.pass_world_model_hiddens_to_actor = pass_world_model_hiddens_to_actor
+        self.pass_sensory_hiddens_to_world_model = pass_sensory_hiddens_to_world_model
+        self.pass_sensory_hiddens_to_actor = pass_sensory_hiddens_to_actor
 
-        self.to_next_action_pred = None
+        self.to_next_action_preds = None
 
-        if self.has_bc:
+        if self.has_actor:
+            if self.pass_sensory_hiddens_to_actor:
+                self.to_actor_sensory_hiddens = ModuleList([LinearNoBias(dim, dim) for _ in self.state_encoder])
+
             dim_action_param = (dim_action * 2) if continuous_actions else dim_action
-            self.to_next_action_pred = Sequential(RMSNorm(dim), LinearNoBias(dim, dim_action_param))
+            self.to_next_action_preds = ModuleList([Sequential(RMSNorm(dim), LinearNoBias(dim, dim_action_param)) for _ in self.actor_models])
 
         self.continuous_actions = continuous_actions
         self.action_eps = action_eps
@@ -578,7 +611,7 @@ class WorldModel(Module):
         self.plan_state_pred_loss_weight = plan_state_pred_loss_weight
 
         self.action_recon_loss_weight = action_recon_loss_weight
-        self.bc_loss_weight = bc_loss_weight
+        self.actor_loss_weight = actor_loss_weight
         self.value_loss_weight = value_loss_weight
 
         self.action_latent_wasserstein_loss_weight = action_latent_wasserstein_loss_weight
@@ -612,14 +645,14 @@ class WorldModel(Module):
     def device(self):
         return self.zero.device
 
-    def _encode_states(
+    def encode_states(
         self,
         encoder: ModuleList,
         states: list[Tensor] | tuple[Tensor, ...]
     ):
         assert len(encoder) == len(states), 'number of states must match number of state encoders'
-        # todo: support multiple state tokens
-        return sum([enc(state) for enc, state in zip(encoder, states)])
+        encoded = [enc(state) for enc, state in zip(encoder, states)]
+        return sum(encoded), encoded
 
     def update(self):
         [ema.update() for ema in self.ema_state_encoder]
@@ -679,7 +712,7 @@ class WorldModel(Module):
 
         # get the state and action latents
 
-        state_tokens = self._encode_states(self.state_encoder, states)
+        state_tokens, sensory_layer_hiddens = self.encode_states(self.state_encoder, states)
         action_tokens = self.action_encoder(actions)
 
         # handle memories
@@ -821,7 +854,7 @@ class WorldModel(Module):
                 if is_tensor(goal_state):
                     goal_state = [goal_state]
 
-                encoded_goal = self._encode_states(self.ema_state_encoder, goal_state)
+                encoded_goal, ema_encoded_goal = self.encode_states(self.ema_state_encoder, goal_state)
                 encoded_goal = rearrange(encoded_goal, 'b d -> b 1 1 d')
 
             if exists(fitness_fn):
@@ -975,10 +1008,12 @@ class WorldModel(Module):
         memories = None,
         return_memories = False
     ):
+        device = self.device
+
         if is_tensor(states):
             states = [states]
 
-        state_len, action_len = first(states).shape[1], actions.shape[1]
+        (batch, state_len), action_len = first(states).shape[:2], actions.shape[1]
         assert action_len in {state_len, state_len - 1}
 
         orig_actions = actions
@@ -996,7 +1031,7 @@ class WorldModel(Module):
 
         # encode the states and actions, todo: do mixture of transformers, a la VLAs
 
-        state_tokens = self._encode_states(self.state_encoder, states)
+        state_tokens, sensory_layer_hiddens = self.encode_states(self.state_encoder, states)
         action_tokens = self.action_encoder(actions)
 
         # linear rnns for contextualizing states and actions separately, and for potential path integration and idm
@@ -1017,12 +1052,25 @@ class WorldModel(Module):
 
         tokens = rearrange([rnn_state_tokens, rnn_action_tokens], 'sa b n d -> b (n sa) d')
 
+        # pass sensory hiddens as attention residual layer hiddens
+
+        wm_past_layers = None
+        wm_past_layers_mask = None
+
+        if self.pass_sensory_hiddens_to_world_model:
+            wm_past_layers = [rearrange([h, torch.zeros_like(h)], 'sa b n d -> b (n sa) d') for h in sensory_layer_hiddens]
+            sensory_mask = tensor([True, False], device = device)
+            sensory_mask = repeat(sensory_mask, 'sa -> b (n sa)', b = batch, n = state_len)
+            wm_past_layers_mask = [sensory_mask] * len(sensory_layer_hiddens)
+
         # attention + eventually rnns - yes we need recurrence, i concede that.
 
         # we will follow Teoh et al's lead and use the post-norm space as the latent
 
         (embeds, world_model_hiddens), next_model_memories = self.model(
             tokens,
+            past_layers = wm_past_layers,
+            past_layers_mask = wm_past_layers_mask,
             return_hiddens = True,
             memories = model_memories,
             return_memories = True
@@ -1134,7 +1182,7 @@ class WorldModel(Module):
 
         pred_next_encoded_state = self.to_next_encoded_state_pred((state_latents, action_cond))
 
-        ema_encoded_state = self._encode_states(self.ema_state_encoder, states)
+        ema_encoded_state, ema_sensory_layer_hiddens = self.encode_states(self.ema_state_encoder, states)
 
         next_ema_encoded_state_target = ema_encoded_state[:, 1:]
 
@@ -1142,38 +1190,59 @@ class WorldModel(Module):
 
         # maybe behavior clone
 
-        bc_loss = self.zero
+        actor_loss = self.zero
 
-        if self.has_bc and behavior_clone:
-            bc_encoded_states = self.bc_state_encoder(cat((state_tokens[:, :-1], state_latents.detach()), dim = -1))
-            bc_encoded_actions = self.bc_action_encoder(cat((action_tokens[:, :action_cond.shape[1]], action_cond.detach()), dim = -1))
+        if self.has_actor and behavior_clone:
+            actor_encoded_states = self.actor_state_encoder(cat((state_tokens[:, :-1], state_latents.detach()), dim = -1))
+            actor_encoded_actions = self.actor_action_encoder(cat((action_tokens[:, :action_cond.shape[1]], action_cond.detach()), dim = -1))
 
-            bc_tokens = rearrange([bc_encoded_states, bc_encoded_actions], 'sa b n d -> b (n sa) d')
+            actor_tokens = rearrange([actor_encoded_states, actor_encoded_actions], 'sa b n d -> b (n sa) d')
 
-            detached_hiddens = None
+            actor_past_layers = []
+            actor_past_layers_mask = []
+
+            if self.pass_sensory_hiddens_to_actor:
+                projected_sensory = [proj(h[:, :-1].detach()) for proj, h in zip(self.to_actor_sensory_hiddens, sensory_layer_hiddens)]
+                actor_sensory_hiddens = [rearrange([h, torch.zeros_like(h)], 'sa b n d -> b (n sa) d') for h in projected_sensory]
+                actor_past_layers.extend(actor_sensory_hiddens)
+
+                sensory_mask = tensor([True, False], device = device)
+                sensory_mask = repeat(sensory_mask, 'sa -> b (n sa)', b = batch, n = state_len - 1)
+                actor_past_layers_mask.extend([sensory_mask] * len(actor_sensory_hiddens))
 
             if self.pass_world_model_hiddens_to_actor:
-                seq_len = bc_tokens.shape[1]
+                seq_len = actor_tokens.shape[1]
                 detached_hiddens = tree_map_tensor(lambda t: t[:, :seq_len].detach(), world_model_hiddens)
+                actor_past_layers.extend(detached_hiddens)
 
-            bc_embed = self.bc_model(bc_tokens, prev_hiddens = detached_hiddens)
+            actor_past_layers = tuple(actor_past_layers) if not is_empty(actor_past_layers) else None
+            actor_past_layers_mask = tuple(actor_past_layers_mask) if not is_empty(actor_past_layers_mask) else None
 
-            bc_state_embed, _ = rearrange(bc_embed, 'b (n sa) d -> sa b n d', sa = 2)
+            actor_losses = []
 
-            next_action_pred = self.to_next_action_pred(bc_state_embed)
+            for actor_model, to_next_action_pred in zip(self.actor_models, self.to_next_action_preds):
+                actor_embed = actor_model(actor_tokens, past_layers = actor_past_layers, past_layers_mask = actor_past_layers_mask)
 
-            # log probs
+                actor_state_embed, _ = rearrange(actor_embed, 'b (n sa) d -> sa b n d', sa = 2)
 
-            next_actions = orig_actions[:, :next_action_pred.shape[1]]
+                next_action_pred = to_next_action_pred(actor_state_embed)
 
-            if self.continuous_actions:
-                # use unimodal beta
+                # log probs
 
-                neg_log_probs = self.action_beta_distr(next_action_pred, target = next_actions)
-                bc_loss = neg_log_probs.sum(dim = -1).mean()
+                next_actions = orig_actions[:, :next_action_pred.shape[1]]
 
-            else:
-                bc_loss = F.cross_entropy(rearrange(next_action_pred, 'b n c -> b c n'), next_actions)
+                if self.continuous_actions:
+                    # use unimodal beta
+
+                    neg_log_probs = self.action_beta_distr(next_action_pred, target = next_actions)
+                    loss = neg_log_probs.sum(dim = -1).mean()
+
+                else:
+                    loss = F.cross_entropy(rearrange(next_action_pred, 'b n c -> b c n'), next_actions)
+
+                actor_losses.append(loss)
+
+            actor_loss = sum(actor_losses)
 
         # value head
 
@@ -1228,7 +1297,7 @@ class WorldModel(Module):
             plan_state_pred_loss * self.plan_state_pred_loss_weight +
             action_recon_loss * self.action_recon_loss_weight +
             next_encoded_state_pred_loss * self.next_encoded_state_pred_loss_weight +
-            bc_loss * self.bc_loss_weight +
+            actor_loss * self.actor_loss_weight +
             value_loss * self.value_loss_weight +
             reg_next_state_loss * self.reg_next_state_weight +
             reg_next_encoded_loss * self.reg_next_encoded_weight +
@@ -1242,7 +1311,7 @@ class WorldModel(Module):
             plan_state_pred_loss,
             action_recon_loss,
             next_encoded_state_pred_loss,
-            bc_loss,
+            actor_loss,
             value_loss,
             reg_next_state_loss,
             reg_next_encoded_loss,

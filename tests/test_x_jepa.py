@@ -152,7 +152,7 @@ def test_behavior_cloning(
         causal = True
     )
 
-    bc_model = Transformer(
+    actor_model = Transformer(
         dim = 512,
         depth = 2,
         causal = True
@@ -167,11 +167,11 @@ def test_behavior_cloning(
         transition_action_space = transition_action_space,
         dim_action_latent = 32,
         model = model,
-        bc_model = bc_model,
+        actor_model = actor_model,
         pass_world_model_hiddens_to_actor = pass_world_model_hiddens_to_actor,
         dim_action = dim_action,
         continuous_actions = continuous_actions,
-        bc_loss_weight = 1.
+        actor_loss_weight = 1.
     )
 
     states = torch.randn(2, 10, 128)
@@ -441,19 +441,26 @@ def test_multimodal():
 
     model = Transformer(dim = 256, depth = 2)
 
+    actor_model = Transformer(dim = 256, depth = 2)
+
     world_model = WorldModel(
         state_encoder = [image_encoder, vector_encoder],
         action_encoder = nn.Linear(64, 256),
         model = model,
-        dim_action = 64
+        dim_action = 64,
+        actor_model = actor_model,
+        pass_sensory_hiddens_to_world_model = True,
+        pass_sensory_hiddens_to_actor = True
     )
 
     images = torch.randn(2, 5, 3, 4, 4)
     vectors = torch.randn(2, 5, 128)
     actions = torch.randn(2, 4, 64)
 
-    loss, _ = world_model([images, vectors], actions)
+    loss, losses = world_model([images, vectors], actions, behavior_clone = True)
     loss.backward()
+
+    assert losses.actor > 0.
 
     goal_images = torch.randn(2, 3, 4, 4)
     goal_vectors = torch.randn(2, 128)
