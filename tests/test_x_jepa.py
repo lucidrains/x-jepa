@@ -439,7 +439,8 @@ def test_interact_with_environment():
     assert len(experience.actions) == len(experience.states)
     assert len(experience.rewards) == len(experience.states)
 
-def test_multimodal():
+@param('complex_sensory', (False, True))
+def test_multimodal(complex_sensory):
     image_encoder = nn.Sequential(Rearrange('... c h w -> ... (c h w)'), nn.Linear(48, 256))
     vector_encoder = nn.Linear(128, 256)
 
@@ -447,8 +448,13 @@ def test_multimodal():
 
     actor_model = Transformer(dim = 256, depth = 2)
 
+    if complex_sensory:
+        state_encoders = [image_encoder, image_encoder, vector_encoder, vector_encoder]
+    else:
+        state_encoders = [image_encoder, vector_encoder]
+
     world_model = WorldModel(
-        state_encoder = [image_encoder, vector_encoder],
+        state_encoder = state_encoders,
         action_encoder = nn.Linear(64, 256),
         model = model,
         dim_action = 64,
@@ -457,22 +463,41 @@ def test_multimodal():
         pass_sensory_hiddens_to_actor = True
     )
 
-    images = torch.randn(2, 5, 3, 4, 4)
-    vectors = torch.randn(2, 5, 128)
+    if complex_sensory:
+        images1 = torch.randn(2, 5, 3, 4, 4)
+        images2 = torch.randn(2, 5, 3, 4, 4)
+        vectors1 = torch.randn(2, 5, 128)
+        vectors2 = torch.randn(2, 5, 128)
+        states = [images1, images2, vectors1, vectors2]
+    else:
+        images = torch.randn(2, 5, 3, 4, 4)
+        vectors = torch.randn(2, 5, 128)
+        states = [images, vectors]
+
     actions = torch.randn(2, 4, 64)
 
-    loss, losses = world_model([images, vectors], actions, behavior_clone = True)
+    loss, losses = world_model(states, actions, behavior_clone = True)
     loss.backward()
 
     assert losses.actor > 0.
 
-    goal_images = torch.randn(2, 3, 4, 4)
-    goal_vectors = torch.randn(2, 128)
+    if complex_sensory:
+        goal_images1 = torch.randn(2, 3, 4, 4)
+        goal_images2 = torch.randn(2, 3, 4, 4)
+        goal_vectors1 = torch.randn(2, 128)
+        goal_vectors2 = torch.randn(2, 128)
+        goal_states = [goal_images1, goal_images2, goal_vectors1, goal_vectors2]
+        states_plan = [s[:, :2] for s in states]
+    else:
+        goal_images = torch.randn(2, 3, 4, 4)
+        goal_vectors = torch.randn(2, 128)
+        goal_states = [goal_images, goal_vectors]
+        states_plan = [images[:, :2], vectors[:, :2]]
 
     planned_actions = world_model.plan(
-        states = [images[:, :2], vectors[:, :2]],
+        states = states_plan,
         actions = actions[:, :1],
-        goal_state = [goal_images, goal_vectors],
+        goal_state = goal_states,
         horizon = 2
     )
 

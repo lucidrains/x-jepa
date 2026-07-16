@@ -228,7 +228,7 @@ class AttentionResidual(Module):
         sim = einsum(queries, keys, 'm d, l m d -> m l') * self.scale
 
         if exists(mask):
-            if isinstance(mask, list):
+            if isinstance(mask, (list, tuple)):
                 mask = stack(mask)
 
             mask, _ = pack_with_inverse(mask, 'l *')
@@ -1304,6 +1304,9 @@ class WorldModel(Module):
                 seq_len = actor_tokens.shape[1]
                 detached_hiddens = tree_map_tensor(lambda t: t[:, :seq_len].detach(), world_model_hiddens)
                 actor_past_layers.extend(detached_hiddens)
+
+                wm_mask = torch.ones((batch, seq_len), dtype = torch.bool, device = device)
+                actor_past_layers_mask.extend([wm_mask] * len(detached_hiddens))
 
             actor_past_layers = tuple(actor_past_layers) if not is_empty(actor_past_layers) else None
             actor_past_layers_mask = tuple(actor_past_layers_mask) if not is_empty(actor_past_layers_mask) else None
