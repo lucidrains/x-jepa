@@ -867,7 +867,9 @@ class WorldModel(Module):
         pop_size = 1024,
         elite_frac = 0.1,
         generations = 5,
-        eps = 1e-5,
+        cem_ema_decay = 1.,
+        cem_min_var = 1e-5,
+        cem_temperature = 0.,
         clamp_state_latent_to_range = True,
         return_action_latent = False,
         search_space: Literal['raw', 'local_global'] | None = None,
@@ -891,6 +893,8 @@ class WorldModel(Module):
 
         is_search_space_raw_action = search_space == 'raw'
         dim_action = self.dim_transition_action_input if not is_search_space_raw_action else self.dim_action
+
+        has_cem_temperature = cem_temperature > 0.
 
         # validation
 
@@ -944,14 +948,13 @@ class WorldModel(Module):
 
         # start with naive cross entropy method
 
-        # means and std
-
         num_elites = max(int(elite_frac * pop_size), 1)
 
         shape = (batch, 1, horizon, dim_action)
 
         means = torch.rand(shape, device = device) * 2. - 1.
         stds = torch.rand(shape, device = device)
+        vars = (stds ** 2).clamp_min(cem_min_var)
 
         # precompute past rnn memories for rnn action latents, repeating to population size
 
@@ -966,7 +969,7 @@ class WorldModel(Module):
 
             # actions could be in raw, encoded, or contextualized latent space
 
-            actions = means + stds * torch.randn((batch, pop_size, horizon, dim_action), device = device)
+            actions = means + vars.sqrt() * torch.randn((batch, pop_size, horizon, dim_action), device = device)
             actions.clamp_(-1., 1.)
 
             # the action condition into the step
@@ -1084,10 +1087,24 @@ class WorldModel(Module):
             fittest_actions = batched_index_select(actions, elite_indices, dim = 1)
 
             if not is_last:
-                means = reduce(fittest_actions, 'b p h d -> b 1 h d', 'mean')
+                if has_cem_temperature:
+                    elite_fitnesses = fitnesses.gather(-1, elite_indices)
+                    weights = (elite_fitnesses * cem_temperature).softmax(dim = -1)
 
-                stds = reduce(fittest_actions, 'b p h d -> b 1 h d', partial(torch.std, unbiased = False))
-                stds = stds.clamp_min(eps)
+                    elite_means = einx.dot('b p, b p h d -> b 1 h d', weights, fittest_actions)
+
+                    diffs = fittest_actions - elite_means
+                    elite_vars = einx.dot('b p, b p h d -> b 1 h d', weights, diffs ** 2)
+                else:
+                    elite_means = reduce(fittest_actions, 'b p h d -> b 1 h d', 'mean')
+                    elite_vars = reduce(fittest_actions, 'b p h d -> b 1 h d', partial(torch.var, unbiased = False))
+
+                elite_vars = elite_vars.clamp_min(cem_min_var)
+
+                # ema smoothing
+
+                means.lerp_(elite_means, cem_ema_decay)
+                vars.lerp_(elite_vars, cem_ema_decay)
 
         # return the top winner
 

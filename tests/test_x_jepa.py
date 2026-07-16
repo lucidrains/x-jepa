@@ -137,6 +137,17 @@ def test_plan_search_spaces(
 
     assert planned_actions.shape == (2, 5, 20)
 
+    planned_actions_mppi = world_model.plan(
+        states[:, :2],
+        actions[:, :1],
+        horizon = 5,
+        cem_temperature = 1.,
+        search_space = search_space,
+        fitness_fn = lambda pred_state_latents: reduce(pred_state_latents, 'b p ... -> b p', 'sum')
+    )
+
+    assert planned_actions_mppi.shape == (2, 5, 20)
+
 @param('continuous_actions', (True, False))
 @param('action_len', (9, 10))
 @param('transition_action_space', ('raw', 'local', 'global'))
@@ -441,7 +452,8 @@ def test_interact_with_environment():
     assert experience.actions.shape[1] == experience.states.shape[1]
     assert experience.rewards.shape[1] == experience.states.shape[1]
     assert exists(experience.returns)
-    assert experience.returns.shape[1] == experience.states.shape[1]
+    _, returns_tensor = experience.returns
+    assert returns_tensor.shape[1] == experience.states.shape[1]
 
 @param('complex_sensory', (False, True))
 def test_multimodal(complex_sensory):
