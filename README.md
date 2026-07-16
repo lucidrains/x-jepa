@@ -153,3 +153,15 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
     url     = {https://arxiv.org/abs/2607.00784},
 }
 ```
+
+```bibtex
+@misc{ma2024transformerworldmodelsbetter,
+    title   = {Do Transformer World Models Give Better Policy Gradients?},
+    author  = {Michel Ma and Tianwei Ni and Clement Gehring and Pierluca D'Oro and Pierre-Luc Bacon},
+    year    = {2024},
+    eprint  = {2402.05290},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2402.05290},
+}
+```
