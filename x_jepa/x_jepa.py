@@ -954,7 +954,7 @@ class WorldModel(Module):
 
         means = torch.rand(shape, device = device) * 2. - 1.
         stds = torch.rand(shape, device = device)
-        vars = (stds ** 2).clamp_min(cem_min_var)
+        variances = (stds ** 2).clamp_min(cem_min_var)
 
         # precompute past rnn memories for rnn action latents, repeating to population size
 
@@ -969,7 +969,7 @@ class WorldModel(Module):
 
             # actions could be in raw, encoded, or contextualized latent space
 
-            actions = means + vars.sqrt() * torch.randn((batch, pop_size, horizon, dim_action), device = device)
+            actions = means + variances.sqrt() * torch.randn((batch, pop_size, horizon, dim_action), device = device)
             actions.clamp_(-1., 1.)
 
             # the action condition into the step
@@ -1104,7 +1104,7 @@ class WorldModel(Module):
                 # ema smoothing
 
                 means.lerp_(elite_means, cem_ema_decay)
-                vars.lerp_(elite_vars, cem_ema_decay)
+                variances.lerp_(elite_vars, cem_ema_decay)
 
         # return the top winner
 
