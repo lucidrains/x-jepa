@@ -1300,20 +1300,20 @@ class WorldModel(Module):
             self.has_align_pre_state_action_repr_loss or
             self.has_align_pre_state_action_repr_sigreg
         ):
-            align_state_tokens, align_action_tokens = rnn_state_tokens[:, 1:], rnn_action_tokens[:, :-1]
+            align_next_state_tokens, align_curr_state_tokens, align_action_tokens = rnn_state_tokens[:, 1:], rnn_state_tokens[:, :-1], rnn_action_tokens[:, :-1]
 
             if self.has_align_pre_state_action_repr_loss:
-                pred_action_from_state = self.state_to_action_pred(align_state_tokens)
+                pred_action_from_state = self.state_to_action_pred(align_next_state_tokens)
                 pred_state_from_action = self.action_to_state_pred(align_action_tokens)
 
                 align_pre_state_action_repr_loss = (
                     F.mse_loss(pred_action_from_state, align_action_tokens) +
-                    F.mse_loss(pred_state_from_action, align_state_tokens)
+                    F.mse_loss(pred_state_from_action, align_curr_state_tokens)
                 ) / 2
 
             if self.has_align_pre_state_action_repr_sigreg:
                 align_pre_state_action_repr_sigreg_loss = (
-                    self.reg(align_state_tokens) +
+                    self.reg(align_next_state_tokens) +
                     self.reg(align_action_tokens)
                 ) / 2
 
