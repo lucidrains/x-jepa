@@ -73,6 +73,9 @@ CrossSensoryPairLoss = namedtuple('CrossSensoryPairLoss', ['src', 'tgt', 'loss']
 def exists(v):
     return v is not None
 
+def cast_tuple(t, length = 1):
+    return t if isinstance(t, (tuple, list)) else ((t,) * length)
+
 def default(v, d):
     return v if exists(v) else d
 
@@ -571,7 +574,9 @@ class WorldModel(Module):
         cross_sensory_align_loss_weight: float = 1.,
         cross_sensory_align_sigreg_weight: float = 0.,
         intrinsics: Module | list[Module] | ModuleList | tuple[Module, ...] | None = None,
-        intrinsic_loss_weight: float = 1.
+        intrinsic_loss_weight: float = 1.,
+        intrinsic_frac_gradient: float | tuple[float, ...] | list[float] = 0.,
+        sigreg_loss_weight: float | None = None
     ):
         super().__init__()
 
@@ -802,6 +807,10 @@ class WorldModel(Module):
 
         self.intrinsics = ModuleList(intrinsics)
         self.has_intrinsics = len(self.intrinsics) > 0
+
+        intrinsic_frac_gradient = cast_tuple(intrinsic_frac_gradient, len(self.intrinsics))
+        assert len(intrinsic_frac_gradient) == len(self.intrinsics)
+        self.intrinsic_frac_gradients = ModuleList([FracGradient(frac) for frac in intrinsic_frac_gradient])
 
         # regularizer - defaults to sigreg, but any drop-in (ex. visreg) can be passed in
 
@@ -1632,9 +1641,12 @@ class WorldModel(Module):
         intrinsics_breakdown = tuple()
 
         if self.has_intrinsics:
-            flat_state_latents, _ = pack_with_inverse(state_latents_full.detach(), '* d')
+            flat_state_latents, _ = pack_with_inverse(state_latents_full, '* d')
 
-            ind_losses = [intrinsic.compute_loss(flat_state_latents) for intrinsic in self.intrinsics]
+            ind_losses = []
+            for intrinsic, frac_grad_fn in zip(self.intrinsics, self.intrinsic_frac_gradients):
+                intrinsic_latents = frac_grad_fn(flat_state_latents)
+                ind_losses.append(intrinsic.compute_loss(intrinsic_latents))
 
             if not is_empty(ind_losses):
                 intrinsics_loss = sum(ind_losses)

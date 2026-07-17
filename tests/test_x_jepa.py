@@ -8,6 +8,8 @@ from torch.testing import assert_close
 from einops import reduce, rearrange
 from einops.layers.torch import Rearrange
 
+from x_mlps_pytorch import MLP
+
 from x_jepa.x_jepa import WorldModel, Transformer, exists
 from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
 from x_jepa.goals import FlowMatching, GoalGenerator
@@ -609,6 +611,7 @@ def test_interact_with_environment_multimodal():
     assert returns_tensor.shape[1] == experience.states[0].shape[1]
 
 def test_world_model_with_intrinsics():
+    from copy import deepcopy
     from x_jepa.intrinsic import CoinFlipNetwork
 
     dim = 256
@@ -618,8 +621,8 @@ def test_world_model_with_intrinsics():
         causal = True
     )
 
-    cfn_net = nn.Sequential(nn.Linear(dim, 64), nn.ReLU(), nn.Linear(64, dim))
-    cfn = CoinFlipNetwork(net=cfn_net, dim=dim)
+    cfn_net = MLP(dim, 64, dim)
+    coin_flip_network = CoinFlipNetwork(net = cfn_net, dim = dim)
 
     world_model = WorldModel(
         model = model,
@@ -629,8 +632,9 @@ def test_world_model_with_intrinsics():
         action_decoder = nn.Linear(dim, 4),
         transition_action_space = 'local',
         continuous_actions = True,
-        intrinsics = [cfn],
-        intrinsic_loss_weight = 1.0
+        intrinsics = [coin_flip_network],
+        intrinsic_loss_weight = 1.0,
+        intrinsic_frac_gradient = 0.1
     )
 
     world_model.eval()
