@@ -165,3 +165,15 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
     url     = {https://arxiv.org/abs/2402.05290},
 }
 ```
+
+```bibtex
+@misc{lobel2023flippingcoinsestimatepseudocounts,
+    title   = {Flipping Coins to Estimate Pseudocounts for Exploration in Reinforcement Learning},
+    author  = {Sam Lobel and Akhil Bagaria and George Konidaris},
+    year    = {2023},
+    eprint  = {2306.03186},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2306.03186},
+}
+```

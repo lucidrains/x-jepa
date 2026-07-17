@@ -61,7 +61,9 @@ Losses = namedtuple('Losses', [
     'align_pre_state_action_repr_sigreg',
     'cross_sensory_align',
     'cross_sensory_align_sigreg',
-    'cross_sensory_align_breakdown'
+    'cross_sensory_align_breakdown',
+    'intrinsics',
+    'intrinsics_breakdown'
 ])
 
 CrossSensoryPairLoss = namedtuple('CrossSensoryPairLoss', ['src', 'tgt', 'loss'])
@@ -567,7 +569,9 @@ class WorldModel(Module):
         num_sensory_views: tuple[int, ...] | None = None,
         cross_sensory_align_pairs: list[tuple[int, int]] | None = None,
         cross_sensory_align_loss_weight: float = 1.,
-        cross_sensory_align_sigreg_weight: float = 0.
+        cross_sensory_align_sigreg_weight: float = 0.,
+        intrinsics: Module | list[Module] | ModuleList | tuple[Module, ...] | None = None,
+        intrinsic_loss_weight: float = 1.
     ):
         super().__init__()
 
@@ -786,6 +790,18 @@ class WorldModel(Module):
                 returns_norm_momentum = returns_norm_momentum # controls how fast the agent ascends the hedonic treadmill
             )
             self.goal_flow_matching = FlowMatching(model = self.goal_generator)
+
+        # intrinsics
+
+        self.intrinsic_loss_weight = intrinsic_loss_weight
+
+        if not exists(intrinsics):
+            intrinsics = []
+        elif not isinstance(intrinsics, (list, tuple, ModuleList)):
+            intrinsics = [intrinsics]
+
+        self.intrinsics = ModuleList(intrinsics)
+        self.has_intrinsics = len(self.intrinsics) > 0
 
         # regularizer - defaults to sigreg, but any drop-in (ex. visreg) can be passed in
 
@@ -1063,6 +1079,15 @@ class WorldModel(Module):
                     encoded_goal = encoded_goal,
                     pred_state_entropies = pred_state_entropies
                 )
+
+                if 'pred_intrinsic_bonuses' in fn_params:
+                    assert self.has_intrinsics, 'intrinsics must be passed into WorldModel'
+
+                    flat_pred_state_latents, unpack = pack_with_inverse(pred_state_latents, '* d')
+
+                    bonuses = tuple(unpack(intrinsic.compute_bonus(flat_pred_state_latents), '*') for intrinsic in self.intrinsics)
+
+                    kwargs.update(pred_intrinsic_bonuses = bonuses)
 
                 allowed_params = set(kwargs.keys())
                 unknown_params = set(fn_params.keys()) - allowed_params
@@ -1601,6 +1626,20 @@ class WorldModel(Module):
 
             goal_loss = self.goal_flow_matching(flat_state_latents, returns = flat_returns)
 
+        # intrinsics loss
+
+        intrinsics_loss = self.zero
+        intrinsics_breakdown = tuple()
+
+        if self.has_intrinsics:
+            flat_state_latents, _ = pack_with_inverse(state_latents_full.detach(), '* d')
+
+            ind_losses = [intrinsic.compute_loss(flat_state_latents) for intrinsic in self.intrinsics]
+
+            if not is_empty(ind_losses):
+                intrinsics_loss = sum(ind_losses)
+                intrinsics_breakdown = tuple(ind_losses)
+
         # losses
 
         loss_breakdown = Losses(
@@ -1619,7 +1658,9 @@ class WorldModel(Module):
             align_pre_state_action_repr_sigreg_loss,
             cross_sensory_align_loss,
             cross_sensory_align_sigreg_loss,
-            cross_sensory_align_breakdown
+            cross_sensory_align_breakdown,
+            intrinsics_loss,
+            intrinsics_breakdown
         )
 
         total_loss = (
@@ -1637,7 +1678,8 @@ class WorldModel(Module):
             align_pre_state_action_repr_loss * self.align_pre_state_action_repr_loss_weight +
             align_pre_state_action_repr_sigreg_loss * self.align_pre_state_action_repr_sigreg_weight +
             cross_sensory_align_loss * self.cross_sensory_align_loss_weight +
-            cross_sensory_align_sigreg_loss * self.cross_sensory_align_sigreg_weight
+            cross_sensory_align_sigreg_loss * self.cross_sensory_align_sigreg_weight +
+            intrinsics_loss * self.intrinsic_loss_weight
         )
 
         out = (total_loss, loss_breakdown)

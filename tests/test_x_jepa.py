@@ -61,7 +61,6 @@ def test_world_model(
 
     loss, loss_breakdown = world_model(states, actions, returns = returns)
 
-    assert len(loss_breakdown) == 16
     assert loss.ndim == 0
     loss.backward()
 
@@ -608,3 +607,55 @@ def test_interact_with_environment_multimodal():
     assert exists(experience.returns)
     _, returns_tensor = experience.returns
     assert returns_tensor.shape[1] == experience.states[0].shape[1]
+
+def test_world_model_with_intrinsics():
+    from x_jepa.intrinsic import CoinFlipNetwork
+
+    dim = 256
+    model = Transformer(
+        dim = dim,
+        depth = 2,
+        causal = True
+    )
+
+    cfn_net = nn.Sequential(nn.Linear(dim, 64), nn.ReLU(), nn.Linear(64, dim))
+    cfn = CoinFlipNetwork(net=cfn_net, dim=dim)
+
+    world_model = WorldModel(
+        model = model,
+        dim_action = 4,
+        state_encoder = nn.Linear(128, dim),
+        action_encoder = nn.Linear(4, dim),
+        action_decoder = nn.Linear(dim, 4),
+        transition_action_space = 'local',
+        continuous_actions = True,
+        intrinsics = [cfn],
+        intrinsic_loss_weight = 1.0
+    )
+
+    world_model.eval()
+
+    states = torch.randn(2, 5, 128)
+    actions = torch.randn(2, 4, 4)
+
+    # Test forward pass with intrinsics loss
+    loss, loss_breakdown = world_model(states, actions)
+    assert loss.dim() == 0
+    assert loss_breakdown.intrinsics.dim() == 0
+    assert len(loss_breakdown.intrinsics_breakdown) == 1
+
+    # Test planning pass with intrinsic bonus dependency injection
+    def fitness_fn(pred_intrinsic_bonuses):
+        bonus = pred_intrinsic_bonuses[0]
+        return bonus.sum(dim=-1)
+
+    planned_actions = world_model.plan(
+        states,
+        actions,
+        fitness_fn = fitness_fn,
+        horizon = 3,
+        pop_size = 4,
+        generations = 1
+    )
+
+    assert planned_actions.shape == (2, 3, 4)
