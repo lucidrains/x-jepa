@@ -1007,3 +1007,35 @@ def test_plan_mixed_cem_and_gradient_descent():
     )
 
     assert planned_actions.shape == (batch_size, 2, 4)
+
+@param('sensory_dropout', (0., 0.5))
+def test_sensory_dropout(sensory_dropout):
+    model = Transformer(
+        dim = 128,
+        depth = 2,
+        causal = True
+    )
+
+    world_model = WorldModel(
+        model = model,
+        dim_action = 4,
+        state_encoder = nn.ModuleList([nn.Linear(64, 128), nn.Linear(64, 128)]),
+        action_encoder = nn.Linear(4, 128),
+        action_decoder = nn.Linear(128, 4),
+        transition_action_space = 'local',
+        continuous_actions = True,
+        pass_sensory_hiddens_to_world_model = True,
+        sensory_dropout_prob = sensory_dropout
+    )
+
+    states = [torch.randn(2, 5, 64), torch.randn(2, 5, 64)]
+    actions = torch.randn(2, 4, 4)
+
+    world_model.train()
+    loss, _ = world_model(states, actions)
+    loss.backward()
+
+    world_model.eval()
+    with torch.no_grad():
+        out = world_model(states, actions, return_loss = False)
+        assert out['embeds'].shape == (2, 10, 128)

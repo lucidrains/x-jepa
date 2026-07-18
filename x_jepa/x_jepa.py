@@ -132,7 +132,7 @@ def tree_map_tensor_to_device(tree, device):
     return tree_map_tensor(lambda t: t.to(device), tree)
 
 def detach_tensor(t, *, preserve_requires_grad = False):
-    orig_requires_grad = t.require_grad
+    orig_requires_grad = t.requires_grad
     out = t.detach()
 
     if not preserve_requires_grad:
@@ -870,6 +870,7 @@ class WorldModel(Module):
         actor_model: Module | None = None,
         pass_world_model_hiddens_to_actor = True,
         pass_sensory_hiddens_to_actor = False,
+        sensory_dropout_prob: float = 0.,
         actor_dropout_all_but_state_latents = 0.,
         actor_loss_weights: float | dict[str, float] = 1.,
         dim_action = None,
@@ -947,6 +948,10 @@ class WorldModel(Module):
         self.num_sensory_views = num_sensory_views
 
         self.view_embs = nn.ParameterList([SmallInitEmbed((v, dim)) if v > 1 else None for v in self.num_sensory_views])
+
+        self.sensory_dropout_prob = sensory_dropout_prob
+        self.has_sensory_dropout = sensory_dropout_prob > 0.
+        assert not (self.has_sensory_dropout and len(self.state_encoder) == 1), 'sensory dropout is only allowed when there are multiple senses'
 
         self.use_perception_film = use_perception_film
         if use_perception_film:
@@ -1889,8 +1894,15 @@ class WorldModel(Module):
 
         if self.pass_sensory_hiddens_to_world_model:
             wm_past_layers = [rearrange([h, torch.zeros_like(h)], 'sa b n d -> b (n sa) d') for h in sensory_layer_hiddens]
+
             sensory_mask = tensor([True, False], device = device)
-            sensory_mask = repeat(sensory_mask, 'sa -> b (n sa)', b = batch, n = state_len)
+            sensory_mask = repeat(sensory_mask, 'sa -> b n sa', b = batch, n = state_len)
+
+            if self.training and self.has_sensory_dropout:
+                keep_sensory = torch.rand((batch, 1, 1), device = device) > self.sensory_dropout_prob
+                sensory_mask = sensory_mask & keep_sensory
+
+            sensory_mask = rearrange(sensory_mask, 'b n sa -> b (n sa)')
             wm_past_layers_mask = [sensory_mask] * len(sensory_layer_hiddens)
 
         # attention + eventually rnns - yes we need recurrence, i concede that.
