@@ -11,6 +11,7 @@ from collections import namedtuple
 import torch
 import torch.nn.functional as F
 from torch.distributions import Beta, Categorical
+from torch.optim import Adam, Optimizer
 
 import einx
 from torch import nn, cat, stack, tensor, is_tensor, Tensor
@@ -1252,6 +1253,9 @@ class WorldModel(Module):
         cem_ema_decay = 1.,
         cem_min_var = 1e-5,
         cem_temperature = 0.,
+        gradient_steps = 0,
+        gradient_lr = 1e-2,
+        gradient_optimizer: Callable[..., Optimizer] = Adam,
         seed_with_actor: str | None = None,
         actor_temperature = 1.,
         clamp_state_latent_to_range = True,
@@ -1279,6 +1283,7 @@ class WorldModel(Module):
         dim_action = self.dim_transition_action_input if not is_search_space_raw_action else self.dim_action
 
         has_cem_temperature = cem_temperature > 0.
+        has_gradient_steps = gradient_steps > 0
 
         # validation
 
@@ -1432,30 +1437,30 @@ class WorldModel(Module):
 
             seeded_actions = stack(seeded_actions, dim = 2)
 
-        # iterate
+        encoded_goal = None
 
-        for generation in range(generations):
-            is_first = generation == 0
-            is_last = generation == generations - 1
+        if exists(goal_state):
+            if is_tensor(goal_state):
+                goal_state = [goal_state]
 
-            # instantiate population
+            encoded_goal, _, _ = self.encode_states(self.ema_state_encoder, goal_state)
+            encoded_goal = rearrange(encoded_goal, 'b d -> b 1 1 d')
 
-            if is_first and exists(seed_actor):
-                actions = seeded_actions
-            else:
-                actions = means + variances.sqrt() * torch.randn((batch, pop_size, horizon, dim_action), device = device)
+        # introspect fitness_fn once
 
-            actions.clamp_(-1., 1.)
+        fitness_fn_params = inspect.signature(fitness_fn).parameters if exists(fitness_fn) else None
 
+        # helper for evaluating actions
+
+        def evaluate_actions(eval_actions):
             # the action condition into the step
 
             # the state transition for planning could take raw actions or action latents depending on the transition action space
 
-            actions_cond = actions
+            actions_cond = eval_actions
 
             if is_search_space_raw_action and not self.is_transition_action_space_raw:
                 actions_cond, unpack = pack_with_inverse(actions_cond, '* h d')
-
                 actions_cond = self.action_encoder(actions_cond)
 
                 # if using actions with global context of past actions, pass through linear rnn with previous memories
@@ -1464,7 +1469,6 @@ class WorldModel(Module):
                     actions_cond = self.action_linear_rnn(actions_cond, memories = past_rnn_memories)
 
                 actions_cond = self.to_action_latent(actions_cond)
-
                 actions_cond = unpack(actions_cond)
 
             # accumulating predictions across horizon
@@ -1507,19 +1511,8 @@ class WorldModel(Module):
 
             # evaluate
 
-            encoded_goal = None
-
-            if exists(goal_state):
-                if is_tensor(goal_state):
-                    goal_state = [goal_state]
-
-                encoded_goal, _, _ = self.encode_states(self.ema_state_encoder, goal_state)
-                encoded_goal = rearrange(encoded_goal, 'b d -> b 1 1 d')
-
             if exists(fitness_fn):
                 # simple introspect and dependency inject into fitness function
-
-                fn_params = inspect.signature(fitness_fn).parameters
 
                 kwargs = dict(
                     pred_state_latents = pred_state_latents,
@@ -1529,26 +1522,59 @@ class WorldModel(Module):
                     pred_state_entropies = pred_state_entropies
                 )
 
-                if 'pred_intrinsic_bonuses' in fn_params:
+                if 'pred_intrinsic_bonuses' in fitness_fn_params:
                     assert self.has_intrinsics, 'intrinsics must be passed into WorldModel'
 
                     flat_pred_state_latents, unpack = pack_with_inverse(pred_state_latents, '* d')
-
                     bonuses = tuple(unpack(intrinsic.compute_bonus(flat_pred_state_latents), '*') for intrinsic in self.intrinsics)
 
                     kwargs.update(pred_intrinsic_bonuses = bonuses)
 
                 allowed_params = set(kwargs.keys())
-                unknown_params = set(fn_params.keys()) - allowed_params
+                unknown_params = set(fitness_fn_params.keys()) - allowed_params
                 assert is_empty(unknown_params), f"fitness_fn accepts unknown parameters: {unknown_params}. Allowed parameters are: {', '.join(allowed_params)}"
 
-                fitness_fn_kwargs = {k: v for k, v in kwargs.items() if k in fn_params}
+                fitness_fn_kwargs = {k: v for k, v in kwargs.items() if k in fitness_fn_params}
                 fitnesses = fitness_fn(**fitness_fn_kwargs)
             else:
-                goal_dist_fn = default(goal_dist_fn, partial(F.smooth_l1_loss, reduction = 'none'))
-                distance_to_goal = goal_dist_fn(pred_next_encoded_states, encoded_goal.expand_as(pred_next_encoded_states))
-                distance_to_goal = reduce(distance_to_goal, 'b p h d -> b p', 'sum')
-                fitnesses = -distance_to_goal
+                dist_fn = default(goal_dist_fn, partial(F.smooth_l1_loss, reduction = 'none'))
+                distance_to_goal = dist_fn(pred_next_encoded_states, encoded_goal.expand_as(pred_next_encoded_states))
+                fitnesses = -reduce(distance_to_goal, 'b p h d -> b p', 'sum')
+
+            return fitnesses
+
+        # iterate
+
+        for generation in range(generations):
+            is_first = generation == 0
+            is_last = generation == generations - 1
+
+            # instantiate population
+
+            if is_first and exists(seed_actor):
+                actions = seeded_actions
+            else:
+                actions = means + variances.sqrt() * torch.randn((batch, pop_size, horizon, dim_action), device = device)
+
+            actions = actions.clamp(-1., 1.)
+
+            # gradient updates for actions
+
+            if has_gradient_steps:
+                actions = actions.detach().requires_grad_()
+                optimizer = gradient_optimizer([actions], lr = gradient_lr)
+
+                with torch.enable_grad():
+                    for _ in range(gradient_steps):
+                        optimizer.zero_grad()
+                        loss = -evaluate_actions(actions).sum()
+                        loss.backward()
+                        optimizer.step()
+                        actions.data.clamp_(-1., 1.)
+
+                actions = actions.detach()
+
+            fitnesses = evaluate_actions(actions)
 
             # select the fittest
 

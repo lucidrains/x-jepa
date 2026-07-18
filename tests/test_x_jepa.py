@@ -933,3 +933,77 @@ def test_world_model_ttt(use_perception_film, episodic_mem_len):
             break
 
     assert updated
+
+def test_plan_with_gradient_descent():
+    model = Transformer(
+        dim = 128,
+        depth = 2,
+        causal = True
+    )
+
+    world_model = WorldModel(
+        model = model,
+        dim_action = 4,
+        state_encoder = nn.Linear(128, 128),
+        action_encoder = nn.Linear(4, 128),
+        action_decoder = nn.Linear(128, 4),
+        transition_action_space = 'local',
+        continuous_actions = True
+    )
+
+    world_model.eval()
+
+    batch_size = 2
+    empty_actions = torch.empty(batch_size, 0, 4)
+    step_state = torch.randn(batch_size, 1, 128)
+    goal_state = torch.randn(batch_size, 128)
+
+    planned_actions = world_model.plan(
+        states = step_state,
+        actions = empty_actions,
+        goal_state = goal_state,
+        horizon = 2,
+        pop_size = 1,
+        generations = 1,
+        gradient_steps = 5,
+        gradient_lr = 0.1
+    )
+
+    assert planned_actions.shape == (batch_size, 2, 4)
+
+def test_plan_mixed_cem_and_gradient_descent():
+    model = Transformer(
+        dim = 128,
+        depth = 2,
+        causal = True
+    )
+
+    world_model = WorldModel(
+        model = model,
+        dim_action = 4,
+        state_encoder = nn.Linear(128, 128),
+        action_encoder = nn.Linear(4, 128),
+        action_decoder = nn.Linear(128, 4),
+        transition_action_space = 'local',
+        continuous_actions = True
+    )
+
+    world_model.eval()
+
+    batch_size = 2
+    empty_actions = torch.empty(batch_size, 0, 4)
+    step_state = torch.randn(batch_size, 1, 128)
+    goal_state = torch.randn(batch_size, 128)
+
+    planned_actions = world_model.plan(
+        states = step_state,
+        actions = empty_actions,
+        goal_state = goal_state,
+        horizon = 2,
+        pop_size = 256,
+        generations = 2,
+        gradient_steps = 10,
+        gradient_lr = 0.1
+    )
+
+    assert planned_actions.shape == (batch_size, 2, 4)
