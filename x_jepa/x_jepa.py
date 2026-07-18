@@ -12,12 +12,12 @@ import torch
 import torch.nn.functional as F
 from torch.distributions import Beta, Categorical
 from torch.optim import Adam, Optimizer
+from torch.utils._pytree import tree_map, tree_flatten
+from torch.func import functional_call, vmap
 
 import einx
 from torch import nn, cat, stack, tensor, is_tensor, Tensor
 from torch.nn import Module, ModuleList, ModuleDict, Linear, RMSNorm, Sequential
-from torch.utils._pytree import tree_map
-from torch.func import functional_call, vmap
 
 from einops import einsum, rearrange, repeat, reduce, pack, unpack
 from einops.layers.torch import Rearrange
@@ -37,10 +37,11 @@ from torch_einops_utils import (
     lens_to_mask,
     maybe,
     safe_cat,
-    detach_tensor,
     tree_map_detach,
     tree_map_tensor_to_device
 )
+
+from torch_einops_utils.device import module_device
 
 from PoPE_pytorch import PoPE, apply_pope_to_qk
 
@@ -107,11 +108,8 @@ def cast_tuple(t, length = 1):
     return t if isinstance(t, (tuple, list)) else ((t,) * length)
 
 def first_tensor(t):
-    if is_tensor(t):
-        return t
-    if isinstance(t, (list, tuple)):
-        return first_tensor(t[0])
-    return None
+    tensors, _ = tree_flatten(t)
+    return first(tensors)
 
 def first(t):
     return None if is_empty(t) else t[0]
@@ -288,15 +286,35 @@ class AttentionResidual(Module):
             self.to_query = LinearNoBias(dim, dim)
             self.split_queries_heads = Rearrange('m (h d) -> h m d', h = heads)
 
+        self.register_token = SmallInitEmbed(dim)
+
+    @property
+    def device(self):
+        return module_device(self)
+
     def forward(
         self,
         hiddens,
         mask = None
     ):
+        device = self.device
+
         if isinstance(hiddens, list):
             hiddens = stack(hiddens)
 
         hiddens, unpack = pack_with_inverse(hiddens, 'l * d')
+
+        # queries and similarities
+
+        if not self.use_pseudo_queries:
+            *_, last_layer_output = hiddens
+            queries = self.split_queries_heads(self.to_query(last_layer_output))
+
+        # add register token
+
+        m = hiddens.shape[1]
+        reg_token = repeat(self.register_token, 'd -> 1 m d', m = m)
+        hiddens = torch.cat((reg_token, hiddens), dim = 0)
 
         # cross attention
 
@@ -305,13 +323,9 @@ class AttentionResidual(Module):
 
         keys, values = self.split_heads(keys), self.split_heads(values)
 
-        # queries and similarities
-
         if self.use_pseudo_queries:
             sim = einsum(self.pseudo_queries, keys, 'h d, h l m d -> h m l') * self.scale
         else:
-            *_, last_layer_output = hiddens
-            queries = self.split_queries_heads(self.to_query(last_layer_output))
             sim = einsum(queries, keys, 'h m d, h l m d -> h m l') * self.scale
 
         # masking
@@ -320,6 +334,10 @@ class AttentionResidual(Module):
             mask = stack(mask) if isinstance(mask, (list, tuple)) else mask
 
             mask, _ = pack_with_inverse(mask, 'l *')
+
+            reg_mask = torch.ones((1, mask.shape[1]), dtype = torch.bool, device = device)
+            mask = torch.cat((reg_mask, mask), dim = 0)
+
             mask = rearrange(mask, 'l m -> m l')
 
             mask = pad_right_at_dim_to(mask, sim.shape[-1], value = True)
@@ -890,7 +908,9 @@ class WorldModel(Module):
         actor_model: Module | None = None,
         pass_world_model_hiddens_to_actor = True,
         pass_sensory_hiddens_to_actor = False,
-        sensory_dropout_prob: float = 0.,
+        sensory_dropout_prob = 0.,
+        use_structured_sensory_dropout = False,
+        structured_sensory_dropout_keep_prob = 0.1,
         actor_dropout_all_but_state_latents = 0.,
         actor_loss_weights: float | dict[str, float] = 1.,
         dim_action = None,
@@ -969,9 +989,17 @@ class WorldModel(Module):
 
         self.view_embs = nn.ParameterList([SmallInitEmbed((v, dim)) if v > 1 else None for v in self.num_sensory_views])
 
+        total_sensory_views = sum(self.num_sensory_views)
+        self.sensory_mask_tokens = nn.ParameterList([SmallInitEmbed(dim) for _ in range(total_sensory_views)])
+
         self.sensory_dropout_prob = sensory_dropout_prob
         self.has_sensory_dropout = sensory_dropout_prob > 0.
+
+        self.use_structured_sensory_dropout = use_structured_sensory_dropout
+        self.structured_sensory_dropout_keep_prob = structured_sensory_dropout_keep_prob
+
         assert not (self.has_sensory_dropout and len(self.state_encoder) == 1), 'sensory dropout is only allowed when there are multiple senses'
+        assert not (self.use_structured_sensory_dropout and len(self.state_encoder) == 1), 'structured sensory dropout is only allowed when there are multiple senses'
 
         self.use_perception_film = use_perception_film
         if use_perception_film:
@@ -1220,7 +1248,8 @@ class WorldModel(Module):
     def encode_states(
         self,
         encoder: ModuleList,
-        states: States
+        states: States,
+        masks = None
     ):
         if is_tensor(states):
             states = [states]
@@ -1231,7 +1260,10 @@ class WorldModel(Module):
         sensory_layer_hiddens = []
         sensory_for_alignment = []
 
-        for enc, state, views, view_emb in zip(encoder, states, self.num_sensory_views, self.view_embs):
+        total_view_idx = 0
+        masks = default(masks, (None,) * len(encoder))
+
+        for enc, state, views, view_emb, mask in zip(encoder, states, self.num_sensory_views, self.view_embs, masks):
             has_multi_views = views > 1
 
             if has_multi_views:
@@ -1251,8 +1283,20 @@ class WorldModel(Module):
                 sensory_for_alignment.append(embed)
 
             embeds = list(embed) if has_multi_views else [embed]
-            encoded.extend(embeds)
-            sensory_layer_hiddens.extend(embeds)
+
+            if exists(mask):
+                mask = rearrange(mask, 'b n -> b n 1')
+
+            for view_embed in embeds:
+                sum_embed = view_embed
+
+                if exists(mask):
+                    mask_token = self.sensory_mask_tokens[total_view_idx]
+                    sum_embed = torch.where(mask, view_embed, mask_token)
+
+                encoded.append(sum_embed)
+                sensory_layer_hiddens.append(view_embed)
+                total_view_idx += 1
 
         return sum(encoded), sensory_layer_hiddens, sensory_for_alignment
 
@@ -1823,9 +1867,27 @@ class WorldModel(Module):
 
         next_model_memories = dict()
 
+        # generate structured dropout mask
+
+        sensory_layer_masks = None
+
+        if self.training and (self.has_sensory_dropout or self.use_structured_sensory_dropout):
+            num_senses = len(self.state_encoder)
+            sensory_layer_masks = torch.ones((num_senses, batch, state_len), dtype = torch.bool, device = device)
+
+            if self.has_sensory_dropout:
+                keep_sensory = torch.rand((num_senses, batch, 1), device = device) > self.sensory_dropout_prob
+                sensory_layer_masks &= keep_sensory
+
+            if self.use_structured_sensory_dropout:
+                keep_structured = torch.rand((num_senses, batch, state_len), device = device) < self.structured_sensory_dropout_keep_prob
+                sensory_layer_masks &= keep_structured
+
+            sensory_layer_masks = sensory_layer_masks.unbind(dim = 0)
+
         # encode the states and actions, todo: do mixture of transformers, a la VLAs
 
-        state_tokens, sensory_layer_hiddens, sensory_for_alignment = self.encode_states(self.state_encoder, states)
+        state_tokens, sensory_layer_hiddens, sensory_for_alignment = self.encode_states(self.state_encoder, states, sensory_layer_masks)
 
         # perceptual gating
 
@@ -1915,15 +1977,17 @@ class WorldModel(Module):
         if self.pass_sensory_hiddens_to_world_model:
             wm_past_layers = [rearrange([h, torch.zeros_like(h)], 'sa b n d -> b (n sa) d') for h in sensory_layer_hiddens]
 
-            sensory_mask = tensor([True, False], device = device)
-            sensory_mask = repeat(sensory_mask, 'sa -> b n sa', b = batch, n = state_len)
+            wm_past_layers_mask = []
+            masks = default(sensory_layer_masks, (None,) * len(self.num_sensory_views))
 
-            if self.training and self.has_sensory_dropout:
-                keep_sensory = torch.rand((batch, 1, 1), device = device) > self.sensory_dropout_prob
-                sensory_mask = sensory_mask & keep_sensory
+            for views, mask in zip(self.num_sensory_views, masks):
+                state_mask = default(mask, torch.ones((batch, state_len), dtype = torch.bool, device = device))
+                action_mask = torch.zeros_like(state_mask)
 
-            sensory_mask = rearrange(sensory_mask, 'b n sa -> b (n sa)')
-            wm_past_layers_mask = [sensory_mask] * len(sensory_layer_hiddens)
+                interleaved_mask = rearrange([state_mask, action_mask], 'sa b n -> b (n sa)')
+
+                for _ in range(views):
+                    wm_past_layers_mask.append(interleaved_mask)
 
         # attention + eventually rnns - yes we need recurrence, i concede that.
 
