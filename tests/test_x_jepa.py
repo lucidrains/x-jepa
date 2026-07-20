@@ -1050,7 +1050,12 @@ def test_sensory_dropout(sensory_dropout):
 @param('seq_len', (None, 4, 10))
 def test_action_flow_matching(seq_len):
     dim_action = 8
-    model = LatentActionModel(dim_action)
+    dim_state_latent = 16
+
+    model = LatentActionModel(
+        dim_action,
+        dim_state_latent = dim_state_latent
+    )
     flow_matching = model
 
     batch_size = 16
@@ -1063,38 +1068,61 @@ def test_action_flow_matching(seq_len):
 
     if exists(seq_len):
         expert_actions = torch.rand(batch_size, seq_len, dim_action) * 2 - 1
+        expert_state_latents = torch.randn(batch_size, seq_len, dim_state_latent)
     else:
         expert_actions = torch.rand(batch_size, dim_action) * 2 - 1
+        expert_state_latents = torch.randn(batch_size, dim_state_latent)
 
     for _ in range(50):
         optimizer.zero_grad()
-        loss = flow_matching(expert_actions)
+        loss = flow_matching(
+            expert_actions,
+            state_latent = expert_state_latents,
+            cond_drop_prob = 0.25
+        )
         loss.backward()
         optimizer.step()
 
     # embed real actions back to gaussian noise using invert method
 
     test_actions = expert_actions[:4]
+    test_state_latents = expert_state_latents[:4]
 
     # invert the actions back to noise
 
-    latent_noise = flow_matching.invert(test_actions, steps = 32)
+    latent_noise = flow_matching.invert(
+        test_actions,
+        state_latent = test_state_latents,
+        steps = 32
+    )
 
-    # sample back from that noise
+    # sample back from that noise (conditioned on state_latent)
 
     reconstructed_actions = flow_matching.sample(
+        steps = 32,
+        batch_size = test_actions.shape[0],
+        noise = latent_noise,
+        state_latent = test_state_latents
+    )
+
+    assert reconstructed_actions.shape == test_actions.shape
+
+    # sample back unconditionally (null state_latent)
+
+    uncond_reconstructed_actions = flow_matching.sample(
         steps = 32,
         batch_size = test_actions.shape[0],
         noise = latent_noise
     )
 
-    assert reconstructed_actions.shape == test_actions.shape
+    assert uncond_reconstructed_actions.shape == test_actions.shape
 
     # demonstrate that LatentActionModel can take in variable length sequences
 
     if exists(seq_len):
         seq_actions = torch.randn(batch_size, seq_len, dim_action)
         seq_times = torch.rand(batch_size)
+        seq_state_latents = torch.randn(batch_size, seq_len, dim_state_latent)
 
-        seq_out = model.model(seq_actions, seq_times)
+        seq_out = model.model(seq_actions, seq_times, state_latent = seq_state_latents)
         assert seq_out.shape == (batch_size, seq_len, dim_action)

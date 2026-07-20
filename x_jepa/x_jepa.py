@@ -33,6 +33,7 @@ from torch_einops_utils import (
     temp_eval,
     batched_index_select,
     tree_map_tensor,
+    tree_flatten_with_inverse,
     pack_with_inverse,
     lens_to_mask,
     maybe,
@@ -395,6 +396,32 @@ class EpisodicMemories(Module):
 
 # transformer
 
+class AdaNormWrapper(Module):
+    def __init__(self, dim, dim_cond_hidden, block):
+        super().__init__()
+        self.block = block
+        self.norm = RMSNorm(dim)
+
+        self.proj = nn.Linear(dim_cond_hidden, dim * 3)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, tokens, cond = None, **kwargs):
+        assert exists(cond)
+
+        gamma, beta, alpha = self.proj(cond).chunk(3, dim = -1)
+
+        normed_tokens = self.norm(tokens)
+        normed_tokens = normed_tokens * (1 + gamma) + beta
+
+        out = self.block(normed_tokens, **kwargs)
+
+        (out, *rest), pack_out = tree_flatten_with_inverse(out)
+
+        out = out * alpha
+
+        return pack_out((out, *rest))
+
 class Transformer(Module):
     def __init__(
         self,
@@ -407,22 +434,36 @@ class Transformer(Module):
         ff_expand_factor = 4.,
         use_pope = False,
         use_pseudo_queries = False,
-        attn_res_dim_head = None
+        attn_res_dim_head = None,
+        dim_cond = None
     ):
         super().__init__()
         self.dim = dim
         self.depth = depth
         self.heads = heads
         self.dim_head = dim_head
+        self.dim_cond = dim_cond
 
         self.pope = PoPE(dim_head, heads = heads) if use_pope else None
+
+        has_cond = exists(dim_cond)
+
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(dim_cond, dim * 2),
+            nn.SiLU()
+        ) if has_cond else None
 
         layers = ModuleList([])
 
         for _ in range(depth):
-            attn = Attention(dim = dim, dim_head = dim_head, heads = heads, causal = causal)
+            prenorm = not has_cond
+            attn = Attention(dim = dim, dim_head = dim_head, heads = heads, causal = causal, prenorm = prenorm)
             attn_res = AttentionResidual(dim = dim, use_pseudo_queries = use_pseudo_queries, dim_head = attn_res_dim_head)
-            ff = SwiGLUFeedForward(dim = dim, expand_factor = ff_expand_factor)
+            ff = SwiGLUFeedForward(dim = dim, expand_factor = ff_expand_factor, prenorm = prenorm)
+
+            if has_cond:
+                attn = AdaNormWrapper(dim, dim * 2, attn)
+                ff = AdaNormWrapper(dim, dim * 2, ff)
 
             layers.append(ModuleList([attn_res, attn, ff]))
 
@@ -436,9 +477,19 @@ class Transformer(Module):
         return_hiddens = False,
         memories = None,
         prepend_memories = None,
-        return_memories = False
+        return_memories = False,
+        cond = None
     ):
+        has_cond = exists(self.dim_cond)
+
         seq_len = tokens.shape[-2]
+
+        if has_cond:
+            assert exists(cond)
+            cond = self.cond_mlp(cond)
+
+            if cond.ndim == 2:
+                cond = rearrange(cond, 'b d -> b 1 d')
 
         past_seq_len = 0
         layer_memories = None
@@ -463,18 +514,25 @@ class Transformer(Module):
                 prep_memory = next(prepend_memories_iter)
                 layer_memory = tuple(safe_cat((p, m), dim = -2) for p, m in zip(prep_memory, layer_memory or (None, None)))
 
-            attn_out, next_memory = attn(
-                tokens,
+            attn_kwargs = dict(
                 pope_pos_emb = pope_pos_emb,
                 memories = layer_memory,
                 return_memories = True
             )
 
+            if has_cond:
+                attn_kwargs.update(cond = cond)
+
+            attn_out, next_memory = attn(tokens, **attn_kwargs)
+
             if return_memories:
                 next_layer_memories.append(next_memory)
 
             tokens = attn_out + tokens
-            tokens = ff(tokens) + tokens
+
+            ff_kwargs = dict(cond = cond) if has_cond else dict()
+
+            tokens = ff(tokens, **ff_kwargs) + tokens
 
             layer_hiddens.append(tokens)
 
