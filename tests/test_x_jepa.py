@@ -3,6 +3,7 @@ param = pytest.mark.parametrize
 
 import torch
 from torch import nn, tensor, cat
+import torch.nn.functional as F
 from torch.testing import assert_close
 
 from einops import reduce, rearrange
@@ -13,7 +14,9 @@ from x_mlps_pytorch import MLP
 from x_jepa.x_jepa import WorldModel, Transformer, Actor, exists, WorldModelRolloutWrapper, TTTMetaLearningLoss
 from x_jepa.min_gru import minGRUBlocks
 from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
-from x_jepa.goals import FlowMatching, GoalGenerator
+from x_jepa.goals import GoalGenerator
+from x_jepa.flow_matching import FlowMatching
+from x_jepa.latent_action_model import LatentActionModel
 
 @param('plan_type', ('no_goal', 'goal', 'custom_goal'))
 @param('transition_action_space', ('raw', 'local', 'global'))
@@ -1043,3 +1046,55 @@ def test_sensory_dropout(sensory_dropout):
     with torch.no_grad():
         out = world_model(states, actions, return_loss = False)
         assert out['embeds'].shape == (2, 10, 128)
+
+@param('seq_len', (None, 4, 10))
+def test_action_flow_matching(seq_len):
+    dim_action = 8
+    model = LatentActionModel(dim_action)
+    flow_matching = model
+
+    batch_size = 16
+
+    # train the model on dummy continuous actions
+
+    optimizer = torch.optim.Adam(flow_matching.parameters(), lr = 1e-2)
+
+    # create some dummy expert actions
+
+    if exists(seq_len):
+        expert_actions = torch.rand(batch_size, seq_len, dim_action) * 2 - 1
+    else:
+        expert_actions = torch.rand(batch_size, dim_action) * 2 - 1
+
+    for _ in range(50):
+        optimizer.zero_grad()
+        loss = flow_matching(expert_actions)
+        loss.backward()
+        optimizer.step()
+
+    # embed real actions back to gaussian noise using invert method
+
+    test_actions = expert_actions[:4]
+
+    # invert the actions back to noise
+
+    latent_noise = flow_matching.invert(test_actions, steps = 32)
+
+    # sample back from that noise
+
+    reconstructed_actions = flow_matching.sample(
+        steps = 32,
+        batch_size = test_actions.shape[0],
+        noise = latent_noise
+    )
+
+    assert reconstructed_actions.shape == test_actions.shape
+
+    # demonstrate that LatentActionModel can take in variable length sequences
+
+    if exists(seq_len):
+        seq_actions = torch.randn(batch_size, seq_len, dim_action)
+        seq_times = torch.rand(batch_size)
+
+        seq_out = model.model(seq_actions, seq_times)
+        assert seq_out.shape == (batch_size, seq_len, dim_action)

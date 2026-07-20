@@ -29,6 +29,9 @@ Experience = namedtuple('Experience', [
 def exists(v):
     return v is not None
 
+def default(v, d):
+    return v if exists(v) else d
+
 def is_vectorized(env):
     num_envs = getattr(env, 'num_envs', 0)
     is_vector_env = getattr(env, 'is_vector_env', False)

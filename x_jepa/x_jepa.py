@@ -49,7 +49,8 @@ from x_jepa.utils import EnvWrapper, Experience
 
 from x_jepa.regularizers import SigReg, uniform_wasserstein_loss, temporal_straightening_loss
 from x_jepa.min_gru import minGRUBlocks
-from x_jepa.goals import GoalGenerator, FlowMatching
+from x_jepa.goals import GoalGenerator, RandomSinusoidalPosEmb
+from x_jepa.flow_matching import FlowMatching
 
 # constants
 
