@@ -14,7 +14,7 @@ from x_mlps_pytorch import MLP
 from x_jepa.x_jepa import WorldModel, Transformer, Actor, exists, WorldModelRolloutWrapper, TTTMetaLearningLoss
 from x_jepa.min_gru import minGRUBlocks
 from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
-from x_jepa.goals import GoalGenerator
+from x_jepa.goals import GoalGenerator, MetricResidualNetwork
 from x_jepa.flow_matching import FlowMatching
 from x_jepa.latent_action_model import LatentActionModel
 
@@ -1160,3 +1160,47 @@ def test_latent_action_model_prepend_and_causal(seq_len):
     )
 
     assert sampled_actions.shape == (batch_size, seq_len, dim_action)
+
+@param('use_mrn', (True, False))
+def test_mrn_world_model(use_mrn):
+    model = Transformer(
+        dim = 512,
+        depth = 2,
+        causal = True
+    )
+
+    mrn = None
+    if use_mrn:
+        mrn = MetricResidualNetwork(
+            sym_network = MLP(512, 256, 512),
+            asym_network = MLP(512, 256, 512)
+        )
+
+    world_model = WorldModel(
+        state_encoder = nn.Linear(128, 512),
+        action_encoder = nn.Linear(20, 512),
+        action_decoder = nn.Linear(32, 20),
+        transition_action_space = 'local',
+        dim_action = 20,
+        dim_action_latent = 32,
+        model = model,
+        quasimetric_distance_network = mrn
+    )
+
+    states = torch.randn(2, 4, 128)
+    actions = torch.randn(2, 3, 20).tanh()
+
+    loss, loss_breakdown = world_model(states, actions)
+    assert loss.ndim == 0
+    loss.backward()
+
+    # plan
+
+    planned_actions = world_model.plan(
+        states[:, :2],
+        actions[:, :1],
+        horizon = 3,
+        goal_state = torch.randn(2, 128)
+    )
+
+    assert planned_actions.shape == (2, 3, 20)

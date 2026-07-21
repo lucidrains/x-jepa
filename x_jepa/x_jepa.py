@@ -78,7 +78,8 @@ Losses = namedtuple('Losses', [
     'cross_sensory_align_sigreg',
     'cross_sensory_align_breakdown',
     'intrinsics',
-    'intrinsics_breakdown'
+    'intrinsics_breakdown',
+    'quasimetric_distance'
 ])
 
 CrossSensoryPairLoss = namedtuple('CrossSensoryPairLoss', ['src', 'tgt', 'loss'])
@@ -1006,7 +1007,9 @@ class WorldModel(Module):
         intrinsics: Module | list[Module] | ModuleList | tuple[Module, ...] | None = None,
         intrinsic_loss_weight: float = 1.,
         intrinsic_frac_gradient: float | tuple[float, ...] | list[float] = 0.,
-        episodic_mem_len = 0
+        episodic_mem_len = 0,
+        quasimetric_distance_network = None,
+        quasimetric_distance_loss_weight = 1.
     ):
         super().__init__()
 
@@ -1259,6 +1262,11 @@ class WorldModel(Module):
                 returns_norm_momentum = returns_norm_momentum # controls how fast the agent ascends the hedonic treadmill
             )
             self.goal_flow_matching = FlowMatching(model = self.goal_generator)
+
+        # quasimetric
+
+        self.quasimetric_distance_network = quasimetric_distance_network
+        self.quasimetric_distance_loss_weight = quasimetric_distance_loss_weight
 
         # intrinsics
 
@@ -1664,7 +1672,18 @@ class WorldModel(Module):
 
                 fitness_fn_kwargs = {k: v for k, v in kwargs.items() if k in fitness_fn_params}
                 fitnesses = fitness_fn(**fitness_fn_kwargs)
+
+            elif not exists(goal_dist_fn) and exists(self.quasimetric_distance_network):
+                # evaluate MRN distance on predicted states and goal
+                # enforces state (left) to goal (right) encoder asymmetry
+
+                _, p, h, _ = pred_state_latents.shape
+                encoded_goal_expanded = encoded_goal.expand(-1, p, h, -1)
+                distances = self.quasimetric_distance_network(pred_state_latents, encoded_goal_expanded)
+                fitnesses = -reduce(distances, 'b p h -> b p', 'sum')
             else:
+                # default to simple distance function if no fitness function or quasimetric distance provided
+
                 dist_fn = default(goal_dist_fn, partial(F.smooth_l1_loss, reduction = 'none'))
                 distance_to_goal = dist_fn(pred_next_encoded_states, encoded_goal.expand_as(pred_next_encoded_states))
                 fitnesses = -reduce(distance_to_goal, 'b p h d -> b p', 'sum')
@@ -2298,6 +2317,27 @@ class WorldModel(Module):
                 intrinsics_loss = sum(ind_losses)
                 intrinsics_breakdown = tuple(ind_losses)
 
+        # quasimetric loss
+
+        quasimetric_distance_loss = self.zero
+
+        if exists(self.quasimetric_distance_network) and ema_encoded_state.shape[1] > 1:
+            seq_len = ema_encoded_state.shape[1]
+
+            t1 = torch.randint(0, seq_len, (batch,), device = device)
+            t2 = torch.randint(0, seq_len, (batch,), device = device)
+
+            # enforces state (left) to goal (right) encoder asymmetry
+            state_left = batched_index_select(state_latents_full, t1, dim = 1)
+            state_right = batched_index_select(ema_encoded_state, t2, dim = 1)
+
+            quasimetric_distance_loss = self.quasimetric_distance_network.time_contrastive_loss(
+                state_left,
+                state_right,
+                t1,
+                t2
+            )
+
         # losses
 
         loss_breakdown = Losses(
@@ -2319,7 +2359,8 @@ class WorldModel(Module):
             cross_sensory_align_sigreg_loss,
             cross_sensory_align_breakdown,
             intrinsics_loss,
-            intrinsics_breakdown
+            intrinsics_breakdown,
+            quasimetric_distance_loss
         )
 
         total_loss = (
@@ -2338,7 +2379,8 @@ class WorldModel(Module):
             align_pre_state_action_repr_sigreg_loss * self.align_pre_state_action_repr_sigreg_weight +
             cross_sensory_align_loss * self.cross_sensory_align_loss_weight +
             cross_sensory_align_sigreg_loss * self.cross_sensory_align_sigreg_weight +
-            intrinsics_loss * self.intrinsic_loss_weight
+            intrinsics_loss * self.intrinsic_loss_weight +
+            quasimetric_distance_loss * self.quasimetric_distance_loss_weight
         )
 
         out = (total_loss, loss_breakdown)

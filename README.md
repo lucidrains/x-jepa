@@ -189,3 +189,15 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
     url     = {https://arxiv.org/abs/2512.23675},
 }
 ```
+
+```bibtex
+@misc{liu2023metricresidualnetworkssample,
+    title   = {Metric Residual Networks for Sample Efficient Goal-Conditioned Reinforcement Learning},
+    author  = {Bo Liu and Yihao Feng and Qiang Liu and Peter Stone},
+    year    = {2023},
+    eprint  = {2208.08133},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2208.08133},
+}
+```
