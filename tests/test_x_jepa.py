@@ -1126,3 +1126,37 @@ def test_action_flow_matching(seq_len):
 
         seq_out = model.model(seq_actions, seq_times, state_latent = seq_state_latents)
         assert seq_out.shape == (batch_size, seq_len, dim_action)
+
+@param('seq_len', (4, 10))
+def test_latent_action_model_prepend_and_causal(seq_len):
+    dim_action = 8
+    dim_state_latent = 16
+
+    model = LatentActionModel(
+        dim_action,
+        dim_state_latent = dim_state_latent,
+        prepend_state_latent = True,
+        causal_mask = True
+    )
+
+    batch_size = 2
+    actions = torch.randn(batch_size, seq_len, dim_action)
+    state_latents = torch.randn(batch_size, dim_state_latent)
+
+    loss = model(
+        actions,
+        state_latent = state_latents
+    )
+
+    assert loss.ndim == 0
+    loss.backward()
+
+    noise = torch.randn(batch_size, seq_len, dim_action)
+    sampled_actions = model.sample(
+        steps = 2,
+        batch_size = batch_size,
+        noise = noise,
+        state_latent = state_latents
+    )
+
+    assert sampled_actions.shape == (batch_size, seq_len, dim_action)

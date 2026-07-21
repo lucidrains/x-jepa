@@ -27,24 +27,32 @@ class ActionVectorField(Module):
         self,
         dim,
         dim_state_latent = None,
-        depth = 2
+        depth = 2,
+        prepend_state_latent = False,
+        causal_mask = False
     ):
         super().__init__()
         self.time_emb = RandomSinusoidalPosEmb(dim)
         self.dim_state_latent = default(dim_state_latent, 0)
         self.has_state_latent = self.dim_state_latent > 0
+        self.prepend_state_latent = prepend_state_latent
 
         if self.has_state_latent:
             self.null_state_latent = nn.Parameter(torch.zeros(self.dim_state_latent))
 
+            if self.prepend_state_latent:
+                self.state_latent_proj = nn.Linear(self.dim_state_latent, dim)
+
         self.proj_in = nn.Linear(dim, dim)
+
+        dim_cond = dim if self.prepend_state_latent else (dim + self.dim_state_latent)
 
         self.net = Transformer(
             dim = dim,
             depth = depth,
-            causal = False,
+            causal = causal_mask,
             use_pope = True,
-            dim_cond = dim + self.dim_state_latent
+            dim_cond = dim_cond
         )
         self.proj_out = nn.Sequential(
             RMSNorm(dim),
@@ -60,19 +68,22 @@ class ActionVectorField(Module):
         **kwargs
     ):
         has_cond_drop = cond_drop_prob > 0.
+        prepend_state_latent = self.prepend_state_latent
 
         time = self.time_emb(time)
 
         action, unpack_action = pack_with_inverse([action], 'b * d')
-        n = action.shape[-2]
+        batch, seq_len = action.shape[0], action.shape[-2]
 
-        time = repeat(time, 'b d -> b n d', n = n)
+        if prepend_state_latent:
+            seq_len += 1
+
+        time = repeat(time, 'b d -> b n d', n = seq_len)
 
         cond_inputs = [time]
+        state_latent_tokens = None
 
         if self.has_state_latent:
-            batch = action.shape[0]
-
             if not exists(state_latent):
                 state_latent = self.null_state_latent
                 state_latent = repeat(state_latent, 'd -> b 1 d', b = batch)
@@ -91,17 +102,29 @@ class ActionVectorField(Module):
                         null_state_latent
                     )
 
-            state_seq_len = state_latent.shape[-2]
+            if prepend_state_latent:
+                state_latent = state_latent[:, :1]
+                state_latent_tokens = self.state_latent_proj(state_latent)
+            else:
+                state_seq_len = state_latent.shape[-2]
 
-            if state_seq_len == 1 and n > 1:
-                state_latent = repeat(state_latent, 'b 1 d -> b n d', n = n)
+                if state_seq_len == 1 and seq_len > 1:
+                    state_latent = repeat(state_latent, 'b 1 d -> b n d', n = seq_len)
 
-            cond_inputs.append(state_latent)
+                cond_inputs.append(state_latent)
 
         cond = cat(cond_inputs, dim = -1)
 
         x = self.proj_in(action)
+
+        if prepend_state_latent and exists(state_latent_tokens):
+            x, unpack_prepend = pack_with_inverse([state_latent_tokens, x], 'b * d')
+
         x = self.net(x, cond = cond)
+
+        if prepend_state_latent and exists(state_latent_tokens):
+            _, x = unpack_prepend(x)
+
         x = self.proj_out(x)
 
         x, = unpack_action(x)
@@ -115,9 +138,17 @@ def LatentActionModel(
     dim_state_latent = None,
     depth = 2,
     noise_std = 1.0,
-    loss_fn = F.mse_loss
+    loss_fn = F.mse_loss,
+    prepend_state_latent = False,
+    causal_mask = False
 ):
-    model = ActionVectorField(dim, dim_state_latent, depth = depth)
+    model = ActionVectorField(
+        dim,
+        dim_state_latent,
+        depth = depth,
+        prepend_state_latent = prepend_state_latent,
+        causal_mask = causal_mask
+    )
 
     return FlowMatching(
         model = model,
