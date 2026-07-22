@@ -29,7 +29,7 @@ def uniform_wasserstein_loss(x):
     x = rearrange(x, 'b ... d -> (b ...) d')
     batch, dim, device, dtype = *x.shape, x.device, x.dtype
 
-    x_sorted, _ = x.sort(dim=0)
+    x_sorted, _ = x.sort(dim = 0)
     quantiles = (torch.arange(batch, device = device, dtype = dtype) + 0.5) / batch
     target = quantiles * 2. - 1.
     target = repeat(target, 'b -> b d', d = dim)

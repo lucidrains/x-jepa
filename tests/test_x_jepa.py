@@ -17,6 +17,8 @@ from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
 from x_jepa.goals import GoalGenerator, MetricResidualNetwork
 from x_jepa.flow_matching import FlowMatching
 from x_jepa.latent_action_model import LatentActionModel
+from x_jepa.rl import ppo_loss, tpo_loss
+from x_jepa.utils import store_experience_in_replay_buffer, experience_from_replay_buffer, Experience
 
 @param('plan_type', ('no_goal', 'goal', 'custom_goal'))
 @param('transition_action_space', ('raw', 'local', 'global'))
@@ -1204,3 +1206,203 @@ def test_mrn_world_model(use_mrn):
     )
 
     assert planned_actions.shape == (2, 3, 20)
+
+@param('rl_type', ('ppo', 'tpo'))
+@param('is_vector_env', (False, True))
+def test_end_to_end_bc_rl_finetune_flow(rl_type, is_vector_env):
+    import tempfile
+    import gymnasium as gym
+    from torch.optim import Adam
+
+    obs_dim = 4
+    action_dim = 2
+    dim_model = 64
+    horizon = 5
+
+    env = gym.vector.SyncVectorEnv([lambda: gym.make('CartPole-v1')] * 2) if is_vector_env else gym.make('CartPole-v1')
+
+    # instantiate world model with transformer backbone and reflexive actor
+
+    model = Transformer(
+        dim = dim_model,
+        depth = 2,
+        causal = True
+    )
+
+    world_model = WorldModel(
+        state_encoder = nn.Linear(obs_dim, dim_model),
+        action_encoder = nn.Embedding(action_dim, dim_model),
+        action_decoder = nn.Linear(dim_model, action_dim),
+        transition_action_space = 'local',
+        dim_action = action_dim,
+        model = model,
+        add_reflexive_actor = True,
+        continuous_actions = False
+    )
+
+    wm_optimizer = Adam(world_model.parameters(), lr = 1e-3)
+
+    # system 2 exploration / trial & error rollouts using cem planning
+
+    planning_experience = world_model.interact_with_environment(
+        env,
+        max_steps = horizon,
+        actor_module = None, # cem planning
+        fitness_fn = lambda pred_state_latents: pred_state_latents.sum(dim = (-1, -2))
+    )
+
+    assert planning_experience.states.ndim == 3
+
+    # store in memmap replay buffer & train world model
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        buffer = store_experience_in_replay_buffer(
+            planning_experience,
+            1000,
+            100000,
+            folder = tmpdir,
+            overwrite = True
+        )
+
+        reloaded_exp = experience_from_replay_buffer(buffer)
+        assert reloaded_exp.states.shape == planning_experience.states.shape
+
+        wm_loss, _ = world_model(reloaded_exp.states, reloaded_exp.actions)
+        assert wm_loss.ndim == 0
+        wm_loss.backward()
+        wm_optimizer.step()
+
+    # behavior clone planned actions into reflexive actor
+
+    actor_optimizer = Adam(world_model.actors['reflexive'].parameters(), lr = 1e-3)
+
+    bc_loss, _ = world_model(
+        planning_experience.states,
+        planning_experience.actions,
+        behavior_clone = True
+    )
+    assert bc_loss.ndim == 0
+    bc_loss.backward()
+    actor_optimizer.step()
+
+    # roll out bc actor against environment, gathering log probabilities
+
+    bc_experience = world_model.interact_with_environment(
+        env,
+        max_steps = horizon,
+        actor_module = 'reflexive'
+    )
+
+    assert exists(bc_experience.actor_log_probs)
+
+    # store bc rollout experience in memmap replay buffer
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bc_buffer = store_experience_in_replay_buffer(
+            bc_experience,
+            1000,
+            100000,
+            folder = tmpdir,
+            overwrite = True
+        )
+        fetched_bc_exp = experience_from_replay_buffer(bc_buffer)
+        assert exists(fetched_bc_exp.actor_log_probs)
+
+    # rl fine-tuning step
+
+    actor = world_model.actors['reflexive']
+
+    if rl_type == 'ppo':
+        optimizer = Adam(list(actor.parameters()) + list(world_model.value_network.parameters()), lr = 1e-3)
+        loss_fn = ppo_loss
+    else:
+        optimizer = Adam(actor.parameters(), lr = 1e-3)
+        loss_fn = tpo_loss
+
+    optimizer.zero_grad()
+    loss = loss_fn(world_model, fetched_bc_exp, actor_module = 'reflexive')
+    assert loss.ndim == 0
+    loss.backward()
+    optimizer.step()
+
+    # train latent action model on fine-tuned actions
+
+    fine_tuned_exp = world_model.interact_with_environment(
+        env,
+        max_steps = horizon,
+        actor_module = 'reflexive'
+    )
+
+    init_state_latent = fine_tuned_exp.state_latents[:, 0]
+
+    latent_action_model = LatentActionModel(
+        dim = dim_model,
+        dim_state_latent = dim_model,
+        prepend_state_latent = True,
+        causal_mask = True
+    )
+
+    lam_optimizer = Adam(latent_action_model.parameters(), lr = 1e-3)
+
+    fine_tuned_action_latents = world_model.to_action_latent(world_model.encode_actions(fine_tuned_exp.actions))
+
+    lam_loss = latent_action_model(
+        fine_tuned_action_latents,
+        state_latent = init_state_latent
+    )
+    assert lam_loss.ndim == 0
+    lam_loss.backward()
+    lam_optimizer.step()
+
+    # plan with latent action model generating candidate proposal actions
+
+    planned_actions = world_model.plan(
+        fine_tuned_exp.states[:, :2],
+        fine_tuned_exp.actions[:, :1],
+        horizon = horizon,
+        latent_action_model = latent_action_model,
+        latent_action_model_steps = 2,
+        latent_action_model_chunk_size = (3, 2),
+        fitness_fn = lambda pred_state_latents: pred_state_latents.sum(dim = (-1, -2))
+    )
+
+    assert planned_actions.shape == (fine_tuned_exp.states.shape[0], horizon)
+
+@param('has_actor_log_probs', (True, False))
+@param('has_rewards', (True, False))
+@param('has_returns', (True, False))
+@param('has_state_latents', (True, False))
+def test_replay_buffer_serialization(has_actor_log_probs, has_rewards, has_returns, has_state_latents):
+    import tempfile
+    batch_size = 2
+    horizon = 5
+    states = torch.randn(batch_size, horizon, 16)
+    actions = torch.randn(batch_size, horizon, 4)
+
+    exp = Experience(
+        states = states,
+        actions = actions,
+        actor_log_probs = torch.randn(batch_size, horizon) if has_actor_log_probs else None,
+        rewards = torch.randn(batch_size, horizon) if has_rewards else None,
+        returns = torch.randn(batch_size, horizon) if has_returns else None,
+        state_latents = torch.randn(batch_size, horizon, 32) if has_state_latents else None,
+        cumulative_rewards = torch.randn(batch_size),
+        episode_len = torch.randint(1, horizon, (batch_size,))
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        buffer = store_experience_in_replay_buffer(exp, 1000, 100000, folder = tmpdir, overwrite = True)
+        reloaded_exp = experience_from_replay_buffer(buffer)
+
+        assert torch.allclose(reloaded_exp.states, exp.states)
+        assert torch.allclose(reloaded_exp.actions, exp.actions)
+
+        if has_actor_log_probs:
+            assert torch.allclose(reloaded_exp.actor_log_probs, exp.actor_log_probs)
+        else:
+            assert not exists(reloaded_exp.actor_log_probs)
+
+        if has_state_latents:
+            assert torch.allclose(reloaded_exp.state_latents, exp.state_latents)
+        else:
+            assert not exists(reloaded_exp.state_latents)

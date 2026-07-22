@@ -1,12 +1,12 @@
 from __future__ import annotations
-from typing import Callable, Literal
+from typing import Callable, Literal, NamedTuple, Any
 
 import math
 import inspect
 from random import random
 from contextlib import nullcontext
 from functools import partial, reduce as ft_reduce
-from collections import namedtuple
+from collections import deque, namedtuple
 
 import torch
 import torch.nn.functional as F
@@ -638,8 +638,13 @@ def calc_returns(
 
     scan = AssocScan(reverse = True)
 
-    if is_tensor(discount_factor) and discount_factor.ndim == 1:
-        discount_factor = rearrange(discount_factor, 'b -> b 1')
+    # pack to ensure at least 2 dimensions for assoc scan
+
+    if is_tensor(discount_factor):
+        discount_factor, _ = pack([discount_factor], 'b *')
+
+    if is_tensor(next_values):
+        next_values, _ = pack([next_values], 'b *')
 
     gates = discount_factor * (~is_done).float()
 
@@ -712,6 +717,7 @@ class Actor(Module):
         super().__init__()
         self.continuous_actions = continuous_actions
         self.dim_action = dim_action
+        self.pass_world_model_hiddens = False
         if continuous_actions:
             self.action_distr = BetaDistrReadout(source_range = (-1., 1.), eps = action_eps)
 
@@ -722,8 +728,29 @@ class Actor(Module):
 
         return F.cross_entropy(
             rearrange(action_preds, 'b ... c -> b c ...'),
-            target_actions
+            target_actions.long()
         )
+
+    def get_continuous_log_probs_and_entropy(self, action_preds, target_actions):
+        distr = self.action_distr(action_preds, return_distr = True)
+        source_min, source_max = self.action_distr.source_range
+        scaled_target = (target_actions - source_min) / (source_max - source_min)
+        scaled_target = scaled_target.clamp(self.action_distr.eps, 1. - self.action_distr.eps)
+
+        log_prob = reduce(distr.log_prob(scaled_target), '... d -> ...', 'sum')
+        entropy = reduce(distr.entropy(), '... d -> ...', 'sum')
+        return log_prob, entropy
+
+    def get_discrete_log_probs_and_entropy(self, action_preds, target_actions):
+        distr = Categorical(logits = action_preds)
+        log_prob = distr.log_prob(target_actions)
+        entropy = distr.entropy()
+        return log_prob, entropy
+
+    def get_log_probs_and_entropy(self, action_preds, target_actions):
+        fn = self.get_continuous_log_probs_and_entropy if self.continuous_actions else self.get_discrete_log_probs_and_entropy
+        return fn(action_preds, target_actions)
+
 
     def sample_actions(
         self,
@@ -1302,6 +1329,11 @@ class WorldModel(Module):
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
+    def encode_actions(self, actions):
+        if isinstance(self.action_encoder, nn.Embedding) and actions.is_floating_point():
+            actions = actions.argmax(dim = -1)
+        return self.action_encoder(actions)
+
     @property
     def device(self):
         return self.zero.device
@@ -1393,6 +1425,9 @@ class WorldModel(Module):
         gradient_lr = 1e-2,
         gradient_optimizer: Callable[..., Optimizer] = Adam,
         seed_with_actor: str | None = None,
+        latent_action_model = None,
+        latent_action_model_steps = 10,
+        latent_action_model_chunk_size = None,
         actor_temperature = 1.,
         clamp_state_latent_to_range = True,
         return_action_latent = False,
@@ -1423,6 +1458,7 @@ class WorldModel(Module):
 
         # validation
 
+        assert not (exists(seed_with_actor) and exists(latent_action_model)), 'cannot seed planning with both an actor and a latent action model'
         assert exists(fitness_fn) or exists(goal_state), 'either fitness_fn or goal_state must be provided'
         assert action_len == (state_len - 1)
         assert generations > 0
@@ -1433,7 +1469,7 @@ class WorldModel(Module):
         # get the state and action latents
 
         state_tokens, sensory_layer_hiddens, _ = self.encode_states(self.state_encoder, states)
-        action_tokens = self.action_encoder(actions)
+        action_tokens = self.encode_actions(actions)
 
         # handle memories
 
@@ -1497,7 +1533,7 @@ class WorldModel(Module):
                 return action, memories
 
             action, unpack = pack_with_inverse(action, '* d')
-            encoded = self.action_encoder(action)
+            encoded = self.encode_actions(action)
 
             if self.transition_action_space == 'global':
                 encoded, memories = self.action_linear_rnn(
@@ -1557,7 +1593,7 @@ class WorldModel(Module):
                 step_action, seed_actor_memory = seed_actor.sample(**action_kwargs)
 
                 step_action_seq = rearrange(step_action, 'b ... -> b 1 ...')
-                seed_last_action_tokens = self.action_encoder(step_action_seq)
+                seed_last_action_tokens = self.encode_actions(step_action_seq)
                 if self.is_transition_action_space_raw:
                     seed_last_action_cond = step_action_seq
                 else:
@@ -1597,7 +1633,7 @@ class WorldModel(Module):
 
             if is_search_space_raw_action and not self.is_transition_action_space_raw:
                 actions_cond, unpack = pack_with_inverse(actions_cond, '* h d')
-                actions_cond = self.action_encoder(actions_cond)
+                actions_cond = self.encode_actions(actions_cond)
 
                 # if using actions with global context of past actions, pass through linear rnn with previous memories
 
@@ -1690,6 +1726,41 @@ class WorldModel(Module):
 
             return fitnesses
 
+        # latent action model seeding logic
+
+        latent_drawn_actions = None
+        if exists(latent_action_model):
+            curr_state_latents = self.to_state_latent(state_embeds)
+            pop_state_latents = repeat(curr_state_latents, 'b d -> (b p) d', p = pop_size)
+            chunk_sizes = default(latent_action_model_chunk_size, horizon)
+            chunk_sizes = cast_tuple(chunk_sizes)
+
+            assert sum(chunk_sizes) == horizon, f'latent action model chunk sizes must sum up to horizon ({horizon})'
+
+            latent_drawn_actions = []
+            step_state_latents = pop_state_latents
+            step_rnn_memories = tree_map_tensor(partial(batch_repeat, r = pop_size), next_action_rnn_memories)
+
+            for ind, chunk_size in enumerate(chunk_sizes):
+                chunk_actions = latent_action_model.sample(
+                    steps = latent_action_model_steps,
+                    batch_size = batch * pop_size,
+                    data_shape = (chunk_size, dim_action),
+                    state_latent = step_state_latents
+                )
+                latent_drawn_actions.append(chunk_actions)
+
+                is_last_chunk = ind == (len(chunk_sizes) - 1)
+
+                if not is_last_chunk:
+                    for step in range(chunk_size):
+                        step_action = chunk_actions[:, step]
+                        step_action_cond, step_rnn_memories = encode_action_step(step_action, step_rnn_memories)
+                        step_state_latents = advance_state(step_state_latents, step_action_cond)
+
+            latent_drawn_actions = cat(latent_drawn_actions, dim = 1)
+            latent_drawn_actions = rearrange(latent_drawn_actions, '(b p) h d -> b p h d', b = batch, p = pop_size)
+
         # iterate
 
         for generation in range(generations):
@@ -1700,6 +1771,8 @@ class WorldModel(Module):
 
             if is_first and exists(seed_actor):
                 actions = seeded_actions
+            elif is_first and exists(latent_drawn_actions):
+                actions = latent_drawn_actions
             else:
                 actions = means + variances.sqrt() * torch.randn((batch, pop_size, horizon, dim_action), device = device)
 
@@ -1822,7 +1895,7 @@ class WorldModel(Module):
             if exists(actor_module):
                 # encode state
                 ema_encoded_state, ema_encoded_sensory_states, patch_mask = self.encode_states(self.ema_state_encoder, state_seq)
-                ema_state_tokens = rearrange(ema_encoded_state, 'b 1 ... -> b ...')
+                ema_state_tokens = ema_encoded_state
                 ema_state_latents = self.to_state_latent(ema_state_tokens)
 
                 actor = self.actors[actor_module]
@@ -1902,6 +1975,12 @@ class WorldModel(Module):
             next_values = self.value_network.forward_ema(ema_state_tokens, ema_state_latents)
             next_values = rearrange(next_values, '... 1 -> ...')
 
+            # encode the entire trajectory to store state latents
+
+            all_states = tree_map_tensor_to_device(states, self.device)
+            all_ema_encoded_states, _, _ = self.encode_states(self.ema_state_encoder, all_states)
+            all_ema_state_latents = self.to_state_latent(all_ema_encoded_states)
+
         returns = calc_returns(rewards, terminateds, next_values, self.discount_factor)
 
         batch_discount = self.value_network.discount_factor.expand(batch)
@@ -1910,12 +1989,24 @@ class WorldModel(Module):
         actor_log_probs = actor_log_probs if not is_empty(actor_log_probs) else None
         actor_log_probs = maybe(stack)(actor_log_probs, dim = 1)
 
-        experience = (states, actions, actor_log_probs, rewards, terminateds, truncateds, infos, episode_len, cumulative_rewards, returns)
+        experience = Experience(
+            states = states,
+            actions = actions,
+            actor_log_probs = actor_log_probs,
+            rewards = rewards,
+            terminated = terminateds,
+            truncated = truncateds,
+            infos = infos,
+            episode_len = episode_len,
+            cumulative_rewards = cumulative_rewards,
+            returns = returns,
+            state_latents = all_ema_state_latents
+        )
 
         if return_cpu:
             experience = tree_map_tensor_to_device(experience, 'cpu')
 
-        return Experience(*experience)
+        return experience
 
     def forward(
         self,
@@ -1972,7 +2063,7 @@ class WorldModel(Module):
         if self.use_perception_film:
             state_tokens = self.perception_film(state_tokens)
 
-        action_tokens = self.action_encoder(actions)
+        action_tokens = self.encode_actions(actions)
 
         # linear rnns for contextualizing states and actions separately, and for potential path integration and idm
 
@@ -2187,7 +2278,7 @@ class WorldModel(Module):
             else:
                 action_recon_loss = F.cross_entropy(
                     rearrange(decoded_actions, 'b n c -> b c n'),
-                    recon_orig_actions
+                    recon_orig_actions.long()
                 )
 
         # goal prediction head - cannot use the next state, as the encoded goal does not know the past sequence that led to it

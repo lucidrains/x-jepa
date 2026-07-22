@@ -201,3 +201,12 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
     url     = {https://arxiv.org/abs/2208.08133},
 }
 ```
+
+```bibtex
+@article{kaddour2026target,
+    title   = {Target Policy Optimization},
+    author  = {Kaddour, Jean},
+    journal = {arXiv preprint arXiv:2604.06159},
+    year    = {2026}
+}
+```
