@@ -1325,13 +1325,21 @@ def test_end_to_end_bc_rl_finetune_flow(rl_type, is_vector_env):
     loss.backward()
     optimizer.step()
 
-    # train latent action model on fine-tuned actions
+    # continue to do rollouts with fine-tuned actor and strengthen world model
 
     fine_tuned_exp = world_model.interact_with_environment(
         env,
         max_steps = horizon,
         actor_module = 'reflexive'
     )
+
+    wm_optimizer.zero_grad()
+    fine_tuned_wm_loss, _ = world_model(fine_tuned_exp.states, fine_tuned_exp.actions, behavior_clone = False)
+    assert fine_tuned_wm_loss.ndim == 0
+    fine_tuned_wm_loss.backward()
+    wm_optimizer.step()
+
+    # train latent action model on fine-tuned actions
 
     init_state_latent = fine_tuned_exp.state_latents[:, 0]
 
