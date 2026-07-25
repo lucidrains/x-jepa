@@ -8,6 +8,8 @@ from contextlib import nullcontext
 from functools import partial, reduce as ft_reduce
 from collections import deque, namedtuple
 
+import numpy as np
+
 import torch
 import torch.nn.functional as F
 from torch.distributions import Beta, Categorical
@@ -28,7 +30,6 @@ from assoc_scan import AssocScan
 from x_mlps_pytorch import MLP
 
 from torch_einops_utils import (
-    masked_mean,
     pad_right_at_dim_to,
     temp_eval,
     batched_index_select,
@@ -36,6 +37,7 @@ from torch_einops_utils import (
     tree_flatten_with_inverse,
     pack_with_inverse,
     lens_to_mask,
+    and_masks,
     maybe,
     safe_cat,
     tree_map_detach,
@@ -46,7 +48,7 @@ from torch_einops_utils.device import module_device
 
 from PoPE_pytorch import PoPE, apply_pope_to_qk
 
-from x_jepa.utils import EnvWrapper, Experience
+from x_jepa.utils import EnvWrapper, Experience, masked_mean
 
 from x_jepa.regularizers import SigReg, uniform_wasserstein_loss, temporal_straightening_loss
 from x_jepa.min_gru import minGRUBlocks
@@ -721,15 +723,18 @@ class Actor(Module):
         if continuous_actions:
             self.action_distr = BetaDistrReadout(source_range = (-1., 1.), eps = action_eps)
 
-    def compute_loss(self, action_preds, target_actions):
+    def compute_loss(self, action_preds, target_actions, mask = None, masked_loss_average_mode = 'timestep'):
         if self.continuous_actions:
             neg_log_probs = self.action_distr(action_preds, target = target_actions)
-            return reduce(neg_log_probs, '... d -> ...', 'sum').mean()
+            raw_loss = reduce(neg_log_probs, '... d -> ...', 'sum')
+        else:
+            raw_loss = F.cross_entropy(
+                rearrange(action_preds, 'b ... c -> b c ...'),
+                target_actions.long(),
+                reduction = 'none'
+            )
 
-        return F.cross_entropy(
-            rearrange(action_preds, 'b ... c -> b c ...'),
-            target_actions.long()
-        )
+        return masked_mean(raw_loss, mask, average_mode = masked_loss_average_mode)
 
     def get_continuous_log_probs_and_entropy(self, action_preds, target_actions):
         distr = self.action_distr(action_preds, return_distr = True)
@@ -801,13 +806,13 @@ class Actor(Module):
         out = cast_tuple(out)
         return (*out, next_memories)
 
-    def forward(self, target_actions = None, **kwargs):
+    def forward(self, target_actions = None, mask = None, masked_loss_average_mode = 'timestep', **kwargs):
         preds = self.get_action_preds(**kwargs)
 
         if not exists(target_actions):
             return preds
 
-        return self.compute_loss(preds, target_actions)
+        return self.compute_loss(preds, target_actions, mask = mask, masked_loss_average_mode = masked_loss_average_mode)
 
 class ReflexiveActor(Actor):
     def __init__(
@@ -1007,6 +1012,7 @@ class WorldModel(Module):
         next_encoded_state_pred_loss_weight = 1.,
         plan_state_pred_loss_weight = 1.,
         value_loss_weight = 1.,
+        masked_loss_average_mode: Literal['timestep', 'trajectory'] = 'timestep',
         discount_factor = 0.99,
         pass_sensory_hiddens_to_world_model = False,
         frac_gradients = 0.,
@@ -1238,6 +1244,8 @@ class WorldModel(Module):
         self.frac_gradient = FracGradient(frac_gradients)
 
         # loss related
+
+        self.masked_loss_average_mode = masked_loss_average_mode
 
         self.next_encoded_state_pred_loss_weight = next_encoded_state_pred_loss_weight
         self.plan_state_pred_loss_weight = plan_state_pred_loss_weight
@@ -1860,11 +1868,14 @@ class WorldModel(Module):
         fitness_fn = None,
         goal_state = None,
         return_cpu = True,
+        cast_double_to_float: bool = True,
         actor_module: str | None = None, # can be any custom key, but 'reflexive' or 'bc' are standard
         actor_temperature = 1.0,
+        callback: Callable[..., Any] | None = None,
+        action_fn: Callable[..., Any] | None = None,
         **plan_kwargs
     ):
-        env = EnvWrapper(env, return_cpu = return_cpu)
+        env = EnvWrapper(env, return_cpu = return_cpu, cast_double_to_float = cast_double_to_float)
 
         states, actions, actor_log_probs, rewards, terminateds, truncateds, infos = [], [], [], [], [], [], []
 
@@ -1892,7 +1903,26 @@ class WorldModel(Module):
 
             state_seq = tree_map_tensor(lambda t: rearrange(t, 'b ... -> b 1 ...'), state)
 
-            if exists(actor_module):
+            if exists(action_fn):
+                action_params = inspect.signature(action_fn).parameters
+                kwargs = dict(
+                    step = step,
+                    state = state,
+                    env = env,
+                    info = info
+                )
+                kwargs = {k: v for k, v in kwargs.items() if k in action_params}
+                action = action_fn(**kwargs)
+
+                action = torch.as_tensor(action, device = self.device)
+
+                if cast_double_to_float and action.dtype == torch.float64:
+                    action = action.float()
+
+                if action.ndim == 1:
+                    action = rearrange(action, 'd -> 1 d')
+
+            elif exists(actor_module):
                 # encode state
                 ema_encoded_state, ema_encoded_sensory_states, patch_mask = self.encode_states(self.ema_state_encoder, state_seq)
                 ema_state_tokens = ema_encoded_state
@@ -1943,6 +1973,23 @@ class WorldModel(Module):
             rewards.append(reward)
             terminateds.append(terminated)
             truncateds.append(truncated)
+
+            if exists(callback):
+                callback_params = inspect.signature(callback).parameters
+                kwargs = dict(
+                    step = step,
+                    state = state,
+                    action = action,
+                    reward = reward,
+                    terminated = terminated,
+                    truncated = truncated,
+                    info = info,
+                    is_done = is_done,
+                    cumulative_rewards = cumulative_rewards,
+                    episode_len = episode_len,
+                    world_model = self
+                )
+                callback(**{k: v for k, v in kwargs.items() if k in callback_params})
 
             state = next_state
 
@@ -2012,16 +2059,29 @@ class WorldModel(Module):
         self,
         states: States,
         actions,
+        mask: Tensor | None = None,
+        lens: Tensor | None = None,
         returns = None,
         behavior_clone: bool | str | tuple[str, ...] | list[str] = True,
         return_loss = True,
         memories = None,
-        return_memories = False
+        return_memories = False,
+        masked_loss_average_mode: str | None = None
     ):
+        assert not (exists(mask) and exists(lens)), 'cannot pass both mask and lens'
+
         device = self.device
 
         (batch, state_len), action_len = first_tensor(states).shape[:2], actions.shape[1]
         assert action_len in {state_len, state_len - 1}
+
+        if exists(lens):
+            mask = lens_to_mask(lens, max_len = state_len)
+
+        masked_loss_average_mode = default(masked_loss_average_mode, self.masked_loss_average_mode)
+
+        valid_target_mask = mask[:, 1:] if exists(mask) else None
+        valid_input_mask = mask[:, :-1] if exists(mask) else None
 
         orig_actions = actions
 
@@ -2094,10 +2154,13 @@ class WorldModel(Module):
                 pred_action_from_state = self.state_to_action_pred(align_next_state_tokens)
                 pred_state_from_action = self.action_to_state_pred(align_action_tokens)
 
-                align_pre_state_action_repr_loss = (
-                    F.mse_loss(pred_action_from_state, align_action_tokens) +
-                    F.mse_loss(pred_state_from_action, align_curr_state_tokens)
-                ) / 2
+                raw_action_loss_from_state = F.mse_loss(pred_action_from_state, align_action_tokens, reduction = 'none')
+                raw_state_loss_from_action = F.mse_loss(pred_state_from_action, align_curr_state_tokens, reduction = 'none')
+
+                action_loss_from_state = masked_mean(raw_action_loss_from_state, valid_input_mask, average_mode = masked_loss_average_mode)
+                state_loss_from_action = masked_mean(raw_state_loss_from_action, valid_input_mask, average_mode = masked_loss_average_mode)
+
+                align_pre_state_action_repr_loss = (action_loss_from_state + state_loss_from_action) / 2
 
             if self.has_align_pre_state_action_repr_sigreg:
                 align_pre_state_action_repr_sigreg_loss = (
@@ -2149,8 +2212,12 @@ class WorldModel(Module):
             wm_past_layers_mask = []
             masks = default(sensory_layer_masks, (None,) * len(self.num_sensory_views))
 
-            for views, mask in zip(self.num_sensory_views, masks):
-                state_mask = default(mask, torch.ones((batch, state_len), dtype = torch.bool, device = device))
+            for views, sensory_m in zip(self.num_sensory_views, masks):
+                state_mask = and_masks([mask, sensory_m])
+
+                if not exists(state_mask):
+                    state_mask = torch.ones((batch, state_len), dtype = torch.bool, device = device)
+
                 action_mask = torch.zeros_like(state_mask)
 
                 interleaved_mask = rearrange([state_mask, action_mask], 'sa b n -> b (n sa)')
@@ -2229,7 +2296,8 @@ class WorldModel(Module):
             next_state_pred_logits = self.state_transition((state_latents, action_cond))
 
             neg_log_probs = self.state_transition_beta_distr(next_state_pred_logits, target = next_target_state_latents.detach())
-            next_state_latent_pred_loss = neg_log_probs.sum(dim = -1).mean()
+
+            state_transition_loss = neg_log_probs.sum(dim = -1)
 
             # for next_state_pred to be accessible for reg loss if needed
 
@@ -2241,7 +2309,9 @@ class WorldModel(Module):
 
             next_state_pred = state_latents + pred_residual
 
-            next_state_latent_pred_loss = F.smooth_l1_loss(next_state_pred, next_target_state_latents.detach())
+            state_transition_loss = F.smooth_l1_loss(next_state_pred, next_target_state_latents.detach(), reduction = 'none')
+
+        next_state_latent_pred_loss = masked_mean(state_transition_loss, valid_target_mask, average_mode = masked_loss_average_mode)
 
         # prediction for planning transition, where actions can be in raw, local encoded, or global encoded
 
@@ -2251,7 +2321,8 @@ class WorldModel(Module):
             next_state_pred_logits_plan = self.state_transition_for_planning((state_latents, action_cond))
 
             neg_log_probs = self.plan_state_transition_beta_distr(next_state_pred_logits_plan, target = next_target_state_latents.detach())
-            plan_state_pred_loss = neg_log_probs.sum(dim = -1).mean()
+
+            plan_state_transition_loss = neg_log_probs.sum(dim = -1)
         else:
             # deterministic
 
@@ -2259,7 +2330,9 @@ class WorldModel(Module):
 
             next_state_pred_for_plan = state_latents + pred_residual_for_planning
 
-            plan_state_pred_loss = F.smooth_l1_loss(next_state_pred_for_plan, next_target_state_latents.detach())
+            plan_state_transition_loss = F.smooth_l1_loss(next_state_pred_for_plan, next_target_state_latents.detach(), reduction = 'none')
+
+        plan_state_pred_loss = masked_mean(plan_state_transition_loss, valid_target_mask, average_mode = masked_loss_average_mode)
 
         # action decoder
 
@@ -2271,15 +2344,15 @@ class WorldModel(Module):
             recon_orig_actions = orig_actions[:, :decoded_actions.shape[1]]
 
             if self.continuous_actions:
-                action_recon_loss = F.mse_loss(
-                    recon_orig_actions,
-                    decoded_actions
-                )
+                raw_action_loss = F.mse_loss(recon_orig_actions, decoded_actions, reduction = 'none')
             else:
-                action_recon_loss = F.cross_entropy(
+                raw_action_loss = F.cross_entropy(
                     rearrange(decoded_actions, 'b n c -> b c n'),
-                    recon_orig_actions.long()
+                    recon_orig_actions.long(),
+                    reduction = 'none'
                 )
+
+            action_recon_loss = masked_mean(raw_action_loss, valid_input_mask, average_mode = masked_loss_average_mode)
 
         # goal prediction head - cannot use the next state, as the encoded goal does not know the past sequence that led to it
 
@@ -2287,9 +2360,11 @@ class WorldModel(Module):
 
         ema_encoded_state, ema_sensory_layer_hiddens, _ = self.encode_states(self.ema_state_encoder, states)
 
-        next_ema_encoded_state_target = ema_encoded_state[:, 1:]
+        next_ema_encoded_state_target = ema_encoded_state[:, 1:].contiguous()
 
-        next_encoded_state_pred_loss = F.smooth_l1_loss(pred_next_encoded_state, next_ema_encoded_state_target.detach())
+        raw_next_encoded_loss = F.smooth_l1_loss(pred_next_encoded_state, next_ema_encoded_state_target.detach(), reduction = 'none')
+
+        next_encoded_state_pred_loss = masked_mean(raw_next_encoded_loss, valid_target_mask, average_mode = masked_loss_average_mode)
 
         # behavior clone
 
@@ -2318,6 +2393,8 @@ class WorldModel(Module):
 
                 actor_bc_loss_for_name = actor(
                     target_actions = orig_actions[:, :bc_seq_len],
+                    mask = valid_input_mask,
+                    masked_loss_average_mode = masked_loss_average_mode,
                     state_latents = tree_map_detach(state_latents),
                     state_tokens = tree_map_detach(state_tokens),
                     action_cond = tree_map_detach(action_cond),
@@ -2353,7 +2430,10 @@ class WorldModel(Module):
 
         if exists(returns_tensor):
             assert pred_values.shape == returns_tensor.shape, f'predicted values shape {pred_values.shape} must match returns shape {returns_tensor.shape}'
-            value_loss = F.mse_loss(pred_values, returns_tensor)
+
+            raw_value_loss = F.smooth_l1_loss(pred_values, returns_tensor, reduction = 'none')
+
+            value_loss = masked_mean(raw_value_loss, mask, average_mode = masked_loss_average_mode)
 
         # regularizer loss
 

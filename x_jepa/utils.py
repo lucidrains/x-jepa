@@ -7,7 +7,7 @@ from torch import tensor, is_tensor, Tensor
 from torch.utils._pytree import tree_map
 
 from einops import rearrange
-from torch_einops_utils import tree_map_tensor
+from torch_einops_utils import tree_map_tensor, lens_to_mask, masked_mean as torch_einops_masked_mean
 
 # constants
 
@@ -32,12 +32,25 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def divisible_by(num, den):
+    return (num % den) == 0
+
+def masked_mean(tensor, mask = None, dim = None, average_mode = 'timestep'):
+    assert average_mode in {'timestep', 'trajectory'}, f'invalid average_mode {average_mode}'
+
+    if average_mode == 'timestep':
+        return torch_einops_masked_mean(tensor, mask = mask, dim = dim)
+
+    seq_dim = dim if exists(dim) else 1
+    trajectory_means = torch_einops_masked_mean(tensor, mask = mask, dim = seq_dim)
+    return trajectory_means.mean()
+
 def is_vectorized(env):
     num_envs = getattr(env, 'num_envs', 0)
     is_vector_env = getattr(env, 'is_vector_env', False)
     return num_envs > 0 or is_vector_env
 
-def to_torch_and_batch(x, is_vector, device = None):
+def to_torch_and_batch(x, is_vector, device = None, cast_double_to_float = True):
     def transform(t):
         if isinstance(t, np.ndarray):
             t = torch.from_numpy(t)
@@ -46,6 +59,9 @@ def to_torch_and_batch(x, is_vector, device = None):
 
         if not is_tensor(t):
             return t
+
+        if cast_double_to_float and t.dtype == torch.float64:
+            t = t.float()
 
         if not is_vector:
             t = rearrange(t, '... -> 1 ...')
@@ -74,12 +90,18 @@ def to_numpy_and_unbatch(x, is_vector):
 # classes
 
 class EnvWrapper:
-    def __init__(self, env, return_cpu = False):
+    def __init__(
+        self,
+        env,
+        return_cpu = False,
+        cast_double_to_float = True
+    ):
         assert not isinstance(env, EnvWrapper), 'EnvWrapper should only be applied once'
 
         self.env = env
         self.is_vector = is_vectorized(env)
         self.return_cpu = return_cpu
+        self.cast_double_to_float = cast_double_to_float
 
     def __getattr__(self, name):
         if name.startswith('_'):
@@ -88,7 +110,7 @@ class EnvWrapper:
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        return to_torch_and_batch(obs, self.is_vector), info
+        return to_torch_and_batch(obs, self.is_vector, cast_double_to_float = self.cast_double_to_float), info
 
     def step(self, action):
 
@@ -114,7 +136,8 @@ class EnvWrapper:
         obs, reward, terminated, truncated = to_torch_and_batch(
             (obs, reward, terminated, truncated),
             self.is_vector,
-            action_device
+            action_device,
+            cast_double_to_float = self.cast_double_to_float
         )
 
         return obs, reward, terminated, truncated, info
@@ -169,6 +192,7 @@ def store_experience_in_replay_buffer(
             max_timesteps = max_timesteps,
             fields = fields,
             meta_fields = meta_fields,
+            circular = True,
             overwrite = overwrite
         )
 

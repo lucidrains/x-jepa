@@ -17,8 +17,8 @@ from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
 from x_jepa.goals import GoalGenerator, MetricResidualNetwork
 from x_jepa.flow_matching import FlowMatching
 from x_jepa.latent_action_model import LatentActionModel
-from x_jepa.rl import ppo_loss, tpo_loss
 from x_jepa.utils import store_experience_in_replay_buffer, experience_from_replay_buffer, Experience
+from x_jepa.rl import ppo_loss, tpo_loss
 
 @param('plan_type', ('no_goal', 'goal', 'custom_goal'))
 @param('transition_action_space', ('raw', 'local', 'global'))
@@ -1209,7 +1209,8 @@ def test_mrn_world_model(use_mrn):
 
 @param('rl_type', ('ppo', 'tpo'))
 @param('is_vector_env', (False, True))
-def test_end_to_end_bc_rl_finetune_flow(rl_type, is_vector_env):
+@param('use_var_lens', (False, True))
+def test_end_to_end_bc_rl_finetune_flow(rl_type, is_vector_env, use_var_lens):
     import tempfile
     import gymnasium as gym
     from torch.optim import Adam
@@ -1267,7 +1268,8 @@ def test_end_to_end_bc_rl_finetune_flow(rl_type, is_vector_env):
         reloaded_exp = experience_from_replay_buffer(buffer)
         assert reloaded_exp.states.shape == planning_experience.states.shape
 
-        wm_loss, _ = world_model(reloaded_exp.states, reloaded_exp.actions)
+        lens = reloaded_exp.episode_len if use_var_lens else None
+        wm_loss, _ = world_model(reloaded_exp.states, reloaded_exp.actions, lens = lens)
         assert wm_loss.ndim == 0
         wm_loss.backward()
         wm_optimizer.step()
@@ -1276,9 +1278,11 @@ def test_end_to_end_bc_rl_finetune_flow(rl_type, is_vector_env):
 
     actor_optimizer = Adam(world_model.actors['reflexive'].parameters(), lr = 1e-3)
 
+    lens = planning_experience.episode_len if use_var_lens else None
     bc_loss, _ = world_model(
         planning_experience.states,
         planning_experience.actions,
+        lens = lens,
         behavior_clone = True
     )
     assert bc_loss.ndim == 0
@@ -1308,6 +1312,9 @@ def test_end_to_end_bc_rl_finetune_flow(rl_type, is_vector_env):
         fetched_bc_exp = experience_from_replay_buffer(bc_buffer)
         assert exists(fetched_bc_exp.actor_log_probs)
 
+    if not use_var_lens:
+        fetched_bc_exp = fetched_bc_exp._replace(episode_len = None)
+
     # rl fine-tuning step
 
     actor = world_model.actors['reflexive']
@@ -1334,7 +1341,8 @@ def test_end_to_end_bc_rl_finetune_flow(rl_type, is_vector_env):
     )
 
     wm_optimizer.zero_grad()
-    fine_tuned_wm_loss, _ = world_model(fine_tuned_exp.states, fine_tuned_exp.actions, behavior_clone = False)
+    lens = fine_tuned_exp.episode_len if use_var_lens else None
+    fine_tuned_wm_loss, _ = world_model(fine_tuned_exp.states, fine_tuned_exp.actions, lens = lens, behavior_clone = False)
     assert fine_tuned_wm_loss.ndim == 0
     fine_tuned_wm_loss.backward()
     wm_optimizer.step()
