@@ -16,7 +16,6 @@ import os
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import fire
-
 import numpy as np
 
 import torch
@@ -24,19 +23,21 @@ import torch.nn.functional as F
 from torch.optim import Adam
 
 from accelerate import Accelerator
-
 import gymnasium as gym
-
 import wandb
 
 from torch_einops_utils import tree_map_tensor_to_device
-
 from x_mlps_pytorch import MLP
 
 from x_jepa import WorldModel
 from x_jepa.x_jepa import Transformer
 from x_jepa.rl import ppo_loss, tpo_loss
-from x_jepa.utils import store_experience_in_replay_buffer, divisible_by, exists
+from x_jepa.utils import (
+    store_experience_in_replay_buffer,
+    experience_from_replay_buffer,
+    divisible_by,
+    exists
+)
 
 # goals
 
@@ -67,7 +68,7 @@ def main(
     lr = 1e-3,
     rl_type = 'tpo',            # 'ppo' or 'tpo'
     rl_lr = 3e-4,
-    rl_start_episode = 500,     # switch to RL policy after 1000 episodes
+    rl_start_episode = 1000,    # switch to RL policy after 1000 episodes
     rl_epochs = 2,
     num_episodes = 1500,
     train_every_eps = 10,
@@ -80,6 +81,7 @@ def main(
     cem_horizon = 1,
     random_action_eps = 10,
     gamma = 0.99,
+    reward_avg_window = 100,
     print_every_eps = 10,
     project_name = 'x-jepa-lunar-lander',
     record_video = False,
@@ -132,10 +134,9 @@ def main(
     optimizer = Adam(wm.parameters(), lr = lr)
 
     rl_loss_fn = ppo_loss if rl_type == 'ppo' else tpo_loss
+    rl_params = list(wm.actors['reflexive'].parameters())
     if rl_type == 'ppo':
-        rl_params = list(wm.actors['reflexive'].parameters()) + list(wm.value_network.parameters())
-    else:
-        rl_params = list(wm.actors['reflexive'].parameters())
+        rl_params.extend(wm.value_network.parameters())
 
     rl_optimizer = Adam(rl_params, lr = rl_lr)
 
@@ -145,8 +146,7 @@ def main(
             encoded_goal.expand_as(pred_next_encoded_states),
             reduction = 'none'
         ).sum(dim = -1)
-        fitness = -dist_cost + 5.0 * pred_values
-        return fitness.sum(dim = -1)
+        return (-dist_cost + 5.0 * pred_values).sum(dim = -1)
 
     rewards_history = []
     buffer = None
@@ -188,17 +188,6 @@ def main(
         total_reward = experience.cumulative_rewards.item()
         steps = experience.episode_len.item()
 
-        rl_loss_val = 0.0
-        if use_rl:
-            wm.train()
-            for _ in range(rl_epochs):
-                rl_optimizer.zero_grad()
-                r_loss = rl_loss_fn(wm, experience, actor_module = 'reflexive')
-                r_loss.backward()
-                rl_optimizer.step()
-                wm.update()
-                rl_loss_val = r_loss.item()
-
         buffer = store_experience_in_replay_buffer(
             experience,
             max_episodes = max_episodes_buffer,
@@ -207,6 +196,19 @@ def main(
             buffer = buffer,
             overwrite = (episode == 1)
         )
+
+        rl_loss_val = 0.0
+
+        if use_rl:
+            wm.train()
+            rl_exp = experience_from_replay_buffer(buffer)
+            for _ in range(rl_epochs):
+                rl_optimizer.zero_grad()
+                r_loss = rl_loss_fn(wm, rl_exp, actor_module = 'reflexive')
+                r_loss.backward()
+                rl_optimizer.step()
+                wm.update()
+                rl_loss_val = r_loss.item()
 
         if divisible_by(episode, train_every_eps):
             dl = buffer.dataloader(batch_size = batch_size, shuffle = True)
@@ -229,49 +231,54 @@ def main(
                         wm.update()
                         loss_val = loss.item() * grad_accum_steps
 
-        phase = 1 if use_rl else 0
-        log_dict = dict(episode = episode, episode_length = steps, phase = phase)
+        # logging and metrics
+
+        phase_str = f"[{rl_type.upper()} phase=1]" if use_rl else f"[WM phase=0 {'ideal' if is_ideal_goal else 'random'}]"
+
+        log_dict = dict(
+            episode = episode,
+            episode_length = steps,
+            phase = 1 if use_rl else 0,
+            reward = total_reward
+        )
+
+        track_reward = use_rl or is_ideal_goal
+
+        if track_reward:
+            rewards_history.append(total_reward)
+            avg_reward = float(np.mean(rewards_history[-reward_avg_window:]))
+
+            log_dict.update({
+                'avg_reward': avg_reward,
+                f'avg{reward_avg_window}_reward': avg_reward
+            })
+
+            if avg_reward > best_avg_reward:
+                best_avg_reward = avg_reward
+                torch.save(wm.state_dict(), f"./{env_name.lower().replace('-v3', '')}-best.pt")
 
         if use_rl:
-            rewards_history.append(total_reward)
-            avg_reward = float(np.mean(rewards_history[-100:]))
             log_dict.update(
-                reward = total_reward,
-                avg100_reward = avg_reward,
                 rl_reward = total_reward,
-                rl_avg100_reward = avg_reward,
+                rl_avg_reward = avg_reward,
                 rl_loss = rl_loss_val,
                 rl_type = rl_type
             )
-
-            if avg_reward > best_avg_reward:
-                best_avg_reward = avg_reward
-                torch.save(wm.state_dict(), f"./{env_name.lower().replace('-v3', '')}-best.pt")
-
-            if divisible_by(episode, print_every_eps):
-                print(f"episode {episode:4d} [{rl_type.upper()} phase=1] | reward: {total_reward:8.2f} | avg100: {avg_reward:8.2f} | {rl_type}_loss: {rl_loss_val:.4f}", flush = True)
-
         elif is_ideal_goal:
-            rewards_history.append(total_reward)
-            avg_reward = float(np.mean(rewards_history[-100:]))
             log_dict.update(
-                reward = total_reward,
-                avg100_reward = avg_reward,
                 ideal_goal_reward = total_reward,
-                ideal_goal_avg100_reward = avg_reward
+                ideal_goal_avg_reward = avg_reward
             )
-
-            if avg_reward > best_avg_reward:
-                best_avg_reward = avg_reward
-                torch.save(wm.state_dict(), f"./{env_name.lower().replace('-v3', '')}-best.pt")
-
-            if divisible_by(episode, print_every_eps):
-                print(f"episode {episode:4d} [WM phase=0 ideal] | reward: {total_reward:8.2f} | avg100: {avg_reward:8.2f}", flush = True)
         else:
-            log_dict.update(random_goal_reward = total_reward, reward = total_reward)
+            log_dict.update(random_goal_reward = total_reward)
 
-            if divisible_by(episode, print_every_eps):
-                print(f"episode {episode:4d} [WM phase=0 random] | reward: {total_reward:8.2f}", flush = True)
+        if divisible_by(episode, print_every_eps):
+            msg = f"episode {episode:4d} {phase_str:20s} | reward: {total_reward:8.2f}"
+            if track_reward:
+                msg += f" | avg{reward_avg_window}: {avg_reward:8.2f}"
+            if use_rl:
+                msg += f" | {rl_type}_loss: {rl_loss_val:.4f}"
+            print(msg, flush = True)
 
         if divisible_by(episode, train_every_eps):
             log_dict.update(train_loss = loss_val)

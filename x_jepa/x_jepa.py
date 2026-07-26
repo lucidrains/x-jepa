@@ -698,14 +698,16 @@ class Value(Module):
 
     def forward_ema(self, state_tokens, state_latents, discount = None):
         discount_embed = self.get_discount_embed(state_tokens, discount)
-        return self.ema_net((state_tokens, state_latents, discount_embed))
+        out = self.ema_net((state_tokens, state_latents, discount_embed))
+        return rearrange(out, '... 1 -> ...')
 
     def update(self):
         self.ema_net.update()
 
     def forward(self, state_tokens, state_latents, discount = None):
         discount_embed = self.get_discount_embed(state_tokens, discount)
-        return self.net((state_tokens, state_latents, discount_embed))
+        out = self.net((state_tokens, state_latents, discount_embed))
+        return rearrange(out, '... 1 -> ...')
 
 # classes
 
@@ -1690,7 +1692,7 @@ class WorldModel(Module):
                 pred_state_entropies = rearrange(pred_state_entropies, 'h b p d -> b p h d')
 
             pred_next_encoded_states = rearrange(pred_next_encoded_states, 'h b p d -> b p h d')
-            pred_values = rearrange(pred_values, 'h b p 1 -> b p h')
+            pred_values = rearrange(pred_values, 'h b p -> b p h')
 
             # evaluate
 
@@ -2021,7 +2023,6 @@ class WorldModel(Module):
             # get next values
 
             next_values = self.value_network.forward_ema(ema_state_tokens, ema_state_latents)
-            next_values = rearrange(next_values, '... 1 -> ...')
 
             # encode the entire trajectory to store state latents
 
@@ -2427,7 +2428,6 @@ class WorldModel(Module):
                 returns_tensor = returns
 
         pred_values = self.value_network(state_tokens, self.frac_gradient(state_latents_full), discounts)
-        pred_values = rearrange(pred_values, '... 1 -> ...')
 
         if exists(returns_tensor):
             assert pred_values.shape == returns_tensor.shape, f'predicted values shape {pred_values.shape} must match returns shape {returns_tensor.shape}'

@@ -46,7 +46,11 @@ def ppo_loss(
     lens = maybe(tree_map_tensor_to_device)(experience.episode_len, device)
     mask = maybe(lens_to_mask)(lens, max_len = states.shape[1])
 
-    returns = experience.returns[1] if isinstance(experience.returns, (tuple, list)) else experience.returns
+    discounts = None
+    returns = experience.returns
+    if isinstance(returns, (tuple, list)):
+        discounts, returns = returns
+
     assert exists(returns), 'experience.returns must be provided for ppo_loss'
     returns = returns.to(device)
 
@@ -56,7 +60,7 @@ def ppo_loss(
 
     old_log_probs = default(experience.actor_log_probs, log_probs.detach()).to(device)
 
-    values = rearrange(world_model.value_network(state_tokens, state_latents), 'b n 1 -> b n')
+    values = world_model.value_network(state_tokens, state_latents, discounts)
     advantages = returns - values.detach()
     advantages = z_score(advantages, mask = mask)
 
@@ -95,6 +99,9 @@ def tpo_loss(
 
     assert exists(cum_rewards), 'experience.cumulative_rewards or experience.rewards must be provided for tpo_loss'
     cum_rewards = cum_rewards.to(device)
+
+    num_episodes = cum_rewards.numel()
+    assert num_episodes > 1, 'tpo_loss requires a batch of more than one episode'
 
     u = z_score(cum_rewards)
 

@@ -1312,6 +1312,14 @@ def test_end_to_end_bc_rl_finetune_flow(rl_type, is_vector_env, use_var_lens):
             folder = tmpdir,
             overwrite = True
         )
+        if not is_vector_env:
+            store_experience_in_replay_buffer(
+                bc_experience,
+                1000,
+                100000,
+                folder = tmpdir,
+                buffer = bc_buffer
+            )
         fetched_bc_exp = experience_from_replay_buffer(bc_buffer)
         assert exists(fetched_bc_exp.actor_log_probs)
 
