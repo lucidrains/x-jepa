@@ -1545,7 +1545,9 @@ class WorldModel(Module):
         return_action_latent = False,
         search_space: Literal['raw', 'local_global'] | None = None,
         memories = None,
-        return_memories = False
+        return_memories = False,
+        return_pred_state_latents = False,
+        return_pred_states = False
     ):
         batch, device = first_tensor(states).shape[0], self.device
         state_len, action_len = first_tensor(states).shape[1], actions.shape[1]
@@ -1841,7 +1843,7 @@ class WorldModel(Module):
                 distance_to_goal = dist_fn(pred_next_encoded_states, encoded_goal.expand_as(pred_next_encoded_states))
                 fitnesses = -reduce(distance_to_goal, 'b p h d -> b p', 'sum')
 
-            return fitnesses
+            return fitnesses, pred_state_latents
 
         # latent action model seeding logic
 
@@ -1904,14 +1906,15 @@ class WorldModel(Module):
                 with torch.enable_grad():
                     for _ in range(gradient_steps):
                         optimizer.zero_grad()
-                        loss = -evaluate_actions(actions).sum()
+                        step_fitnesses, _ = evaluate_actions(actions)
+                        loss = -step_fitnesses.sum()
                         loss.backward()
                         optimizer.step()
                         actions.data.clamp_(-1., 1.)
 
                 actions = actions.detach()
 
-            fitnesses = evaluate_actions(actions)
+            fitnesses, pred_state_latents = evaluate_actions(actions)
 
             # select the fittest
 
@@ -1962,6 +1965,10 @@ class WorldModel(Module):
         if return_action_latent:
             out = (decoded_actions, winning_actions)
 
+        if return_pred_state_latents or return_pred_states:
+            winning_pred_latents = batched_index_select(pred_state_latents, elite_indices, dim = 1)[:, 0]
+            out = (*cast_tuple(out), winning_pred_latents)
+
         if not return_memories:
             return out
 
@@ -1982,6 +1989,7 @@ class WorldModel(Module):
         actor_temperature = 1.0,
         callback: Callable[..., Any] | None = None,
         action_fn: Callable[..., Any] | None = None,
+        commit_k_steps = 1,
         **plan_kwargs
     ):
         env = EnvWrapper(env, return_cpu = return_cpu, cast_double_to_float = cast_double_to_float)
@@ -1994,6 +2002,10 @@ class WorldModel(Module):
         batch, device = first_state.shape[0], first_state.device
 
         memories = None
+        action_queue = []
+        pred_state_latent_queue = []
+
+        horizon = max(plan_kwargs.pop('horizon', 1), commit_k_steps)
 
         is_done = torch.zeros(batch, dtype = torch.bool, device = device)
         cumulative_rewards = torch.zeros(batch, device = device)
@@ -2048,16 +2060,29 @@ class WorldModel(Module):
                 actor_log_probs.append(step_log_prob.cpu() if return_cpu else step_log_prob)
                 memories = None
             else:
-                planned_actions, memories = self.plan(
-                    states = state_seq,
-                    actions = empty_actions,
-                    fitness_fn = fitness_fn,
-                    goal_state = goal_state,
-                    memories = memories,
-                    return_memories = True,
-                    **plan_kwargs
-                )
-                action = planned_actions[:, 0]
+                if not action_queue:
+                    plan_out, memories = self.plan(
+                        states = state_seq,
+                        actions = empty_actions,
+                        fitness_fn = fitness_fn,
+                        goal_state = goal_state,
+                        memories = memories,
+                        horizon = horizon,
+                        return_memories = True,
+                        return_pred_state_latents = True,
+                        **plan_kwargs
+                    )
+
+                    planned_actions, *rest = cast_tuple(plan_out)
+                    pred_latents = rest[0] if rest else None
+
+                    action_queue = [*planned_actions[:, :commit_k_steps].unbind(dim = 1)]
+                    pred_state_latent_queue = [*pred_latents[:, :commit_k_steps].unbind(dim = 1)] if exists(pred_latents) else []
+
+                action, *action_queue = action_queue
+
+                if pred_state_latent_queue:
+                    _, *pred_state_latent_queue = pred_state_latent_queue
 
             actions.append(action.cpu() if return_cpu else action)
 
@@ -2073,6 +2098,10 @@ class WorldModel(Module):
                 truncated = truncated | ~is_done
 
             is_done |= terminated | truncated
+
+            if is_done.any():
+                action_queue = []
+                pred_state_latent_queue = []
 
             rewards.append(reward)
             terminateds.append(terminated)

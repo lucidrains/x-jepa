@@ -470,6 +470,56 @@ def test_interact_with_environment():
     _, returns_tensor = experience.returns
     assert returns_tensor.shape[1] == experience.states.shape[1]
 
+@torch.no_grad()
+def test_interact_with_environment_commit_k_steps():
+    import gymnasium as gym
+
+    model = Transformer(
+        dim = 128,
+        depth = 2,
+        causal = True
+    )
+
+    world_model = WorldModel(
+        model = model,
+        dim_action = 2,
+        state_encoder = nn.Linear(4, 128),
+        action_encoder = nn.Linear(2, 128),
+        action_decoder = nn.Linear(128, 2),
+        transition_action_space = 'local',
+        continuous_actions = False,
+        value_loss_weight = 1.,
+        discount_factor = 0.99
+    )
+
+    world_model.eval()
+
+    env = gym.make('CartPole-v1')
+
+    plan_count = 0
+    orig_plan = world_model.plan
+
+    def tracking_plan(*args, **kwargs):
+        nonlocal plan_count
+        plan_count += 1
+        return orig_plan(*args, **kwargs)
+
+    world_model.plan = tracking_plan
+
+    def fitness_fn(pred_state_latents):
+        return torch.randn(pred_state_latents.shape[:2])
+
+    experience = world_model.interact_with_environment(
+        env = env,
+        max_steps = 9,
+        fitness_fn = fitness_fn,
+        commit_k_steps = 3
+    )
+
+    assert experience.states.shape[1] == 9
+    # With commit_k_steps = 3 for 9 steps, plan should be called exactly 3 times (steps 0, 3, 6)
+    assert plan_count == 3
+
 @param('complex_sensory', (False, True))
 def test_multimodal(complex_sensory):
     image_encoder = nn.Sequential(Rearrange('... c h w -> ... (c h w)'), nn.Linear(48, 256))
