@@ -1011,6 +1011,7 @@ class WorldModel(Module):
         use_structured_sensory_dropout = False,
         structured_sensory_dropout_keep_prob = 0.1,
         actor_dropout_all_but_state_latents = 0.,
+        actor_residual_state_encoder = False,
         actor_loss_weights: float | dict[str, float] = 1.,
         dim_action = None,
         continuous_actions = True,
@@ -1232,6 +1233,8 @@ class WorldModel(Module):
                 action_eps = action_eps
             )
 
+        self.actor_residual_state_encoder = actor_residual_state_encoder
+
         self.actors = ModuleDict(actors)
         self.actor_state_encoders = ModuleDict({
             name: copy.deepcopy(self.state_encoder) for name in actors
@@ -1430,15 +1433,19 @@ class WorldModel(Module):
             params.extend(self.actor_state_encoders[actor_name].parameters())
         return params
 
-    def get_actor_state_tokens(
+    def get_target_state_tokens(
         self,
-        actor_name: str,
         states: States,
+        target_state_encoder: ModuleList | None = None,
         base_state_encoder: ModuleList | None = None,
         base_state_tokens: Tensor | None = None,
         detach_base_state_encoder = False,
         masks = None
     ):
+        if exists(target_state_encoder) and not self.actor_residual_state_encoder:
+            target_tokens, sensory_hiddens, _ = self.encode_states(target_state_encoder, states, masks = masks)
+            return target_tokens, sensory_hiddens
+
         base_state_encoder = default(base_state_encoder, self.state_encoder)
 
         if not exists(base_state_tokens):
@@ -1449,13 +1456,32 @@ class WorldModel(Module):
             base_state_tokens = base_state_tokens.detach() if detach_base_state_encoder else base_state_tokens
             sensory_hiddens = None
 
-        if actor_name not in self.actor_state_encoders:
+        if not exists(target_state_encoder):
             return base_state_tokens, sensory_hiddens
 
-        actor_tokens, actor_sensory_hiddens, _ = self.encode_states(self.actor_state_encoders[actor_name], states, masks = masks)
-        sensory_hiddens = default(sensory_hiddens, actor_sensory_hiddens)
+        target_tokens, target_sensory_hiddens, _ = self.encode_states(target_state_encoder, states, masks = masks)
+        sensory_hiddens = default(sensory_hiddens, target_sensory_hiddens)
 
-        return base_state_tokens + actor_tokens, sensory_hiddens
+        return base_state_tokens + target_tokens, sensory_hiddens
+
+    def get_actor_state_tokens(
+        self,
+        actor_name: str,
+        states: States,
+        base_state_encoder: ModuleList | None = None,
+        base_state_tokens: Tensor | None = None,
+        detach_base_state_encoder = False,
+        masks = None
+    ):
+        target_encoder = self.actor_state_encoders[actor_name] if actor_name in self.actor_state_encoders else None
+        return self.get_target_state_tokens(
+            states,
+            target_state_encoder = target_encoder,
+            base_state_encoder = base_state_encoder,
+            base_state_tokens = base_state_tokens,
+            detach_base_state_encoder = detach_base_state_encoder,
+            masks = masks
+        )
 
     def get_value_parameters(self):
         params = list(self.value_network.parameters())
@@ -1472,24 +1498,15 @@ class WorldModel(Module):
         detach_base_state_encoder = False,
         masks = None
     ):
-        base_state_encoder = default(base_state_encoder, self.state_encoder)
         value_state_encoder = default(value_state_encoder, self.value_state_encoder)
-
-        if not exists(base_state_tokens):
-            context = torch.no_grad if detach_base_state_encoder else nullcontext
-            with context():
-                base_state_tokens, sensory_hiddens, _ = self.encode_states(base_state_encoder, states, masks = masks)
-        else:
-            base_state_tokens = base_state_tokens.detach() if detach_base_state_encoder else base_state_tokens
-            sensory_hiddens = None
-
-        if not exists(value_state_encoder):
-            return base_state_tokens, sensory_hiddens
-
-        val_tokens, val_sensory_hiddens, _ = self.encode_states(value_state_encoder, states, masks = masks)
-        sensory_hiddens = default(sensory_hiddens, val_sensory_hiddens)
-
-        return base_state_tokens + val_tokens, sensory_hiddens
+        return self.get_target_state_tokens(
+            states,
+            target_state_encoder = value_state_encoder,
+            base_state_encoder = base_state_encoder,
+            base_state_tokens = base_state_tokens,
+            detach_base_state_encoder = detach_base_state_encoder,
+            masks = masks
+        )
 
     def update(self):
         [ema.update() for ema in self.ema_state_encoder]

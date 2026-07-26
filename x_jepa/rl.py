@@ -139,6 +139,7 @@ def tpo_loss(
     eta = 1.0,
     entropy_loss_weight = 0.01,
     masked_loss_average_mode = 'timestep',
+    log_score_average_mode = 'mean',
     detach_base_state_encoder = False
 ):
     experience = coerce_experience(experience)
@@ -169,7 +170,21 @@ def tpo_loss(
         world_model, actor_module, states, actions, detach_base_state_encoder = detach_base_state_encoder
     )
 
-    log_scores = masked_sum(log_probs, mask = mask, dim = 1)
+    log_scores_sum = masked_sum(log_probs, mask = mask, dim = 1)
+    lens_float = mask.sum(dim = 1).clamp(min = 1.) if exists(mask) else seq_len
+
+    if log_score_average_mode == 'sum':
+        divisor = 1.
+    elif log_score_average_mode == 'mean':
+        divisor = lens_float
+    elif log_score_average_mode == 'log_timestep':
+        divisor = 1. + lens_float.log()
+    elif log_score_average_mode == 'sqrt_timestep':
+        divisor = lens_float.sqrt()
+    else:
+        raise ValueError(f'invalid log_score_average_mode: {log_score_average_mode}')
+
+    log_scores = log_scores_sum / divisor
 
     with torch.no_grad():
         log_q = F.log_softmax(log_scores + u / eta, dim = -1)

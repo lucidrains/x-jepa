@@ -1527,6 +1527,10 @@ def test_detach_base_state_encoder():
         episode_len = torch.tensor([5, 5])
     )
 
+    for mode in ('mean', 'sum', 'log_timestep', 'sqrt_timestep'):
+        l = tpo_loss(wm, exp, actor_module = 'reflexive', log_score_average_mode = mode)
+        assert torch.isfinite(l)
+
     loss = tpo_loss(wm, exp, actor_module = 'reflexive', detach_base_state_encoder = True)
     loss.backward()
 
@@ -1609,24 +1613,45 @@ def test_residual_state_encoder_sum():
     obs_dim = 8
     action_dim = 2
 
-    wm = WorldModel(
+    wm_res = WorldModel(
         state_encoder = nn.Linear(obs_dim, dim),
         action_encoder = nn.Linear(action_dim, dim),
         model = Transformer(dim = dim, depth = 2, causal = True),
         dim_action = action_dim,
         continuous_actions = True,
         transition_action_space = 'raw',
-        add_reflexive_actor = True
+        add_reflexive_actor = True,
+        actor_residual_state_encoder = True
     )
 
     states = torch.randn(2, 5, obs_dim)
 
-    base_tokens, _, _ = wm.encode_states(wm.state_encoder, states)
-    actor_res_tokens, _, _ = wm.encode_states(wm.actor_state_encoders['reflexive'], states)
-    val_res_tokens, _, _ = wm.encode_states(wm.value_state_encoder, states)
+    base_tokens, _, _ = wm_res.encode_states(wm_res.state_encoder, states)
+    actor_res_tokens, _, _ = wm_res.encode_states(wm_res.actor_state_encoders['reflexive'], states)
+    val_res_tokens, _, _ = wm_res.encode_states(wm_res.value_state_encoder, states)
 
-    actor_state_tokens, _ = wm.get_actor_state_tokens('reflexive', states)
-    val_state_tokens, _ = wm.get_value_state_tokens(states)
+    actor_state_tokens, _ = wm_res.get_actor_state_tokens('reflexive', states)
+    val_state_tokens, _ = wm_res.get_value_state_tokens(states)
 
     assert_close(actor_state_tokens, base_tokens + actor_res_tokens)
     assert_close(val_state_tokens, base_tokens + val_res_tokens)
+
+    wm_sep = WorldModel(
+        state_encoder = nn.Linear(obs_dim, dim),
+        action_encoder = nn.Linear(action_dim, dim),
+        model = Transformer(dim = dim, depth = 2, causal = True),
+        dim_action = action_dim,
+        continuous_actions = True,
+        transition_action_space = 'raw',
+        add_reflexive_actor = True,
+        actor_residual_state_encoder = False
+    )
+
+    actor_sep_tokens, _, _ = wm_sep.encode_states(wm_sep.actor_state_encoders['reflexive'], states)
+    val_sep_tokens, _, _ = wm_sep.encode_states(wm_sep.value_state_encoder, states)
+
+    actor_state_tokens, _ = wm_sep.get_actor_state_tokens('reflexive', states)
+    val_state_tokens, _ = wm_sep.get_value_state_tokens(states)
+
+    assert_close(actor_state_tokens, actor_sep_tokens)
+    assert_close(val_state_tokens, val_sep_tokens)
