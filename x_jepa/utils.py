@@ -246,33 +246,3 @@ def store_experience_in_replay_buffer(
         buffer.store_episode(**ep_data)
 
     return buffer
-
-def experience_from_replay_buffer(
-    buffer: ReplayBuffer,
-    device = None
-) -> Experience:
-
-    data = buffer.get_all_data(device = device)
-    states = data['states']
-    actions = data['actions']
-    actor_log_probs = data.get('actor_log_probs')
-    rewards = data.get('rewards')
-    returns = data.get('returns')
-    cumulative_rewards = data.get('cumulative_rewards')
-    episode_len = data.get('episode_len', data.get('episode_lens'))
-
-    state_latents = data.get('state_latents')
-
-    return Experience(
-        states = states,
-        actions = actions,
-        actor_log_probs = actor_log_probs,
-        rewards = rewards,
-        terminated = None,
-        truncated = None,
-        infos = None,
-        episode_len = episode_len,
-        cumulative_rewards = cumulative_rewards,
-        returns = returns,
-        state_latents = state_latents
-    )

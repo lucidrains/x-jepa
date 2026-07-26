@@ -17,8 +17,8 @@ from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
 from x_jepa.goals import GoalGenerator, MetricResidualNetwork
 from x_jepa.flow_matching import FlowMatching
 from x_jepa.latent_action_model import LatentActionModel
-from x_jepa.utils import store_experience_in_replay_buffer, experience_from_replay_buffer, Experience
-from x_jepa.rl import ppo_loss, tpo_loss
+from x_jepa.utils import store_experience_in_replay_buffer, Experience, exists
+from x_jepa.rl import ppo_loss, tpo_loss, coerce_experience
 
 @param('plan_type', ('no_goal', 'goal', 'custom_goal'))
 @param('transition_action_space', ('raw', 'local', 'global'))
@@ -912,8 +912,8 @@ def test_world_model_ttt(use_perception_film, episodic_mem_len):
 
     # step 1
 
-    states_step1 = torch.randn(batch_size, 1, 32)
-    actions_step1 = torch.randn(batch_size, 1, 8)
+    states_step1 = torch.randn(batch_size, 2, 32)
+    actions_step1 = torch.randn(batch_size, 2, 8)
 
     out1, memories = wrapper(states_step1, actions_step1, return_memories = True, return_loss = True)
 
@@ -925,8 +925,8 @@ def test_world_model_ttt(use_perception_film, episodic_mem_len):
 
     # step 2
 
-    states_step2 = torch.randn(batch_size, 1, 32)
-    actions_step2 = torch.randn(batch_size, 1, 8)
+    states_step2 = torch.randn(batch_size, 2, 32)
+    actions_step2 = torch.randn(batch_size, 2, 8)
 
     # save params for comparison
 
@@ -1268,7 +1268,7 @@ def test_end_to_end_bc_rl_finetune_flow(rl_type, is_vector_env, use_var_lens):
             overwrite = True
         )
 
-        reloaded_exp = experience_from_replay_buffer(buffer)
+        reloaded_exp = coerce_experience(buffer.get_all_data())
         assert reloaded_exp.states.shape == planning_experience.states.shape
 
         lens = reloaded_exp.episode_len if use_var_lens else None
@@ -1320,7 +1320,7 @@ def test_end_to_end_bc_rl_finetune_flow(rl_type, is_vector_env, use_var_lens):
                 folder = tmpdir,
                 buffer = bc_buffer
             )
-        fetched_bc_exp = experience_from_replay_buffer(bc_buffer)
+        fetched_bc_exp = coerce_experience(bc_buffer.get_all_data())
         assert exists(fetched_bc_exp.actor_log_probs)
 
     if not use_var_lens:
@@ -1419,7 +1419,7 @@ def test_replay_buffer_serialization(has_actor_log_probs, has_rewards, has_retur
 
     with tempfile.TemporaryDirectory() as tmpdir:
         buffer = store_experience_in_replay_buffer(exp, 1000, 100000, folder = tmpdir, overwrite = True)
-        reloaded_exp = experience_from_replay_buffer(buffer)
+        reloaded_exp = coerce_experience(buffer.get_all_data())
 
         assert torch.allclose(reloaded_exp.states, exp.states)
         assert torch.allclose(reloaded_exp.actions, exp.actions)
@@ -1463,7 +1463,170 @@ def test_replay_buffer_schema_evolution():
         assert 'actor_log_probs' not in buffer.fieldnames
 
         buffer = store_experience_in_replay_buffer(exp_phase2, 100, 50, folder = tmpdir, buffer = buffer)
-        reloaded_exp = experience_from_replay_buffer(buffer)
+        reloaded_exp = coerce_experience(buffer.get_all_data())
 
         assert reloaded_exp.states.shape[0] == 4
         assert not exists(reloaded_exp.actor_log_probs)
+
+def test_actor_residual_state_encoder():
+    dim = 64
+    obs_dim = 8
+    action_dim = 2
+
+    wm = WorldModel(
+        state_encoder = nn.Linear(obs_dim, dim),
+        action_encoder = nn.Linear(action_dim, dim),
+        model = Transformer(dim = dim, depth = 2, causal = True),
+        dim_action = action_dim,
+        continuous_actions = True,
+        transition_action_space = 'raw',
+        add_reflexive_actor = True
+    )
+
+    states = torch.randn(2, 5, obs_dim)
+    actions = torch.randn(2, 5, action_dim)
+
+    params = wm.get_actor_parameters('reflexive')
+    assert len(params) > 0
+    assert 'reflexive' in wm.actor_state_encoders
+    assert exists(wm.value_state_encoder)
+
+    exp = Experience(
+        states = states,
+        actions = actions,
+        cumulative_rewards = torch.tensor([1.0, 2.0]),
+        episode_len = torch.tensor([5, 5])
+    )
+
+    loss = tpo_loss(wm, exp, actor_module = 'reflexive')
+    assert loss.ndim == 0 and not torch.isnan(loss)
+    loss.backward()
+
+def test_detach_base_state_encoder():
+    dim = 64
+    obs_dim = 8
+    action_dim = 2
+
+    wm = WorldModel(
+        state_encoder = nn.Linear(obs_dim, dim),
+        action_encoder = nn.Linear(action_dim, dim),
+        model = Transformer(dim = dim, depth = 2, causal = True),
+        dim_action = action_dim,
+        continuous_actions = True,
+        transition_action_space = 'raw',
+        add_reflexive_actor = True
+    )
+
+    states = torch.randn(2, 5, obs_dim)
+    actions = torch.randn(2, 5, action_dim)
+
+    exp = Experience(
+        states = states,
+        actions = actions,
+        cumulative_rewards = torch.tensor([1.0, 2.0]),
+        episode_len = torch.tensor([5, 5])
+    )
+
+    loss = tpo_loss(wm, exp, actor_module = 'reflexive', detach_base_state_encoder = True)
+    loss.backward()
+
+    for p in wm.state_encoder.parameters():
+        assert not exists(p.grad)
+
+    for p in wm.actors['reflexive'].parameters():
+        assert exists(p.grad)
+
+    for p in wm.actor_state_encoders['reflexive'].parameters():
+        assert exists(p.grad)
+
+def test_tpo_batch_size_warning():
+    dim = 64
+    obs_dim = 8
+    action_dim = 2
+
+    wm = WorldModel(
+        state_encoder = nn.Linear(obs_dim, dim),
+        action_encoder = nn.Linear(action_dim, dim),
+        model = Transformer(dim = dim, depth = 2, causal = True),
+        dim_action = action_dim,
+        continuous_actions = True,
+        transition_action_space = 'raw',
+        add_reflexive_actor = True
+    )
+
+    states = torch.randn(4, 5, obs_dim)
+    actions = torch.randn(4, 5, action_dim)
+
+    exp = Experience(
+        states = states,
+        actions = actions,
+        cumulative_rewards = torch.tensor([1.0, 2.0, 3.0, 4.0]),
+        episode_len = torch.tensor([5, 5, 5, 5])
+    )
+
+    loss = tpo_loss(wm, exp, actor_module = 'reflexive')
+    assert loss.ndim == 0
+
+def test_ppo_value_state_encoder_gradients():
+    dim = 64
+    obs_dim = 8
+    action_dim = 2
+
+    wm = WorldModel(
+        state_encoder = nn.Linear(obs_dim, dim),
+        action_encoder = nn.Linear(action_dim, dim),
+        model = Transformer(dim = dim, depth = 2, causal = True),
+        dim_action = action_dim,
+        continuous_actions = True,
+        transition_action_space = 'raw',
+        add_reflexive_actor = True
+    )
+
+    states = torch.randn(2, 5, obs_dim)
+    actions = torch.randn(2, 5, action_dim)
+
+    exp = Experience(
+        states = states,
+        actions = actions,
+        returns = torch.randn(2, 5),
+        episode_len = torch.tensor([5, 5])
+    )
+
+    loss = ppo_loss(wm, exp, actor_module = 'reflexive', detach_base_state_encoder = True)
+    loss.backward()
+
+    for p in wm.state_encoder.parameters():
+        assert not exists(p.grad)
+
+    for p in wm.actor_state_encoders['reflexive'].parameters():
+        assert exists(p.grad)
+
+    for p in wm.value_state_encoder.parameters():
+        assert exists(p.grad)
+
+def test_residual_state_encoder_sum():
+    dim = 64
+    obs_dim = 8
+    action_dim = 2
+
+    wm = WorldModel(
+        state_encoder = nn.Linear(obs_dim, dim),
+        action_encoder = nn.Linear(action_dim, dim),
+        model = Transformer(dim = dim, depth = 2, causal = True),
+        dim_action = action_dim,
+        continuous_actions = True,
+        transition_action_space = 'raw',
+        add_reflexive_actor = True
+    )
+
+    states = torch.randn(2, 5, obs_dim)
+
+    base_tokens, _, _ = wm.encode_states(wm.state_encoder, states)
+    actor_res_tokens, _, _ = wm.encode_states(wm.actor_state_encoders['reflexive'], states)
+    val_res_tokens, _, _ = wm.encode_states(wm.value_state_encoder, states)
+
+    actor_state_tokens, _ = wm.get_actor_state_tokens('reflexive', states)
+    val_state_tokens, _ = wm.get_value_state_tokens(states)
+
+    assert_close(actor_state_tokens, base_tokens + actor_res_tokens)
+    assert_close(val_state_tokens, base_tokens + val_res_tokens)

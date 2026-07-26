@@ -6,6 +6,7 @@ import inspect
 from random import random
 from contextlib import nullcontext
 from functools import partial, reduce as ft_reduce
+import copy
 from collections import deque, namedtuple
 
 import numpy as np
@@ -680,32 +681,36 @@ class Value(Module):
         )
         self.net = MLP(dim_state_latent + dim + dim, *((dim * 2,) * 2), 1)
         self.ema_net = EMA(self.net, beta = ema_beta)
+        self.ema_discount_embedder = EMA(self.discount_embedder, beta = ema_beta)
 
         self.register_buffer('discount_factor', tensor(discount_factor), persistent = False)
 
-    def embed_discount(self, discount):
+    def embed_discount(self, discount, ema = False):
         cond = stack([
             discount,
             1. - discount,
             -log(1. - discount, eps = self.eps)
         ], dim = -1)
-        return self.discount_embedder(cond)
 
-    def get_discount_embed(self, state_tokens, discount = None):
+        discount_embedder = self.ema_discount_embedder if ema else self.discount_embedder
+        return discount_embedder(cond)
+
+    def get_discount_embed(self, state_tokens, discount = None, ema = False):
         discount = default(discount, self.discount_factor)
         discount = discount.broadcast_to(state_tokens.shape[:-1])
-        return self.embed_discount(discount)
+        return self.embed_discount(discount, ema = ema)
 
     def forward_ema(self, state_tokens, state_latents, discount = None):
-        discount_embed = self.get_discount_embed(state_tokens, discount)
+        discount_embed = self.get_discount_embed(state_tokens, discount, ema = True)
         out = self.ema_net((state_tokens, state_latents, discount_embed))
         return rearrange(out, '... 1 -> ...')
 
     def update(self):
+        self.ema_discount_embedder.update()
         self.ema_net.update()
 
     def forward(self, state_tokens, state_latents, discount = None):
-        discount_embed = self.get_discount_embed(state_tokens, discount)
+        discount_embed = self.get_discount_embed(state_tokens, discount, ema = False)
         out = self.net((state_tokens, state_latents, discount_embed))
         return rearrange(out, '... 1 -> ...')
 
@@ -1014,7 +1019,7 @@ class WorldModel(Module):
         next_encoded_state_pred_loss_weight = 1.,
         plan_state_pred_loss_weight = 1.,
         value_loss_weight = 1.,
-        masked_loss_average_mode: Literal['timestep', 'trajectory'] = 'timestep',
+        masked_loss_average_mode = 'timestep',
         discount_factor = 0.99,
         pass_sensory_hiddens_to_world_model = False,
         frac_gradients = 0.,
@@ -1228,6 +1233,9 @@ class WorldModel(Module):
             )
 
         self.actors = ModuleDict(actors)
+        self.actor_state_encoders = ModuleDict({
+            name: copy.deepcopy(self.state_encoder) for name in actors
+        })
         self.has_actors = len(actors) > 0
 
         if not isinstance(actor_loss_weights, dict):
@@ -1243,6 +1251,7 @@ class WorldModel(Module):
         # value head
 
         self.value_network = Value(dim, dim_state_latent, discount_factor, ema_beta)
+        self.value_state_encoder = copy.deepcopy(self.state_encoder)
         self.frac_gradient = FracGradient(frac_gradients)
 
         # loss related
@@ -1408,6 +1417,79 @@ class WorldModel(Module):
                 total_view_idx += 1
 
         return sum(encoded), sensory_layer_hiddens, sensory_for_alignment
+
+    def add_actor(self, name: str, actor: Module, actor_loss_weight = 1.0):
+        self.actors[name] = actor
+        self.actor_state_encoders[name] = copy.deepcopy(self.state_encoder)
+        self.actor_loss_weights[name] = actor_loss_weight
+        self.has_actors = True
+
+    def get_actor_parameters(self, actor_name: str):
+        params = list(self.actors[actor_name].parameters())
+        if actor_name in self.actor_state_encoders:
+            params.extend(self.actor_state_encoders[actor_name].parameters())
+        return params
+
+    def get_actor_state_tokens(
+        self,
+        actor_name: str,
+        states: States,
+        base_state_encoder: ModuleList | None = None,
+        base_state_tokens: Tensor | None = None,
+        detach_base_state_encoder = False,
+        masks = None
+    ):
+        base_state_encoder = default(base_state_encoder, self.state_encoder)
+
+        if not exists(base_state_tokens):
+            context = torch.no_grad if detach_base_state_encoder else nullcontext
+            with context():
+                base_state_tokens, sensory_hiddens, _ = self.encode_states(base_state_encoder, states, masks = masks)
+        else:
+            base_state_tokens = base_state_tokens.detach() if detach_base_state_encoder else base_state_tokens
+            sensory_hiddens = None
+
+        if actor_name not in self.actor_state_encoders:
+            return base_state_tokens, sensory_hiddens
+
+        actor_tokens, actor_sensory_hiddens, _ = self.encode_states(self.actor_state_encoders[actor_name], states, masks = masks)
+        sensory_hiddens = default(sensory_hiddens, actor_sensory_hiddens)
+
+        return base_state_tokens + actor_tokens, sensory_hiddens
+
+    def get_value_parameters(self):
+        params = list(self.value_network.parameters())
+        if exists(self.value_state_encoder):
+            params.extend(self.value_state_encoder.parameters())
+        return params
+
+    def get_value_state_tokens(
+        self,
+        states: States,
+        base_state_encoder: ModuleList | None = None,
+        value_state_encoder: ModuleList | None = None,
+        base_state_tokens: Tensor | None = None,
+        detach_base_state_encoder = False,
+        masks = None
+    ):
+        base_state_encoder = default(base_state_encoder, self.state_encoder)
+        value_state_encoder = default(value_state_encoder, self.value_state_encoder)
+
+        if not exists(base_state_tokens):
+            context = torch.no_grad if detach_base_state_encoder else nullcontext
+            with context():
+                base_state_tokens, sensory_hiddens, _ = self.encode_states(base_state_encoder, states, masks = masks)
+        else:
+            base_state_tokens = base_state_tokens.detach() if detach_base_state_encoder else base_state_tokens
+            sensory_hiddens = None
+
+        if not exists(value_state_encoder):
+            return base_state_tokens, sensory_hiddens
+
+        val_tokens, val_sensory_hiddens, _ = self.encode_states(value_state_encoder, states, masks = masks)
+        sensory_hiddens = default(sensory_hiddens, val_sensory_hiddens)
+
+        return base_state_tokens + val_tokens, sensory_hiddens
 
     def update(self):
         [ema.update() for ema in self.ema_state_encoder]
@@ -1928,7 +2010,9 @@ class WorldModel(Module):
             elif exists(actor_module):
                 # encode state
                 ema_encoded_state, ema_encoded_sensory_states, patch_mask = self.encode_states(self.ema_state_encoder, state_seq)
-                ema_state_tokens = ema_encoded_state
+                ema_state_tokens, _ = self.get_actor_state_tokens(
+                    actor_module, state_seq, base_state_encoder = self.ema_state_encoder, base_state_tokens = ema_encoded_state
+                )
                 ema_state_latents = self.to_state_latent(ema_state_tokens)
 
                 actor = self.actors[actor_module]
@@ -2017,7 +2101,14 @@ class WorldModel(Module):
 
             ema_encoded_state, _, _ = self.encode_states(self.ema_state_encoder, state_seq)
 
-            ema_state_tokens = rearrange(ema_encoded_state, 'b 1 ... -> b ...')
+            # encode state with ema model for bootstrapping value
+
+            ema_val_state_tokens, _ = self.get_value_state_tokens(
+                state_seq,
+                base_state_encoder = self.ema_state_encoder
+            )
+
+            ema_state_tokens = rearrange(ema_val_state_tokens, 'b 1 ... -> b ...')
             ema_state_latents = self.to_state_latent(ema_state_tokens)
 
             # get next values
@@ -2275,6 +2366,8 @@ class WorldModel(Module):
 
         # now ready to do losses, remove the last token for predictive coding
 
+        assert state_embeds_full.shape[1] >= 2, 'state sequence length must be at least 2 for predictive transition loss'
+
         state_embeds, state_latents, action_embeds = (t[:, :-1] for t in (state_embeds_full, state_latents_full, action_embeds_full))
 
         # the action conditioning for the state latents that determine its transition
@@ -2373,16 +2466,15 @@ class WorldModel(Module):
         actor_bc_loss = self.zero
         actor_losses = dict()
 
-        if self.has_actors and behavior_clone:
+        bc_seq_len = state_tokens.shape[1] - 1
 
+        if self.has_actors and behavior_clone and bc_seq_len > 0:
             if isinstance(behavior_clone, str):
                 behavior_clone_actors = [behavior_clone]
             elif isinstance(behavior_clone, (tuple, list)):
                 behavior_clone_actors = behavior_clone
             else:
                 behavior_clone_actors = list(self.actors.keys())
-
-            bc_seq_len = state_tokens.shape[1] - 1
 
             for name, actor in self.actors.items():
                 if name not in behavior_clone_actors:
@@ -2393,15 +2485,20 @@ class WorldModel(Module):
                 if loss_weight == 0.:
                     continue
 
+                actor_state_tokens, actor_sensory_hiddens = self.get_actor_state_tokens(
+                    name, tree_map_tensor(lambda t: t[:, :bc_seq_len], states), base_state_tokens = state_tokens[:, :bc_seq_len]
+                )
+                actor_state_latents = self.to_state_latent(actor_state_tokens)
+
                 actor_bc_loss_for_name = actor(
                     target_actions = orig_actions[:, :bc_seq_len],
                     mask = valid_input_mask,
                     masked_loss_average_mode = masked_loss_average_mode,
-                    state_latents = tree_map_detach(state_latents),
-                    state_tokens = tree_map_detach(state_tokens),
+                    state_latents = tree_map_detach(actor_state_latents),
+                    state_tokens = tree_map_detach(actor_state_tokens),
                     action_cond = tree_map_detach(action_cond),
                     action_tokens = tree_map_detach(action_tokens),
-                    sensory_layer_hiddens = tree_map_detach(sensory_layer_hiddens) if exists(sensory_layer_hiddens) else None,
+                    sensory_layer_hiddens = tree_map_detach(actor_sensory_hiddens) if exists(actor_sensory_hiddens) else None,
                     world_model_hiddens = tree_map_detach(world_model_hiddens) if exists(world_model_hiddens) else None,
                     memories = model_memories[name] if exists(model_memories) and name in model_memories else None,
                     return_memories = return_memories
@@ -2427,7 +2524,9 @@ class WorldModel(Module):
             else:
                 returns_tensor = returns
 
-        pred_values = self.value_network(state_tokens, self.frac_gradient(state_latents_full), discounts)
+        val_state_tokens, _ = self.get_value_state_tokens(states, base_state_tokens = state_tokens)
+        val_state_latents = self.to_state_latent(val_state_tokens)
+        pred_values = self.value_network(val_state_tokens, self.frac_gradient(val_state_latents), discounts)
 
         if exists(returns_tensor):
             assert pred_values.shape == returns_tensor.shape, f'predicted values shape {pred_values.shape} must match returns shape {returns_tensor.shape}'
