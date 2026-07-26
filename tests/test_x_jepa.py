@@ -623,26 +623,29 @@ def test_interact_with_environment_multimodal():
     _, returns_tensor = experience.returns
     assert returns_tensor.shape[1] == experience.states[0].shape[1]
 
-def test_world_model_with_intrinsics():
+@param('has_actions', (False, True))
+def test_world_model_with_intrinsics(has_actions):
     from copy import deepcopy
     from x_jepa.intrinsic import CoinFlipNetwork
 
     dim = 256
+    action_dim = 4
     model = Transformer(
         dim = dim,
         depth = 2,
         causal = True
     )
 
-    cfn_net = MLP(dim, 64, dim)
-    coin_flip_network = CoinFlipNetwork(net = cfn_net, dim = dim)
+    in_dim = (dim + action_dim) if has_actions else dim
+    cfn_net = MLP(in_dim, 64, dim)
+    coin_flip_network = CoinFlipNetwork(net = cfn_net, dim = dim, accepts_actions = has_actions)
 
     world_model = WorldModel(
         model = model,
-        dim_action = 4,
+        dim_action = action_dim,
         state_encoder = nn.Linear(128, dim),
-        action_encoder = nn.Linear(4, dim),
-        action_decoder = nn.Linear(dim, 4),
+        action_encoder = nn.Linear(action_dim, dim),
+        action_decoder = nn.Linear(dim, action_dim),
         transition_action_space = 'local',
         continuous_actions = True,
         intrinsics = [coin_flip_network],
@@ -653,7 +656,7 @@ def test_world_model_with_intrinsics():
     world_model.eval()
 
     states = torch.randn(2, 5, 128)
-    actions = torch.randn(2, 4, 4)
+    actions = torch.randn(2, 4, action_dim)
 
     # Test forward pass with intrinsics loss
     loss, loss_breakdown = world_model(states, actions)
@@ -675,7 +678,7 @@ def test_world_model_with_intrinsics():
         generations = 1
     )
 
-    assert planned_actions.shape == (2, 3, 4)
+    assert planned_actions.shape == (2, 3, action_dim)
 
 def test_reflexive_actor_and_planning():
     dim = 128
@@ -1422,3 +1425,37 @@ def test_replay_buffer_serialization(has_actor_log_probs, has_rewards, has_retur
             assert torch.allclose(reloaded_exp.state_latents, exp.state_latents)
         else:
             assert not exists(reloaded_exp.state_latents)
+
+def test_replay_buffer_schema_evolution():
+    import tempfile
+    batch_size = 2
+    horizon = 5
+
+    states = torch.randn(batch_size, horizon, 16)
+    actions = torch.randn(batch_size, horizon, 4)
+
+    exp_phase1 = Experience(
+        states = states,
+        actions = actions,
+        actor_log_probs = None,
+        cumulative_rewards = torch.tensor([1.0, 2.0]),
+        episode_len = torch.tensor([5, 5])
+    )
+
+    exp_phase2 = Experience(
+        states = states,
+        actions = actions,
+        actor_log_probs = torch.randn(batch_size, horizon),
+        cumulative_rewards = torch.tensor([3.0, 4.0]),
+        episode_len = torch.tensor([5, 5])
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        buffer = store_experience_in_replay_buffer(exp_phase1, 100, 50, folder = tmpdir, overwrite = True)
+        assert 'actor_log_probs' not in buffer.fieldnames
+
+        buffer = store_experience_in_replay_buffer(exp_phase2, 100, 50, folder = tmpdir, buffer = buffer)
+        reloaded_exp = experience_from_replay_buffer(buffer)
+
+        assert reloaded_exp.states.shape[0] == 4
+        assert not exists(reloaded_exp.actor_log_probs)

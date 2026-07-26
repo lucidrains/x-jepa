@@ -48,7 +48,7 @@ from torch_einops_utils.device import module_device
 
 from PoPE_pytorch import PoPE, apply_pope_to_qk
 
-from x_jepa.utils import EnvWrapper, Experience, masked_mean
+from x_jepa.utils import EnvWrapper, Experience, masked_mean, accepts_kwarg, filter_kwargs_for_fn
 
 from x_jepa.regularizers import SigReg, uniform_wasserstein_loss, temporal_straightening_loss
 from x_jepa.min_gru import minGRUBlocks
@@ -700,7 +700,7 @@ class Value(Module):
         discount_embed = self.get_discount_embed(state_tokens, discount)
         return self.ema_net((state_tokens, state_latents, discount_embed))
 
-    def update_ema(self):
+    def update(self):
         self.ema_net.update()
 
     def forward(self, state_tokens, state_latents, discount = None):
@@ -1413,6 +1413,9 @@ class WorldModel(Module):
         self.ema_state_transition.update()
         self.ema_state_transition_for_planning.update()
 
+        if exists(self.value_network):
+            self.value_network.update()
+
     @torch.no_grad()
     @temp_eval
     def plan(
@@ -1706,9 +1709,14 @@ class WorldModel(Module):
                     assert self.has_intrinsics, 'intrinsics must be passed into WorldModel'
 
                     flat_pred_state_latents, unpack = pack_with_inverse(pred_state_latents, '* d')
-                    bonuses = tuple(unpack(intrinsic.compute_bonus(flat_pred_state_latents), '*') for intrinsic in self.intrinsics)
+                    flat_actions, _ = pack_with_inverse(actions, '* d') if exists(actions) else (None, None)
 
-                    kwargs.update(pred_intrinsic_bonuses = bonuses)
+                    bonuses = []
+                    for intrinsic in self.intrinsics:
+                        kw = dict(actions = flat_actions) if (accepts_kwarg(intrinsic.compute_bonus, 'actions') and exists(flat_actions)) else dict()
+                        bonuses.append(unpack(intrinsic.compute_bonus(flat_pred_state_latents, **kw), '*'))
+
+                    kwargs.update(pred_intrinsic_bonuses = tuple(bonuses))
 
                 allowed_params = set(kwargs.keys())
                 unknown_params = set(fitness_fn_params.keys()) - allowed_params
@@ -1904,14 +1912,7 @@ class WorldModel(Module):
             state_seq = tree_map_tensor(lambda t: rearrange(t, 'b ... -> b 1 ...'), state)
 
             if exists(action_fn):
-                action_params = inspect.signature(action_fn).parameters
-                kwargs = dict(
-                    step = step,
-                    state = state,
-                    env = env,
-                    info = info
-                )
-                kwargs = {k: v for k, v in kwargs.items() if k in action_params}
+                kwargs = filter_kwargs_for_fn(action_fn, step = step, state = state, env = env, info = info)
                 action = action_fn(**kwargs)
 
                 action = torch.as_tensor(action, device = self.device)
@@ -1975,8 +1976,8 @@ class WorldModel(Module):
             truncateds.append(truncated)
 
             if exists(callback):
-                callback_params = inspect.signature(callback).parameters
-                kwargs = dict(
+                kwargs = filter_kwargs_for_fn(
+                    callback,
                     step = step,
                     state = state,
                     action = action,
@@ -1989,7 +1990,7 @@ class WorldModel(Module):
                     episode_len = episode_len,
                     world_model = self
                 )
-                callback(**{k: v for k, v in kwargs.items() if k in callback_params})
+                callback(**kwargs)
 
             state = next_state
 
@@ -2478,11 +2479,19 @@ class WorldModel(Module):
 
         if self.has_intrinsics:
             flat_state_latents, _ = pack_with_inverse(state_latents_full, '* d')
+            flat_actions, _ = pack_with_inverse(orig_actions, '* d') if exists(orig_actions) else (None, None)
 
             ind_losses = []
             for intrinsic, frac_grad_fn in zip(self.intrinsics, self.intrinsic_frac_gradients):
                 intrinsic_latents = frac_grad_fn(flat_state_latents)
-                ind_losses.append(intrinsic.compute_loss(intrinsic_latents))
+
+                if accepts_kwarg(intrinsic.compute_loss, 'actions') and exists(flat_actions):
+                    actions_len = flat_actions.shape[0]
+                    ind_loss = intrinsic.compute_loss(intrinsic_latents[:actions_len], actions = flat_actions)
+                else:
+                    ind_loss = intrinsic.compute_loss(intrinsic_latents)
+
+                ind_losses.append(ind_loss)
 
             if not is_empty(ind_losses):
                 intrinsics_loss = sum(ind_losses)

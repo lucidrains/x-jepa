@@ -1,4 +1,5 @@
 from typing import NamedTuple, Any
+import inspect
 
 import numpy as np
 
@@ -23,6 +24,19 @@ class Experience(NamedTuple):
     cumulative_rewards: Tensor | None = None
     returns: Tensor | tuple[Tensor, Tensor] | None = None
     state_latents: Tensor | None = None
+
+# fn inspection helpers
+
+def accepts_kwarg(fn, kwarg: str) -> bool:
+    if not exists(fn):
+        return False
+    return kwarg in inspect.signature(fn).parameters
+
+def filter_kwargs_for_fn(fn, **kwargs):
+    if not exists(fn):
+        return dict()
+    params = inspect.signature(fn).parameters
+    return {k: v for k, v in kwargs.items() if k in params}
 
 # helper functions
 
@@ -196,25 +210,38 @@ def store_experience_in_replay_buffer(
             overwrite = overwrite
         )
 
+    # validate buffer schema against experience fields once up front
+
+    candidate_time_fields = dict(
+        states = states,
+        actions = actions,
+        actor_log_probs = experience.actor_log_probs,
+        rewards = experience.rewards,
+        returns = returns if (exists(returns) and is_tensor(returns)) else None,
+        state_latents = experience.state_latents
+    )
+
+    candidate_meta_fields = dict(
+        cumulative_rewards = experience.cumulative_rewards,
+        episode_len = experience.episode_len
+    )
+
+    active_time_fields = {
+        name: tensor for name, tensor in candidate_time_fields.items()
+        if exists(tensor) and name in buffer.fieldnames
+    }
+
+    active_meta_fields = {
+        name: tensor for name, tensor in candidate_meta_fields.items()
+        if exists(tensor) and name in buffer.meta_fieldnames
+    }
+
     for i in range(batch_size):
-        ep_data = dict(states = states[i], actions = actions[i])
+        ep_data = {name: tensor[i] for name, tensor in active_time_fields.items()}
 
-        if exists(experience.actor_log_probs):
-            ep_data['actor_log_probs'] = experience.actor_log_probs[i]
-        if exists(experience.rewards):
-            ep_data['rewards'] = experience.rewards[i]
-
-        if exists(returns) and is_tensor(returns):
-            ep_data['returns'] = returns[i]
-        if exists(experience.state_latents):
-            ep_data['state_latents'] = experience.state_latents[i]
-
-        if exists(experience.cumulative_rewards):
-            v = experience.cumulative_rewards[i]
-            ep_data['cumulative_rewards'] = v.item() if is_tensor(v) else v
-        if exists(experience.episode_len):
-            v = experience.episode_len[i]
-            ep_data['episode_len'] = v.item() if is_tensor(v) else v
+        for name, tensor in active_meta_fields.items():
+            v = tensor[i]
+            ep_data[name] = v.item() if is_tensor(v) else v
 
         buffer.store_episode(**ep_data)
 

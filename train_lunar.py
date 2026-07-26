@@ -13,6 +13,8 @@
 # ///
 
 import os
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 import fire
 
 import numpy as np
@@ -33,6 +35,7 @@ from x_mlps_pytorch import MLP
 
 from x_jepa import WorldModel
 from x_jepa.x_jepa import Transformer
+from x_jepa.rl import ppo_loss, tpo_loss
 from x_jepa.utils import store_experience_in_replay_buffer, divisible_by, exists
 
 # goals
@@ -62,6 +65,10 @@ def main(
     batch_size = 16,
     grad_accum_steps = 2,
     lr = 1e-3,
+    rl_type = 'tpo',             # 'ppo' or 'tpo'
+    rl_lr = 3e-4,
+    rl_start_episode = 500,      # switch to RL policy after 500 episodes
+    rl_epochs = 4,
     num_episodes = 1000,
     train_every_eps = 10,
     epochs_per_train = 2,
@@ -79,12 +86,14 @@ def main(
     use_wandb = True,
     cpu = False
 ):
+    assert rl_type in ('ppo', 'tpo'), f"rl_type must be either 'ppo' or 'tpo', got {rl_type}"
+
     accelerator = Accelerator(cpu = cpu)
     device = accelerator.device
     print(f"using device: {device}", flush = True)
 
     if use_wandb:
-        wandb.init(project = project_name)
+        wandb.init(project = project_name, config = dict(rl_type = rl_type, rl_start_episode = rl_start_episode))
 
     render_mode = "rgb_array" if record_video else None
     env = gym.make(env_name, render_mode = render_mode)
@@ -116,10 +125,19 @@ def main(
         state_linear_rnn_depth = 1,
         action_linear_rnn_depth = 1,
         value_loss_weight = 1.0,
-        discount_factor = gamma
+        discount_factor = gamma,
+        add_reflexive_actor = True
     ).to(device)
 
     optimizer = Adam(wm.parameters(), lr = lr)
+
+    rl_loss_fn = ppo_loss if rl_type == 'ppo' else tpo_loss
+    if rl_type == 'ppo':
+        rl_params = list(wm.actors['reflexive'].parameters()) + list(wm.value_network.parameters())
+    else:
+        rl_params = list(wm.actors['reflexive'].parameters())
+
+    rl_optimizer = Adam(rl_params, lr = rl_lr)
 
     def fitness_fn(pred_next_encoded_states, encoded_goal, pred_values):
         dist_cost = F.smooth_l1_loss(
@@ -138,6 +156,11 @@ def main(
     buffer_folder = f"./{env_name.lower().replace('-v3', '')}-memories"
 
     for episode in range(1, num_episodes + 1):
+        use_rl = episode > rl_start_episode
+
+        if episode == rl_start_episode + 1:
+            print(f"\n=== Episode {episode}: Switching from World Model Planning to {rl_type.upper()} Actor Optimization ===\n", flush = True)
+
         is_ideal_goal = np.random.rand() < 0.5
         episode_goal = ideal_goal_state if is_ideal_goal else get_random_goal()
         goal_tensor = torch.from_numpy(episode_goal).float().unsqueeze(0).to(device)
@@ -147,13 +170,15 @@ def main(
         wm.eval()
 
         action_fn = (lambda env: env.action_space.sample()) if is_random_ep else None
+        actor_module = 'reflexive' if use_rl else None
 
         experience = wm.interact_with_environment(
             env = env,
             max_steps = max_timesteps,
-            goal_state = goal_tensor if not is_random_ep else None,
-            fitness_fn = fitness_fn,
+            goal_state = goal_tensor if (not is_random_ep and not use_rl) else None,
+            fitness_fn = fitness_fn if not use_rl else None,
             action_fn = action_fn,
+            actor_module = actor_module,
             horizon = cem_horizon,
             pop_size = cem_num_samples,
             generations = cem_num_iters,
@@ -162,6 +187,17 @@ def main(
 
         total_reward = experience.cumulative_rewards.item()
         steps = experience.episode_len.item()
+
+        rl_loss_val = 0.0
+        if use_rl:
+            wm.train()
+            for _ in range(rl_epochs):
+                rl_optimizer.zero_grad()
+                r_loss = rl_loss_fn(wm, experience, actor_module = 'reflexive')
+                r_loss.backward()
+                rl_optimizer.step()
+                wm.update()
+                rl_loss_val = r_loss.item()
 
         buffer = store_experience_in_replay_buffer(
             experience,
@@ -183,7 +219,7 @@ def main(
                     b_states, b_actions, b_returns = batch['states'], batch['actions'], batch['returns']
                     b_lens = batch.get('episode_len', batch.get('episode_lens'))
 
-                    loss, _ = wm(b_states, b_actions, lens = b_lens, returns = b_returns)
+                    loss, _ = wm(b_states, b_actions, lens = b_lens, returns = b_returns, behavior_clone = (not use_rl))
                     loss = loss / grad_accum_steps
                     loss.backward()
 
@@ -193,24 +229,49 @@ def main(
                         wm.update()
                         loss_val = loss.item() * grad_accum_steps
 
-        log_dict = dict(episode = episode, episode_length = steps)
+        phase = 1 if use_rl else 0
+        log_dict = dict(episode = episode, episode_length = steps, phase = phase)
 
-        if is_ideal_goal:
+        if use_rl:
             rewards_history.append(total_reward)
             avg_reward = float(np.mean(rewards_history[-100:]))
-            log_dict.update(ideal_goal_reward = total_reward, ideal_goal_avg100_reward = avg_reward)
+            log_dict.update(
+                reward = total_reward,
+                avg100_reward = avg_reward,
+                rl_reward = total_reward,
+                rl_avg100_reward = avg_reward,
+                rl_loss = rl_loss_val,
+                rl_type = rl_type
+            )
 
             if avg_reward > best_avg_reward:
                 best_avg_reward = avg_reward
                 torch.save(wm.state_dict(), f"./{env_name.lower().replace('-v3', '')}-best.pt")
 
             if divisible_by(episode, print_every_eps):
-                print(f"episode {episode:4d} (ideal) | reward: {total_reward:8.2f} | avg100: {avg_reward:8.2f}", flush = True)
-        else:
-            log_dict.update(random_goal_reward = total_reward)
+                print(f"episode {episode:4d} [{rl_type.upper()} phase=1] | reward: {total_reward:8.2f} | avg100: {avg_reward:8.2f} | {rl_type}_loss: {rl_loss_val:.4f}", flush = True)
+
+        elif is_ideal_goal:
+            rewards_history.append(total_reward)
+            avg_reward = float(np.mean(rewards_history[-100:]))
+            log_dict.update(
+                reward = total_reward,
+                avg100_reward = avg_reward,
+                ideal_goal_reward = total_reward,
+                ideal_goal_avg100_reward = avg_reward
+            )
+
+            if avg_reward > best_avg_reward:
+                best_avg_reward = avg_reward
+                torch.save(wm.state_dict(), f"./{env_name.lower().replace('-v3', '')}-best.pt")
 
             if divisible_by(episode, print_every_eps):
-                print(f"episode {episode:4d} (random) | reward: {total_reward:8.2f}", flush = True)
+                print(f"episode {episode:4d} [WM phase=0 ideal] | reward: {total_reward:8.2f} | avg100: {avg_reward:8.2f}", flush = True)
+        else:
+            log_dict.update(random_goal_reward = total_reward, reward = total_reward)
+
+            if divisible_by(episode, print_every_eps):
+                print(f"episode {episode:4d} [WM phase=0 random] | reward: {total_reward:8.2f}", flush = True)
 
         if divisible_by(episode, train_every_eps):
             log_dict.update(train_loss = loss_val)
