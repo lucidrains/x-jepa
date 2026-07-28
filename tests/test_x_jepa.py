@@ -11,7 +11,7 @@ from einops.layers.torch import Rearrange
 
 from x_mlps_pytorch import MLP
 
-from x_jepa.x_jepa import WorldModel, Transformer, Actor, exists, WorldModelRolloutWrapper, TTTMetaLearningLoss
+from x_jepa.x_jepa import Agent, WorldModel, Transformer, Actor, exists, AgentRolloutWrapper, TTTMetaLearningLoss
 from x_jepa.min_gru import minGRUBlocks
 from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
 from x_jepa.goals import GoalGenerator, MetricResidualNetwork
@@ -35,8 +35,8 @@ def test_world_model(
     align_pre_state_action_repr
 ):
     model = Transformer(
-        dim = 512,
-        depth = 4,
+        dim = 32,
+        depth = 1,
         causal = True
     )
 
@@ -44,13 +44,13 @@ def test_world_model(
 
     reg = SigReg() if reg_type == 'sigreg' else VISReg()
 
-    world_model = WorldModel(
-        state_encoder = nn.Linear(128, 512),
-        action_encoder = nn.Linear(20, 512),
-        action_decoder = nn.Linear(32, 20) if not transition_action_is_raw else None,
+    world_model = Agent(
+        state_encoder = nn.Linear(16, 32),
+        action_encoder = nn.Linear(4, 32),
+        action_decoder = nn.Linear(8, 4) if not transition_action_is_raw else None,
         transition_action_space = transition_action_space,
-        dim_action = 20,
-        dim_action_latent = 32,
+        dim_action = 4,
+        dim_action_latent = 8,
         model = model,
         reg = reg,
         reg_next_state_weight = float(use_reg),
@@ -63,9 +63,9 @@ def test_world_model(
         align_pre_state_action_repr_sigreg_weight = 1. if align_pre_state_action_repr else 0.
     )
 
-    states = torch.randn(2, 10, 128)
-    actions = torch.randn(2, 9, 20).tanh()
-    returns = torch.randn(2, 10)
+    states = torch.randn(2, 4, 16)
+    actions = torch.randn(2, 3, 4).tanh()
+    returns = torch.randn(2, 4)
 
     loss, loss_breakdown = world_model(states, actions, returns = returns)
 
@@ -79,11 +79,11 @@ def test_world_model(
     # planning
 
     if plan_type == 'goal':
-        goal_state = torch.randn(2, 128)
+        goal_state = torch.randn(2, 16)
         plan_kwargs = dict(goal_state = goal_state)
 
     elif plan_type == 'custom_goal':
-        goal_state = torch.randn(2, 128)
+        goal_state = torch.randn(2, 16)
 
         def custom_fitness_fn(pred_values, pred_next_encoded_states, encoded_goal):
             dist = torch.nn.functional.mse_loss(pred_next_encoded_states, encoded_goal.expand_as(pred_next_encoded_states), reduction = 'none')
@@ -97,9 +97,9 @@ def test_world_model(
         fitness_fn = lambda pred_state_latents: reduce(pred_state_latents, 'b p ... -> b p', 'sum')
         plan_kwargs = dict(fitness_fn = fitness_fn)
 
-    planned_actions = world_model.plan(states[:, :2], actions[:, :1], horizon = 5, **plan_kwargs)
+    planned_actions = world_model.plan(states[:, :2], actions[:, :1], horizon = 2, **plan_kwargs)
 
-    assert planned_actions.shape == (2, 5, 20)
+    assert planned_actions.shape == (2, 2, 4)
 
 @param('transition_action_space', ('raw', 'local', 'global'))
 @param('search_space', ('raw', 'local_global', None))
@@ -114,49 +114,49 @@ def test_plan_search_spaces(
         pytest.skip('latent transition action space can only be searched in encoded_latent space for now')
 
     model = Transformer(
-        dim = 512,
-        depth = 4,
+        dim = 32,
+        depth = 1,
         causal = True
     )
 
     transition_action_is_raw = transition_action_space == 'raw'
 
-    world_model = WorldModel(
-        state_encoder = nn.Linear(128, 512),
-        action_encoder = nn.Linear(20, 512),
-        action_decoder = nn.Linear(32, 20) if not transition_action_is_raw else None,
+    world_model = Agent(
+        state_encoder = nn.Linear(16, 32),
+        action_encoder = nn.Linear(4, 32),
+        action_decoder = nn.Linear(8, 4) if not transition_action_is_raw else None,
         transition_action_space = transition_action_space,
-        dim_action = 20,
-        dim_action_latent = 32,
+        dim_action = 4,
+        dim_action_latent = 8,
         model = model,
     )
 
-    states = torch.randn(2, 10, 128)
-    actions = torch.randn(2, 9, 20).tanh()
+    states = torch.randn(2, 4, 16)
+    actions = torch.randn(2, 3, 4).tanh()
 
     planned_actions = world_model.plan(
         states[:, :2],
         actions[:, :1],
-        horizon = 5,
+        horizon = 2,
         search_space = search_space,
         fitness_fn = lambda pred_state_latents: reduce(pred_state_latents, 'b p ... -> b p', 'sum')
     )
 
-    assert planned_actions.shape == (2, 5, 20)
+    assert planned_actions.shape == (2, 2, 4)
 
     planned_actions_mppi = world_model.plan(
         states[:, :2],
         actions[:, :1],
-        horizon = 5,
+        horizon = 2,
         cem_temperature = 1.,
         search_space = search_space,
         fitness_fn = lambda pred_state_latents: reduce(pred_state_latents, 'b p ... -> b p', 'sum')
     )
 
-    assert planned_actions_mppi.shape == (2, 5, 20)
+    assert planned_actions_mppi.shape == (2, 2, 4)
 
 @param('continuous_actions', (True, False))
-@param('action_len', (9, 10))
+@param('action_len', (3, 4))
 @param('transition_action_space', ('raw', 'local', 'global'))
 @param('pass_world_model_hiddens_to_actor', (True, False))
 def test_behavior_cloning(
@@ -171,23 +171,23 @@ def test_behavior_cloning(
         pytest.skip('raw state transition action space requires continuous actions')
 
     model = Transformer(
-        dim = 512,
-        depth = 2,
+        dim = 32,
+        depth = 1,
         causal = True
     )
 
     actor_model = Transformer(
-        dim = 512,
-        depth = 2,
+        dim = 32,
+        depth = 1,
         causal = True
     )
 
-    dim_action = 20 if continuous_actions else 4
-    dim_action_latent = 32
+    dim_action = 4 if continuous_actions else 4
+    dim_action_latent = 8
 
-    world_model = WorldModel(
-        state_encoder = nn.Linear(128, 512),
-        action_encoder = nn.Linear(dim_action, 512) if continuous_actions else nn.Embedding(dim_action, 512),
+    world_model = Agent(
+        state_encoder = nn.Linear(16, 32),
+        action_encoder = nn.Linear(dim_action, 32) if continuous_actions else nn.Embedding(dim_action, 32),
         action_decoder = None if transition_action_is_raw else nn.Linear(dim_action_latent, dim_action),
         transition_action_space = transition_action_space,
         dim_action_latent = dim_action_latent,
@@ -200,7 +200,7 @@ def test_behavior_cloning(
         actor_loss_weights = 1.
     )
 
-    states = torch.randn(2, 10, 128)
+    states = torch.randn(2, 4, 16)
 
     if continuous_actions:
         actions = torch.randn(2, action_len, dim_action).tanh()
@@ -348,7 +348,7 @@ def test_world_model_sequential_vs_parallel():
         causal = True
     )
 
-    world_model = WorldModel(
+    world_model = Agent(
         model = model,
         dim_action = 4,
         state_encoder = nn.Linear(128, 128),
@@ -391,7 +391,7 @@ def test_world_model_plan_with_memories():
         causal = True
     )
 
-    world_model = WorldModel(
+    world_model = Agent(
         model = model,
         dim_action = 4,
         state_encoder = nn.Linear(128, 128),
@@ -437,7 +437,7 @@ def test_interact_with_environment():
         causal = True
     )
 
-    world_model = WorldModel(
+    world_model = Agent(
         model = model,
         dim_action = 2,
         state_encoder = nn.Linear(4, 128),
@@ -480,7 +480,7 @@ def test_interact_with_environment_commit_k_steps():
         causal = True
     )
 
-    world_model = WorldModel(
+    world_model = Agent(
         model = model,
         dim_action = 2,
         state_encoder = nn.Linear(4, 128),
@@ -533,7 +533,7 @@ def test_multimodal(complex_sensory):
     else:
         state_encoders = [image_encoder, vector_encoder]
 
-    world_model = WorldModel(
+    world_model = Agent(
         state_encoder = state_encoders,
         action_encoder = nn.Linear(64, 256),
         model = model,
@@ -595,7 +595,7 @@ def test_vljepa_cross_sensory_alignment():
         depth = 2
     )
 
-    world_model = WorldModel(
+    world_model = Agent(
         model = model,
         state_encoder = nn.ModuleList([eyes, ear, proprioception]),
         action_encoder = nn.Linear(4, 256),
@@ -633,7 +633,7 @@ def test_interact_with_environment_multimodal():
         causal = True
     )
 
-    world_model = WorldModel(
+    world_model = Agent(
         model = model,
         dim_action = 2,
         state_encoder = nn.ModuleList([
@@ -690,7 +690,7 @@ def test_world_model_with_intrinsics(has_actions):
     cfn_net = MLP(in_dim, 64, dim)
     coin_flip_network = CoinFlipNetwork(net = cfn_net, dim = dim, accepts_actions = has_actions)
 
-    world_model = WorldModel(
+    world_model = Agent(
         model = model,
         dim_action = action_dim,
         state_encoder = nn.Linear(128, dim),
@@ -739,7 +739,7 @@ def test_reflexive_actor_and_planning():
         causal = True
     )
 
-    world_model = WorldModel(
+    world_model = Agent(
         model = model,
         dim_action = dim_action,
         state_encoder = nn.Linear(64, dim),
@@ -781,7 +781,7 @@ def test_transformer_actor_sequential_vs_parallel():
     dim = 128
     dim_action = 4
 
-    world_model = WorldModel(
+    world_model = Agent(
         model = Transformer(dim = dim, depth = 2, causal = True),
         dim_action = dim_action,
         state_encoder = nn.Linear(64, dim),
@@ -868,7 +868,7 @@ def test_custom_mingru_actor():
         depth = 2
     )
 
-    world_model = WorldModel(
+    world_model = Agent(
         model = Transformer(dim = dim, depth = 2, causal = True),
         dim_action = dim_action,
         state_encoder = nn.Linear(64, dim),
@@ -921,7 +921,7 @@ def test_world_model_ttt(use_perception_film, episodic_mem_len):
 
     # world model
 
-    wm = WorldModel(
+    wm = Agent(
         model = model,
         state_encoder = nn.Linear(32, dim),
         action_encoder = nn.Linear(8, dim),
@@ -946,8 +946,8 @@ def test_world_model_ttt(use_perception_film, episodic_mem_len):
     # targeting the first Linear projection of the feedforward block in the first transformer layer
     ttt_module_paths = ('model.layers.0.2.1',)
 
-    wrapper = WorldModelRolloutWrapper(
-        world_model = wm,
+    wrapper = AgentRolloutWrapper(
+        agent = wm,
         chunk_size = 16,
         tbptt_steps = 2,
         ttt_module_paths = ttt_module_paths,
@@ -969,7 +969,7 @@ def test_world_model_ttt(use_perception_film, episodic_mem_len):
 
     # ensure ttt params initialized
 
-    check_module_name = 'perception_film' if use_perception_film else 'model.layers.0.2.1'
+    check_module_name = 'perception_film' if use_perception_film else 'world_models.0.model.layers.0.2.1'
     ttt_wrapper = wrapper.ttt_trainer.ttt_wrappers[check_module_name]
     assert exists(ttt_wrapper.batch_params)
 
@@ -1003,7 +1003,7 @@ def test_plan_with_gradient_descent():
         causal = True
     )
 
-    world_model = WorldModel(
+    world_model = Agent(
         model = model,
         dim_action = 4,
         state_encoder = nn.Linear(128, 128),
@@ -1040,7 +1040,7 @@ def test_plan_mixed_cem_and_gradient_descent():
         causal = True
     )
 
-    world_model = WorldModel(
+    world_model = Agent(
         model = model,
         dim_action = 4,
         state_encoder = nn.Linear(128, 128),
@@ -1078,7 +1078,7 @@ def test_sensory_dropout(sensory_dropout):
         causal = True
     )
 
-    world_model = WorldModel(
+    world_model = Agent(
         model = model,
         dim_action = 4,
         state_encoder = nn.ModuleList([nn.Linear(64, 128), nn.Linear(64, 128)]),
@@ -1231,7 +1231,7 @@ def test_mrn_world_model(use_mrn):
             asym_network = MLP(512, 256, 512)
         )
 
-    world_model = WorldModel(
+    world_model = Agent(
         state_encoder = nn.Linear(128, 512),
         action_encoder = nn.Linear(20, 512),
         action_decoder = nn.Linear(32, 20),
@@ -1283,7 +1283,7 @@ def test_end_to_end_bc_rl_finetune_flow(rl_type, is_vector_env, use_var_lens):
         causal = True
     )
 
-    world_model = WorldModel(
+    world_model = Agent(
         state_encoder = nn.Linear(obs_dim, dim_model),
         action_encoder = nn.Embedding(action_dim, dim_model),
         action_decoder = nn.Linear(dim_model, action_dim),
@@ -1523,7 +1523,7 @@ def test_actor_residual_state_encoder():
     obs_dim = 8
     action_dim = 2
 
-    wm = WorldModel(
+    wm = Agent(
         state_encoder = nn.Linear(obs_dim, dim),
         action_encoder = nn.Linear(action_dim, dim),
         model = Transformer(dim = dim, depth = 2, causal = True),
@@ -1557,7 +1557,7 @@ def test_detach_base_state_encoder():
     obs_dim = 8
     action_dim = 2
 
-    wm = WorldModel(
+    wm = Agent(
         state_encoder = nn.Linear(obs_dim, dim),
         action_encoder = nn.Linear(action_dim, dim),
         model = Transformer(dim = dim, depth = 2, causal = True),
@@ -1598,7 +1598,7 @@ def test_tpo_batch_size_warning():
     obs_dim = 8
     action_dim = 2
 
-    wm = WorldModel(
+    wm = Agent(
         state_encoder = nn.Linear(obs_dim, dim),
         action_encoder = nn.Linear(action_dim, dim),
         model = Transformer(dim = dim, depth = 2, causal = True),
@@ -1626,7 +1626,7 @@ def test_ppo_value_state_encoder_gradients():
     obs_dim = 8
     action_dim = 2
 
-    wm = WorldModel(
+    wm = Agent(
         state_encoder = nn.Linear(obs_dim, dim),
         action_encoder = nn.Linear(action_dim, dim),
         model = Transformer(dim = dim, depth = 2, causal = True),
@@ -1663,7 +1663,7 @@ def test_residual_state_encoder_sum():
     obs_dim = 8
     action_dim = 2
 
-    wm_res = WorldModel(
+    wm_res = Agent(
         state_encoder = nn.Linear(obs_dim, dim),
         action_encoder = nn.Linear(action_dim, dim),
         model = Transformer(dim = dim, depth = 2, causal = True),
@@ -1686,7 +1686,7 @@ def test_residual_state_encoder_sum():
     assert_close(actor_state_tokens, base_tokens + actor_res_tokens)
     assert_close(val_state_tokens, base_tokens + val_res_tokens)
 
-    wm_sep = WorldModel(
+    wm_sep = Agent(
         state_encoder = nn.Linear(obs_dim, dim),
         action_encoder = nn.Linear(action_dim, dim),
         model = Transformer(dim = dim, depth = 2, causal = True),
@@ -1705,3 +1705,43 @@ def test_residual_state_encoder_sum():
 
     assert_close(actor_state_tokens, actor_sep_tokens)
     assert_close(val_state_tokens, val_sep_tokens)
+
+def test_multiple_world_models():
+    dim = 256
+    model = Transformer(dim = dim, depth = 2, causal = True)
+
+    agent = Agent(
+        model = model,
+        num_world_models = 3,
+        state_encoder = nn.Linear(32, dim),
+        action_encoder = nn.Linear(8, dim),
+        dim_action = 8,
+        transition_action_space = 'raw',
+        continuous_actions = True
+    )
+
+    assert len(agent.world_models) == 3
+
+    states = torch.randn(2, 5, 32)
+    actions = torch.randn(2, 4, 8)
+
+    loss0, _ = agent(states, actions, world_model_index = 0)
+    loss1, _ = agent(states, actions, world_model_index = 1)
+    loss2, _ = agent(states, actions, world_model_index = 2)
+
+    assert exists(loss0) and exists(loss1) and exists(loss2)
+
+    planned0 = agent.plan(states, actions, goal_state = torch.randn(2, 32), world_model_index = 0)
+    planned2 = agent.plan(states, actions, goal_state = torch.randn(2, 32), world_model_index = 2)
+
+    assert planned0.shape == (2, 1, 8)
+    assert planned2.shape == (2, 1, 8)
+
+    wrapper = AgentRolloutWrapper(agent = agent, world_model_index = 1)
+    assert wrapper.world_model_index == 1
+
+    with pytest.raises(AssertionError):
+        agent.get_world_model(world_model_index = 5)
+
+    with pytest.raises(AssertionError):
+        AgentRolloutWrapper(agent = agent, world_model_index = 5)

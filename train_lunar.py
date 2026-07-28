@@ -30,7 +30,7 @@ import wandb
 from torch_einops_utils import tree_map_tensor_to_device
 from x_mlps_pytorch import MLP
 
-from x_jepa import WorldModel
+from x_jepa import Agent
 from x_jepa.x_jepa import Transformer
 from x_jepa.rl import ppo_loss, tpo_loss
 from x_jepa.utils import (
@@ -244,7 +244,7 @@ def main(
 
     model = Transformer(dim = dim, depth = depth, causal = True)
 
-    wm = WorldModel(
+    wm = Agent(
         state_encoder = state_encoder,
         action_encoder = action_encoder,
         model = model,
