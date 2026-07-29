@@ -511,14 +511,14 @@ def test_interact_with_environment_commit_k_steps():
 
     experience = world_model.interact_with_environment(
         env = env,
-        max_steps = 9,
+        max_steps = 4,
         fitness_fn = fitness_fn,
-        commit_k_steps = 3
+        commit_k_steps = 2
     )
 
-    assert experience.states.shape[1] == 9
-    # With commit_k_steps = 3 for 9 steps, plan should be called exactly 3 times (steps 0, 3, 6)
-    assert plan_count == 3
+    assert experience.states.shape[1] == 4
+    # With commit_k_steps = 2 for 4 steps, plan should be called exactly 2 times (steps 0, 2)
+    assert plan_count == 2
 
 @param('complex_sensory', (False, True))
 def test_multimodal(complex_sensory):
@@ -1745,3 +1745,43 @@ def test_multiple_world_models():
 
     with pytest.raises(AssertionError):
         AgentRolloutWrapper(agent = agent, world_model_index = 5)
+
+@param('temporal_compression', (1, 2, 4))
+def test_world_model_temporal_compression(temporal_compression):
+    dim = 64
+    dim_action = 8
+    model = Transformer(dim = dim, depth = 2, causal = True)
+
+    agent = Agent(
+        state_encoder = nn.Linear(32, dim),
+        action_encoder = nn.Linear(dim_action, dim),
+        model = model,
+        dim_action = dim_action,
+        continuous_actions = True,
+        transition_action_space = 'raw',
+        temporal_compression = temporal_compression
+    )
+
+    seq_len = temporal_compression * 3 + 1
+    action_len = seq_len - 1
+
+    states = torch.randn(2, seq_len, 32)
+    actions = torch.randn(2, action_len, dim_action)
+
+    # test forward with temporal compression
+    loss, losses = agent(states, actions)
+    assert loss.ndim == 0
+    loss.backward()
+
+    # test plan with temporal compression
+    horizon = temporal_compression * 2
+    planned_actions = agent.plan(
+        states,
+        actions,
+        goal_state = states[:, -1],
+        horizon = horizon,
+        pop_size = 4,
+        generations = 2
+    )
+
+    assert planned_actions.shape == (2, horizon, dim_action)

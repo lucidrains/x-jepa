@@ -993,6 +993,93 @@ class TransformerActor(Actor):
 
 # agent / world model
 
+# world model temporal compression helpers
+
+def pool_actions(
+    actions,
+    temporal_compression = 1
+):
+    if not exists(actions):
+        return actions
+
+    action_len = actions.shape[1]
+
+    if action_len == 0 or temporal_compression <= 1:
+        return actions
+
+    compressed_len = action_len // temporal_compression
+    if compressed_len == 0:
+        return actions.narrow(1, 0, 0)
+
+    actions_slice = actions.narrow(1, 0, compressed_len * temporal_compression)
+    return reduce(actions_slice, 'b (t n) ... -> b t ...', 'mean', n = temporal_compression)
+
+def slice_state_seq(
+    states,
+    start = 0,
+    stop = None,
+    step = 1
+):
+    return tree_map_tensor(lambda t: t[:, start:stop:step], states)
+
+def extract_temporal_compressed_lanes(
+    states,
+    actions,
+    mask = None,
+    returns = None,
+    temporal_compression = 1
+):
+    if temporal_compression <= 1:
+        return states, actions, mask, returns
+
+    # derive compressed sequence length
+
+    state_len = first_tensor(states).shape[1]
+    compressed_len = (state_len - temporal_compression) // temporal_compression
+
+    if compressed_len <= 0:
+        return states, actions, mask, returns
+
+    # build shifted memory lanes
+
+    lanes_states = []
+    lanes_actions = []
+    lanes_mask = None
+    lanes_returns = None
+
+    if exists(mask):
+        lanes_mask = []
+
+    if exists(returns):
+        lanes_returns = []
+
+    for lane_shift in range(temporal_compression):
+        stop_offset = lane_shift + temporal_compression * compressed_len
+        lane_state = slice_state_seq(states, start = lane_shift, stop = stop_offset + 1, step = temporal_compression)
+        lane_action = pool_actions(actions.narrow(1, lane_shift, temporal_compression * compressed_len), temporal_compression = temporal_compression)
+
+        lanes_states.append(lane_state)
+        lanes_actions.append(lane_action)
+
+        if exists(mask):
+            lanes_mask.append(mask.narrow(1, lane_shift, temporal_compression * compressed_len + 1)[:, ::temporal_compression])
+
+        if exists(returns):
+            lanes_returns.append(returns.narrow(1, lane_shift, temporal_compression * compressed_len + 1)[:, ::temporal_compression])
+
+    # stack lanes along batch dimension
+
+    if is_tensor(states):
+        stacked_states = cat(lanes_states, dim = 0)
+    else:
+        stacked_states = [cat(encoder_lanes, dim = 0) for encoder_lanes in zip(*lanes_states)]
+
+    stacked_actions = cat(lanes_actions, dim = 0)
+    stacked_mask = maybe(cat)(lanes_mask, dim = 0)
+    stacked_returns = maybe(cat)(lanes_returns, dim = 0)
+
+    return stacked_states, stacked_actions, stacked_mask, stacked_returns
+
 # world model module
 
 class WorldModel(Module):
@@ -1011,14 +1098,20 @@ class WorldModel(Module):
         next_encoded_state_pred_loss_weight = 1.,
         plan_state_pred_loss_weight = 1.,
         reg_next_state_weight = 0.,
-        reg_next_encoded_weight = 0.
+        reg_next_encoded_weight = 0.,
+        temporal_compression = 1
     ):
         super().__init__()
+
+        # transformer backbone
+
         assert exists(model), 'model must be passed to WorldModel'
         self.model = model
         self.ema_model = EMA(model, beta = ema_beta)
 
         dim_model = model.dim
+
+        # state transition MLPs for training & planning
 
         if not exists(state_transition):
             assert exists(dim_state_latent) and exists(dim_transition_action_input)
@@ -1037,6 +1130,8 @@ class WorldModel(Module):
 
         self.to_next_encoded_state_pred = MLP(dim_state_latent + dim_transition_action_input, *((dim_model * 2,) * 2), dim_model)
 
+        # probabilistic readouts
+
         self.probabilistic_state_transition = probabilistic_state_transition
         self.probabilistic_plan_state_transition = probabilistic_plan_state_transition
 
@@ -1046,10 +1141,16 @@ class WorldModel(Module):
         if probabilistic_plan_state_transition:
             self.plan_state_transition_beta_distr = BetaDistrReadout(source_range = (-state_latent_clamp_value, state_latent_clamp_value), eps = state_transition_eps)
 
+        # loss weights
+
         self.next_encoded_state_pred_loss_weight = next_encoded_state_pred_loss_weight
         self.plan_state_pred_loss_weight = plan_state_pred_loss_weight
         self.reg_next_state_weight = reg_next_state_weight
         self.reg_next_encoded_weight = reg_next_encoded_weight
+
+        # temporal compression (hierarchical state transition & chunked action planning)
+
+        self.temporal_compression = temporal_compression
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
@@ -1199,6 +1300,7 @@ class WorldModel(Module):
 # agent
 
 class Agent(Module):
+
     def __init__(
         self,
         *,
@@ -1264,9 +1366,15 @@ class Agent(Module):
         intrinsic_frac_gradient: float | tuple[float, ...] | list[float] = 0.,
         episodic_mem_len = 0,
         quasimetric_distance_network = None,
-        quasimetric_distance_loss_weight = 1.
+        quasimetric_distance_loss_weight = 1.,
+        temporal_compression = 1
     ):
         super().__init__()
+
+        # temporal compression (hierarchical state transition & chunked action planning)
+
+        self.temporal_compression = temporal_compression
+        self.has_temporal_compression = temporal_compression > 1
 
         # dimensions
 
@@ -1399,7 +1507,8 @@ class Agent(Module):
                     next_encoded_state_pred_loss_weight = next_encoded_state_pred_loss_weight,
                     plan_state_pred_loss_weight = plan_state_pred_loss_weight,
                     reg_next_state_weight = reg_next_state_weight,
-                    reg_next_encoded_weight = reg_next_encoded_weight
+                    reg_next_encoded_weight = reg_next_encoded_weight,
+                    temporal_compression = temporal_compression
                 ) for idx in range(num_world_models)
             ]
 
@@ -1792,10 +1901,21 @@ class Agent(Module):
 
         actions = pad_right_at_dim_to(actions, state_len, dim = 1)
 
+        temporal_compression = self.temporal_compression
+        has_temporal_compression = self.has_temporal_compression
+
+        offset = (state_len - 1) % temporal_compression if has_temporal_compression else 0
+
+        # handle temporal compression prompt context by slicing states and pooling actions at active lane offset
+
+        states_prompt = slice_state_seq(states, start = offset, step = temporal_compression)
+        actions_prompt = pool_actions(actions[:, offset:], temporal_compression = temporal_compression)
+        actions_prompt = pad_right_at_dim_to(actions_prompt, first_tensor(states_prompt).shape[1], dim = 1)
+
         # get the state and action latents
 
-        state_tokens, sensory_layer_hiddens, _ = self.encode_states(self.state_encoder, states)
-        action_tokens = self.encode_actions(actions)
+        state_tokens, sensory_layer_hiddens, _ = self.encode_states(self.state_encoder, states_prompt)
+        action_tokens = self.encode_actions(actions_prompt)
 
         # handle memories
 
@@ -1845,6 +1965,8 @@ class Agent(Module):
         state_latents = self.to_state_latent(state_embeds)
 
         state_latents = repeat(state_latents, 'b d -> b p d', p = pop_size)
+
+        assert divisible_by(horizon, temporal_compression), f'horizon ({horizon}) must be divisible by temporal compression ({temporal_compression})'
 
         # start with naive cross entropy method
 
@@ -1962,6 +2084,9 @@ class Agent(Module):
             # the state transition for planning could take raw actions or action latents depending on the transition action space
 
             actions_cond = eval_actions
+
+            if has_temporal_compression:
+                actions_cond = reduce(eval_actions, 'b p (h n) d -> b p h d', 'mean', n = temporal_compression)
 
             if is_search_space_raw_action and not self.is_transition_action_space_raw:
                 actions_cond, unpack = pack_with_inverse(actions_cond, '* h d')
@@ -2208,9 +2333,10 @@ class Agent(Module):
         actor_temperature = 1.0,
         callback: Callable[..., Any] | None = None,
         action_fn: Callable[..., Any] | None = None,
-        commit_k_steps = 1,
+        commit_k_steps: int | None = None,
         **plan_kwargs
     ):
+        commit_k_steps = default(commit_k_steps, self.temporal_compression)
         env = EnvWrapper(env, return_cpu = return_cpu, cast_double_to_float = cast_double_to_float)
 
         states, actions, actor_log_probs, rewards, terminateds, truncateds, infos = [], [], [], [], [], [], []
@@ -2440,12 +2566,14 @@ class Agent(Module):
 
         masked_loss_average_mode = default(masked_loss_average_mode, self.masked_loss_average_mode)
 
+        states, orig_actions, mask, returns = extract_temporal_compressed_lanes(
+            states, actions, mask = mask, returns = returns, temporal_compression = self.temporal_compression
+        )
+
+        (batch, state_len), action_len = first_tensor(states).shape[:2], orig_actions.shape[1]
         valid_target_mask = mask[:, 1:] if exists(mask) else None
         valid_input_mask = mask[:, :-1] if exists(mask) else None
-
-        orig_actions = actions
-
-        actions = pad_right_at_dim_to(actions, state_len, dim = 1)
+        actions = pad_right_at_dim_to(orig_actions, state_len, dim = 1)
 
         # handle memories
 
@@ -2453,6 +2581,11 @@ class Agent(Module):
 
         if exists(memories):
             state_rnn_memories, action_rnn_memories, model_memories = memories
+
+            if self.has_temporal_compression:
+                state_rnn_memories = tree_map_tensor(lambda t: repeat(t, 'b ... -> (n b) ...', n = self.temporal_compression), state_rnn_memories)
+                action_rnn_memories = tree_map_tensor(lambda t: repeat(t, 'b ... -> (n b) ...', n = self.temporal_compression), action_rnn_memories)
+                model_memories = tree_map_tensor(lambda t: repeat(t, 'b ... -> (n b) ...', n = self.temporal_compression), model_memories)
 
         next_model_memories = dict()
 
