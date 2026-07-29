@@ -520,6 +520,7 @@ def test_interact_with_environment_commit_k_steps():
     # With commit_k_steps = 2 for 4 steps, plan should be called exactly 2 times (steps 0, 2)
     assert plan_count == 2
 
+
 @param('complex_sensory', (False, True))
 def test_multimodal(complex_sensory):
     image_encoder = nn.Sequential(Rearrange('... c h w -> ... (c h w)'), nn.Linear(48, 256))
@@ -1731,8 +1732,8 @@ def test_multiple_world_models():
 
     assert exists(loss0) and exists(loss1) and exists(loss2)
 
-    planned0 = agent.plan(states, actions, goal_state = torch.randn(2, 32), world_model_index = 0)
-    planned2 = agent.plan(states, actions, goal_state = torch.randn(2, 32), world_model_index = 2)
+    planned0 = agent.plan(states, actions, goal_state = torch.randn(2, 32), horizon = 1, world_model_index = 0)
+    planned2 = agent.plan(states, actions, goal_state = torch.randn(2, 32), horizon = 1, world_model_index = 2)
 
     assert planned0.shape == (2, 1, 8)
     assert planned2.shape == (2, 1, 8)

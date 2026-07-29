@@ -2,11 +2,11 @@ from __future__ import annotations
 from typing import Callable, Literal, NamedTuple, Any
 
 import math
+import copy
 import inspect
 from random import random
 from contextlib import nullcontext
 from functools import partial, reduce as ft_reduce
-import copy
 from collections import deque, namedtuple
 
 import torch
@@ -136,8 +136,8 @@ def safe_divide(num, den, eps = 1e-5):
 
     return num / den.clamp(min = eps)
 
-def divisible_by(numer, denom):
-    return (numer % denom) == 0
+def round_up(n, mult):
+    return math.ceil(n / mult) * mult
 
 def l1norm(t, dim = -1):
     return F.normalize(t, p = 1, dim = dim)
@@ -1007,6 +1007,8 @@ def pool_actions(
     if action_len == 0 or temporal_compression <= 1:
         return actions
 
+    assert actions.is_floating_point(), 'actions being pooled under temporal compression must be in encoded or latent space, not raw discrete action space'
+
     compressed_len = action_len // temporal_compression
     if compressed_len == 0:
         return actions.narrow(1, 0, 0)
@@ -1151,6 +1153,7 @@ class WorldModel(Module):
         # temporal compression (hierarchical state transition & chunked action planning)
 
         self.temporal_compression = temporal_compression
+        self.has_temporal_compression = temporal_compression > 1
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
@@ -1370,11 +1373,6 @@ class Agent(Module):
         temporal_compression = 1
     ):
         super().__init__()
-
-        # temporal compression (hierarchical state transition & chunked action planning)
-
-        self.temporal_compression = temporal_compression
-        self.has_temporal_compression = temporal_compression > 1
 
         # dimensions
 
@@ -1672,8 +1670,12 @@ class Agent(Module):
         return self.world_models[world_model_index]
 
     def encode_actions(self, actions):
+
         if isinstance(self.action_encoder, nn.Embedding) and actions.is_floating_point():
             actions = actions.argmax(dim = -1)
+        elif not self.continuous_actions and not isinstance(self.action_encoder, nn.Embedding) and actions.ndim == 2:
+            actions = F.one_hot(actions.long(), num_classes = self.dim_action).float()
+
         return self.action_encoder(actions)
 
     @property
@@ -1846,7 +1848,7 @@ class Agent(Module):
         fitness_fn: Callable[..., Tensor] | None = None,
         goal_state: Tensor | None = None,
         goal_dist_fn: Callable[[Tensor, Tensor], Tensor] | None = None,
-        horizon = 1,
+        horizon = 8,
         pop_size = 1024,
         elite_frac = 0.1,
         generations = 5,
@@ -1901,8 +1903,11 @@ class Agent(Module):
 
         actions = pad_right_at_dim_to(actions, state_len, dim = 1)
 
-        temporal_compression = self.temporal_compression
-        has_temporal_compression = self.has_temporal_compression
+        temporal_compression = world_model.temporal_compression
+        has_temporal_compression = world_model.has_temporal_compression
+
+        if has_temporal_compression and exists(actions) and action_len > 0 and not actions.is_floating_point():
+            actions = self.encode_actions(actions)
 
         offset = (state_len - 1) % temporal_compression if has_temporal_compression else 0
 
@@ -1915,7 +1920,14 @@ class Agent(Module):
         # get the state and action latents
 
         state_tokens, sensory_layer_hiddens, _ = self.encode_states(self.state_encoder, states_prompt)
-        action_tokens = self.encode_actions(actions_prompt)
+
+        if has_temporal_compression:
+            if self.continuous_actions:
+                action_tokens = self.encode_actions(actions_prompt)
+            else:
+                action_tokens = actions_prompt
+        else:
+            action_tokens = self.encode_actions(actions_prompt)
 
         # handle memories
 
@@ -2334,9 +2346,20 @@ class Agent(Module):
         callback: Callable[..., Any] | None = None,
         action_fn: Callable[..., Any] | None = None,
         commit_k_steps: int | None = None,
+        horizon = 8,
         **plan_kwargs
     ):
-        commit_k_steps = default(commit_k_steps, self.temporal_compression)
+        world_model = self.get_world_model(world_model_index)
+        temporal_compression = world_model.temporal_compression
+        has_temporal_compression = world_model.has_temporal_compression
+
+        commit_k_steps = default(commit_k_steps, temporal_compression)
+        horizon = max(horizon, commit_k_steps)
+
+        if has_temporal_compression:
+            assert divisible_by(commit_k_steps, temporal_compression), f'commit_k_steps ({commit_k_steps}) must be a multiple of temporal compression ({temporal_compression}) when using temporal compressed world model'
+            horizon = round_up(horizon, temporal_compression)
+
         env = EnvWrapper(env, return_cpu = return_cpu, cast_double_to_float = cast_double_to_float)
 
         states, actions, actor_log_probs, rewards, terminateds, truncateds, infos = [], [], [], [], [], [], []
@@ -2349,8 +2372,6 @@ class Agent(Module):
         memories = None
         action_queue = []
         pred_state_latent_queue = []
-
-        horizon = max(plan_kwargs.pop('horizon', 1), commit_k_steps)
 
         is_done = torch.zeros(batch, dtype = torch.bool, device = device)
         cumulative_rewards = torch.zeros(batch, device = device)
@@ -2566,8 +2587,15 @@ class Agent(Module):
 
         masked_loss_average_mode = default(masked_loss_average_mode, self.masked_loss_average_mode)
 
+        world_model = self.get_world_model(world_model_index)
+        temporal_compression = world_model.temporal_compression
+        has_temporal_compression = world_model.has_temporal_compression
+
+        if has_temporal_compression and exists(actions) and action_len > 0 and not actions.is_floating_point():
+            actions = self.encode_actions(actions)
+
         states, orig_actions, mask, returns = extract_temporal_compressed_lanes(
-            states, actions, mask = mask, returns = returns, temporal_compression = self.temporal_compression
+            states, actions, mask = mask, returns = returns, temporal_compression = temporal_compression
         )
 
         (batch, state_len), action_len = first_tensor(states).shape[:2], orig_actions.shape[1]
@@ -2582,10 +2610,10 @@ class Agent(Module):
         if exists(memories):
             state_rnn_memories, action_rnn_memories, model_memories = memories
 
-            if self.has_temporal_compression:
-                state_rnn_memories = tree_map_tensor(lambda t: repeat(t, 'b ... -> (n b) ...', n = self.temporal_compression), state_rnn_memories)
-                action_rnn_memories = tree_map_tensor(lambda t: repeat(t, 'b ... -> (n b) ...', n = self.temporal_compression), action_rnn_memories)
-                model_memories = tree_map_tensor(lambda t: repeat(t, 'b ... -> (n b) ...', n = self.temporal_compression), model_memories)
+            if has_temporal_compression:
+                state_rnn_memories = tree_map_tensor(lambda t: repeat(t, 'b ... -> (n b) ...', n = temporal_compression), state_rnn_memories)
+                action_rnn_memories = tree_map_tensor(lambda t: repeat(t, 'b ... -> (n b) ...', n = temporal_compression), action_rnn_memories)
+                model_memories = tree_map_tensor(lambda t: repeat(t, 'b ... -> (n b) ...', n = temporal_compression), model_memories)
 
         next_model_memories = dict()
 
