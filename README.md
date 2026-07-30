@@ -210,3 +210,14 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
     year    = {2026}
 }
 ```
+
+```bibtex
+@article{Eysenbach2018DiversityIA,
+    title   = {Diversity is All You Need: Learning Skills without a Reward Function},
+    author  = {Benjamin Eysenbach and Abhishek Gupta and Julian Ibarz and Sergey Levine},
+    journal = {ArXiv},
+    year    = {2018},
+    volume  = {abs/1802.06070},
+    url     = {https://arxiv.org/abs/1802.06070}
+}
+```

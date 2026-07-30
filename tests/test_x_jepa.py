@@ -997,6 +997,25 @@ def test_world_model_ttt(use_perception_film, episodic_mem_len):
 
     assert updated
 
+def test_agent_temporal_compression_tuple():
+    dim = 32
+    model = Transformer(dim = dim, depth = 2, heads = 4, dim_head = 8)
+
+    agent = Agent(
+        model = model,
+        state_encoder = nn.Linear(32, dim),
+        action_encoder = nn.Linear(8, dim),
+        dim_action = 8,
+        transition_action_space = 'raw',
+        continuous_actions = True,
+        temporal_compression = (1, 2, 4)
+    )
+
+    assert len(agent.world_models) == 3
+    assert agent.world_models[0].temporal_compression == 1
+    assert agent.world_models[1].temporal_compression == 2
+    assert agent.world_models[2].temporal_compression == 4
+
 def test_plan_with_gradient_descent():
     model = Transformer(
         dim = 128,
@@ -1786,3 +1805,234 @@ def test_world_model_temporal_compression(temporal_compression):
     )
 
     assert planned_actions.shape == (2, horizon, dim_action)
+
+def test_interact_with_env_with_skills():
+    dim = 32
+    num_skills = 4
+    dim_skill = 16
+
+    class ConvEncoder(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Conv2d(3, 16, 3, padding = 1),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten(),
+                nn.Linear(16, dim)
+            )
+
+        def forward(self, x):
+            if x.ndim > 4:
+                *batch_shape, c, h, w = x.shape
+                x = x.reshape(-1, c, h, w)
+                out = self.net(x)
+                return out.reshape(*batch_shape, -1)
+
+            return self.net(x)
+
+    model = Transformer(
+        dim = dim,
+        depth = 2,
+        heads = 4,
+        dim_head = 8
+    )
+
+    agent = Agent(
+        model = model,
+        state_encoder = [ConvEncoder(dim), nn.Linear(4, dim)],
+        action_encoder = nn.Linear(8, dim),
+        dim_action = 8,
+        transition_action_space = 'raw',
+        continuous_actions = True,
+        use_diayn = True,
+        num_skills = num_skills,
+        dim_skill = dim_skill,
+        add_reflexive_actor = True
+    )
+
+    class MultimodalMockEnv:
+        def __init__(self):
+            self.step_count = 0
+
+        def reset(self):
+            self.step_count = 0
+            img = torch.randn(1, 3, 32, 32)
+            prop = torch.randn(1, 4)
+            return [img, prop], {}
+
+        def step(self, action):
+            self.step_count += 1
+            done = self.step_count >= 10
+            img = torch.randn(1, 3, 32, 32)
+            prop = torch.randn(1, 4)
+            return [img, prop], torch.tensor([1.0]), done, False, {}
+
+    env = MultimodalMockEnv()
+    opt = torch.optim.Adam(agent.skill_discriminator.parameters(), lr = 1e-3)
+
+    # interact with env across skills
+
+    experiences = []
+
+    for active_skill in range(num_skills):
+        exp = agent.interact_with_environment(
+            env,
+            actor_module = 'reflexive',
+            max_steps = 10,
+            skill_id = active_skill,
+            return_cpu = False
+        )
+
+        assert exists(exp.skill_ids)
+        assert (exp.skill_ids == active_skill).all()
+        experiences.append(exp)
+
+    # learn on experience
+
+    batch_states = torch.cat([e.state_latents for e in experiences], dim = 0)
+    batch_actions = torch.cat([e.actions for e in experiences], dim = 0)
+    batch_skill_ids = torch.cat([e.skill_ids for e in experiences], dim = 0)
+
+    loss = agent.skill_discriminator.compute_loss(
+        batch_states,
+        batch_skill_ids,
+        actions = batch_actions
+    )
+
+    loss.backward()
+    opt.step()
+    opt.zero_grad()
+
+    # plan with a skill
+    img_states = torch.randn(2, 4, 3, 32, 32)
+    prop_states = torch.randn(2, 4, 4)
+    actions = torch.randn(2, 3, 8)
+    img_goal = torch.randn(2, 3, 32, 32)
+    prop_goal = torch.randn(2, 4)
+
+    planned_actions = agent.plan(
+        [img_states, prop_states],
+        actions,
+        goal_state = [img_goal, prop_goal],
+        horizon = 4,
+        pop_size = 8,
+        generations = 2,
+        skill_id = 2,
+        seed_with_actor = 'reflexive'
+    )
+    assert planned_actions.shape == (2, 4, 8)
+
+    assert planned_actions.shape == (2, 4, 8)
+
+    # custom goal function evaluating DIAYN intrinsic rewards via skill_discriminator
+    def custom_fitness_fn(pred_state_latents, skill_discriminator):
+        pop_skill_ids = torch.full((2, 8, 4), fill_value = 2, device = pred_state_latents.device)
+        return skill_discriminator.compute_intrinsic_reward(pred_state_latents, pop_skill_ids).sum(dim = -1)
+
+    planned_actions_custom = agent.plan(
+        [img_states, prop_states],
+        actions,
+        fitness_fn = custom_fitness_fn,
+        horizon = 4,
+        pop_size = 8,
+        generations = 2,
+        skill_id = 2
+    )
+
+    assert planned_actions_custom.shape == (2, 4, 8)
+
+    # edge case test: batched per-instance tensor skill_id in vector environment rollout
+    class MultimodalBatchMockEnv:
+        def __init__(self):
+            self.step_count = 0
+            self.num_envs = 2
+
+        def reset(self):
+            self.step_count = 0
+            return [torch.randn(2, 3, 32, 32), torch.randn(2, 4)], {}
+
+        def step(self, action):
+            self.step_count += 1
+            done = self.step_count >= 5
+            img = torch.randn(2, 3, 32, 32)
+            prop = torch.randn(2, 4)
+            return [img, prop], torch.tensor([1.0, 1.0]), torch.tensor([done, done]), torch.tensor([False, False]), {}
+
+    batch_env = MultimodalBatchMockEnv()
+    tensor_skills = torch.tensor([0, 3])
+
+    exp_batched = agent.interact_with_environment(
+        batch_env,
+        actor_module = 'reflexive',
+        max_steps = 5,
+        skill_id = tensor_skills,
+        return_cpu = False
+    )
+
+    assert exists(exp_batched.skill_ids)
+    assert exp_batched.skill_ids.shape == (2, 5)
+    assert (exp_batched.skill_ids[0] == 0).all()
+    assert (exp_batched.skill_ids[1] == 3).all()
+
+    # multimodal observation environment rollout with DIAYN skills
+    class ConvEncoder(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Conv2d(3, 16, 4, stride = 2, padding = 1),
+                nn.ReLU(),
+                nn.Flatten(),
+                nn.Linear(16 * 16 * 16, dim)
+            )
+
+        def forward(self, x):
+            if x.ndim > 4:
+                shape = x.shape
+                return self.net(x.reshape(-1, *shape[-3:])).reshape(*shape[:-3], -1)
+            return self.net(x)
+
+    class MultimodalMockEnv:
+        def __init__(self):
+            self.step_count = 0
+
+        def reset(self):
+            self.step_count = 0
+            return (torch.randn(1, 3, 32, 32), torch.randn(1, 4)), {}
+
+        def step(self, action):
+            self.step_count += 1
+            done = self.step_count >= 5
+            return (torch.randn(1, 3, 32, 32), torch.randn(1, 4)), torch.tensor([1.0]), done, False, {}
+
+    multimodal_agent = Agent(
+        model = model,
+        state_encoder = [ConvEncoder(dim), nn.Linear(4, dim)],
+        action_encoder = nn.Linear(8, dim),
+        dim_action = 8,
+        transition_action_space = 'raw',
+        continuous_actions = True,
+        use_diayn = True,
+        num_skills = num_skills,
+        dim_skill = dim_skill,
+        add_reflexive_actor = True
+    )
+
+    mm_env = MultimodalMockEnv()
+    exp_mm = multimodal_agent.interact_with_environment(
+        mm_env,
+        actor_module = 'reflexive',
+        max_steps = 5,
+        skill_id = 2,
+        return_cpu = False
+    )
+
+    assert exists(exp_mm.skill_ids)
+    assert (exp_mm.skill_ids == 2).all()
+
+    mm_loss = multimodal_agent.skill_discriminator.compute_loss(
+        exp_mm.state_latents,
+        exp_mm.skill_ids,
+        actions = exp_mm.actions
+    )
+    assert not torch.isnan(mm_loss)

@@ -24,6 +24,7 @@ class Experience(NamedTuple):
     cumulative_rewards: Tensor | None = None
     returns: Tensor | tuple[Tensor, Tensor] | None = None
     state_latents: Tensor | None = None
+    skill_ids: Tensor | None = None
 
 # fn inspection helpers
 
@@ -199,6 +200,8 @@ def store_experience_in_replay_buffer(
             meta_fields['cumulative_rewards'] = 'float'
         if exists(experience.episode_len):
             meta_fields['episode_len'] = 'int'
+        if exists(experience.skill_ids):
+            meta_fields['skill_ids'] = 'int' if not experience.skill_ids.is_floating_point() else 'float'
 
         buffer = ReplayBuffer(
             folder = folder,
@@ -223,7 +226,8 @@ def store_experience_in_replay_buffer(
 
     candidate_meta_fields = dict(
         cumulative_rewards = experience.cumulative_rewards,
-        episode_len = experience.episode_len
+        episode_len = experience.episode_len,
+        skill_ids = experience.skill_ids
     )
 
     active_time_fields = {
@@ -239,9 +243,10 @@ def store_experience_in_replay_buffer(
     for i in range(batch_size):
         ep_data = {name: tensor[i] for name, tensor in active_time_fields.items()}
 
-        for name, tensor in active_meta_fields.items():
-            v = tensor[i]
-            ep_data[name] = v.item() if is_tensor(v) else v
+        ep_data.update({
+            name: tensor[i].flatten()[0].item() if is_tensor(tensor[i]) else tensor[i]
+            for name, tensor in active_meta_fields.items()
+        })
 
         buffer.store_episode(**ep_data)
 

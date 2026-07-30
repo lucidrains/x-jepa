@@ -25,7 +25,8 @@ def coerce_experience(experience: Experience | dict) -> Experience:
         episode_len = experience.get('episode_len', experience.get('episode_lens')),
         cumulative_rewards = experience.get('cumulative_rewards'),
         returns = experience.get('returns'),
-        state_latents = experience.get('state_latents')
+        state_latents = experience.get('state_latents'),
+        skill_ids = experience.get('skill_ids')
     )
 
 def get_actor_log_probs_and_entropy(
@@ -33,7 +34,9 @@ def get_actor_log_probs_and_entropy(
     actor_module,
     states,
     actions,
-    detach_base_state_encoder = False
+    detach_base_state_encoder = False,
+    skill_latent = None,
+    skill_id = None
 ):
     batch, seq_len = actions.shape[:2]
     actor = world_model.actors[actor_module]
@@ -48,11 +51,15 @@ def get_actor_log_probs_and_entropy(
             wm_out = world_model(states, actions, return_loss = False)
             wm_hiddens = wm_out.get('hiddens')
 
+    if not exists(skill_latent) and exists(skill_id) and hasattr(world_model, 'get_skill'):
+        skill_latent = world_model.get_skill(skill_id)
+
     action_preds = actor.get_action_preds(
         state_latents = state_latents,
         state_tokens = state_tokens,
         sensory_layer_hiddens = sensory_hiddens,
-        world_model_hiddens = wm_hiddens
+        world_model_hiddens = wm_hiddens,
+        skill_latent = skill_latent
     )
 
     action_preds = action_preds[:, :seq_len]

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Callable, Literal, NamedTuple, Any
+from typing import Callable, Literal, NamedTuple, Any, Sequence
 
 import math
 import copy
@@ -53,6 +53,7 @@ from x_jepa.regularizers import SigReg, uniform_wasserstein_loss, temporal_strai
 from x_jepa.min_gru import minGRUBlocks
 from x_jepa.goals import GoalGenerator
 from x_jepa.flow_matching import FlowMatching
+from x_jepa.diayn import SkillLatents, SkillDiscriminator
 
 # constants
 
@@ -723,6 +724,21 @@ class Value(Module):
 
 # classes
 
+def add_actor_conditioning(
+    state_latents,
+    actor_cond = None
+):
+    if not exists(actor_cond):
+        return state_latents
+
+    if actor_cond.ndim == 1:
+        actor_cond = rearrange(actor_cond, 'd -> 1 d')
+
+    while actor_cond.ndim < state_latents.ndim:
+        actor_cond = rearrange(actor_cond, '... d -> ... 1 d')
+
+    return state_latents + actor_cond
+
 class Actor(Module):
     def __init__(
         self,
@@ -769,7 +785,6 @@ class Actor(Module):
     def get_log_probs_and_entropy(self, action_preds, target_actions):
         fn = self.get_continuous_log_probs_and_entropy if self.continuous_actions else self.get_discrete_log_probs_and_entropy
         return fn(action_preds, target_actions)
-
 
     def sample_actions(
         self,
@@ -841,7 +856,14 @@ class ReflexiveActor(Actor):
         dim_out = dim_action * 2 if continuous_actions else dim_action
         self.net = MLP(dim_state_latent, hidden_dim, dim_out)
 
-    def get_action_preds(self, state_latents, return_memories = False, **kwargs):
+    def get_action_preds(
+        self,
+        state_latents,
+        actor_cond = None,
+        return_memories = False,
+        **kwargs
+    ):
+        state_latents = add_actor_conditioning(state_latents, actor_cond)
         pred = self.net(state_latents)
 
         if not return_memories:
@@ -900,6 +922,7 @@ class TransformerActor(Actor):
         world_model_hiddens = None,
         memories = None,
         return_memories = False,
+        actor_cond = None,
         **kwargs
     ):
         batch, seq_len = state_latents.shape[:2]
@@ -914,12 +937,11 @@ class TransformerActor(Actor):
                 sensory_layer_hiddens = None
                 world_model_hiddens = None
 
-        # handle absent states and actions
-
         def default_zeros(t, feature_dim):
             return state_latents.new_zeros(*state_latents.shape[:-1], feature_dim) if not exists(t) else t[:, :seq_len]
 
         state_tokens = default_zeros(state_tokens, self.dim)
+        state_tokens = add_actor_conditioning(state_tokens, actor_cond)
 
         # project
 
@@ -1366,11 +1388,16 @@ class Agent(Module):
         cross_sensory_align_sigreg_weight: float = 0.,
         intrinsics: Module | list[Module] | ModuleList | tuple[Module, ...] | None = None,
         intrinsic_loss_weight: float = 1.,
-        intrinsic_frac_gradient: float | tuple[float, ...] | list[float] = 0.,
+        intrinsic_frac_gradient: float | Sequence[float] = 0.,
         episodic_mem_len = 0,
         quasimetric_distance_network = None,
         quasimetric_distance_loss_weight = 1.,
-        temporal_compression = 1
+        temporal_compression: int | Sequence[int] = 1,
+        use_diayn = False,
+        num_skills = 8,
+        dim_skill = 32,
+        diayn_l2norm_skills = False,
+        diayn_discriminator_depth = 2
     ):
         super().__init__()
 
@@ -1481,6 +1508,11 @@ class Agent(Module):
 
         # instantiate world_models
 
+        temporal_compressions = cast_tuple(temporal_compression)
+
+        if len(temporal_compressions) > 1:
+            num_world_models = len(temporal_compressions)
+
         assert num_world_models >= 1, 'num_world_models must be at least 1'
         self.num_world_models = num_world_models
 
@@ -1506,7 +1538,7 @@ class Agent(Module):
                     plan_state_pred_loss_weight = plan_state_pred_loss_weight,
                     reg_next_state_weight = reg_next_state_weight,
                     reg_next_encoded_weight = reg_next_encoded_weight,
-                    temporal_compression = temporal_compression
+                    temporal_compression = temporal_compressions[idx if idx < len(temporal_compressions) else 0]
                 ) for idx in range(num_world_models)
             ]
 
@@ -1659,7 +1691,41 @@ class Agent(Module):
         self.has_temporal_straightening_loss = temporal_straightening_loss_weight > 0.
         self.discount_factor = discount_factor
 
+        # DIAYN skill discovery
+
+        self.use_diayn = use_diayn
+        self.num_skills = num_skills
+        self.dim_skill = dim_skill
+
+        self.skill_latents = None
+        self.skill_discriminator = None
+        self.to_skill_actor_cond = None
+
+        if use_diayn:
+            self.skill_latents = SkillLatents(
+                num_skills = num_skills,
+                dim_skill = dim_skill,
+                l2norm_skills = diayn_l2norm_skills
+            )
+            self.skill_discriminator = SkillDiscriminator(
+                dim_state = dim_state_latent,
+                num_skills = num_skills,
+                dim_action = dim_action,
+                depth = diayn_discriminator_depth
+            )
+            self.to_skill_actor_cond = LinearNoBias(dim_skill, dim_state_latent)
+
         self.register_buffer('zero', tensor(0.), persistent = False)
+
+    def get_skill(self, skill_id):
+        assert self.use_diayn, 'use_diayn must be True to call get_skill'
+        return self.skill_latents(skill_id)
+
+    def get_skill_actor_cond(self, skill_id = None):
+        if not self.use_diayn or not exists(skill_id):
+            return None
+
+        return self.to_skill_actor_cond(self.get_skill(skill_id))
 
     @property
     def world_model(self):
@@ -1869,10 +1935,15 @@ class Agent(Module):
         memories = None,
         return_memories = False,
         return_pred_state_latents = False,
-        return_pred_states = False
+        return_pred_states = False,
+        skill_id: int | Tensor | None = None
     ):
         batch, device = first_tensor(states).shape[0], self.device
         state_len, action_len = first_tensor(states).shape[1], actions.shape[1]
+
+        # handle skill conditioning for planning
+
+        skill_actor_cond = self.get_skill_actor_cond(skill_id)
 
         # search space and some validation while it is still incomplete
 
@@ -2050,6 +2121,9 @@ class Agent(Module):
                     return_memories = True
                 )
 
+                if exists(skill_actor_cond):
+                    action_kwargs.update(actor_cond = skill_actor_cond)
+
                 if exists(seed_last_action_cond):
                     action_kwargs.update(
                         action_cond = seed_last_action_cond,
@@ -2160,7 +2234,8 @@ class Agent(Module):
                     pred_next_encoded_states = pred_next_encoded_states,
                     pred_values = pred_values,
                     encoded_goal = encoded_goal,
-                    pred_state_entropies = pred_state_entropies
+                    pred_state_entropies = pred_state_entropies,
+                    skill_discriminator = self.skill_discriminator
                 )
 
                 if 'pred_intrinsic_bonuses' in fitness_fn_params:
@@ -2192,7 +2267,7 @@ class Agent(Module):
                 distances = self.quasimetric_distance_network(pred_state_latents, encoded_goal_expanded)
                 fitnesses = -reduce(distances, 'b p h -> b p', 'sum')
             else:
-                # default to simple distance function if no fitness function or quasimetric distance provided
+                # default to simple distance function if goal state provided
 
                 dist_fn = default(goal_dist_fn, partial(F.smooth_l1_loss, reduction = 'none'))
                 distance_to_goal = dist_fn(pred_next_encoded_states, encoded_goal.expand_as(pred_next_encoded_states))
@@ -2347,6 +2422,7 @@ class Agent(Module):
         action_fn: Callable[..., Any] | None = None,
         commit_k_steps: int | None = None,
         horizon = 8,
+        skill_id: int | Tensor | None = None,
         **plan_kwargs
     ):
         world_model = self.get_world_model(world_model_index)
@@ -2372,6 +2448,23 @@ class Agent(Module):
         memories = None
         action_queue = []
         pred_state_latent_queue = []
+
+        # handle maybe skill conditioning for environment interaction - can also be used for evolution later on
+
+        if self.use_diayn and not exists(skill_id):
+            skill_id = torch.randint(0, self.num_skills, (batch,), device = device)
+
+        if exists(skill_id):
+            if not is_tensor(skill_id) or skill_id.numel() == 1:
+                skill_id_val = skill_id.item() if is_tensor(skill_id) else skill_id
+                skill_id = torch.full((batch,), skill_id_val, dtype = torch.long, device = device)
+
+            skill_id = skill_id.to(device)
+            assert skill_id.shape == (batch,)
+
+        skill_actor_cond = self.get_skill_actor_cond(skill_id)
+
+        # some environment output related
 
         is_done = torch.zeros(batch, dtype = torch.bool, device = device)
         cumulative_rewards = torch.zeros(batch, device = device)
@@ -2412,16 +2505,20 @@ class Agent(Module):
 
                 actor = self.actors[actor_module]
 
-                action, step_log_prob = actor.sample(
+                actor_kwargs = dict(
                     state_latents = ema_state_latents,
                     state_tokens = ema_state_tokens,
                     sensory_layer_hiddens = ema_encoded_sensory_states,
                     temperature = actor_temperature,
                     return_log_prob = True
                 )
+                if exists(skill_actor_cond):
+                    actor_kwargs.update(actor_cond = skill_actor_cond)
+
+                action, step_log_prob = actor.sample(**actor_kwargs)
 
                 action = rearrange(action, 'b 1 ... -> b ...')
-                step_log_prob = rearrange(step_log_prob, 'b 1 -> b')
+                step_log_prob = rearrange(step_log_prob, 'b ... -> (b ...)')
 
                 actor_log_probs.append(step_log_prob.cpu() if return_cpu else step_log_prob)
                 memories = None
@@ -2437,6 +2534,7 @@ class Agent(Module):
                         return_memories = True,
                         return_pred_state_latents = True,
                         world_model_index = world_model_index,
+                        skill_id = skill_id,
                         **plan_kwargs
                     )
 
@@ -2458,7 +2556,7 @@ class Agent(Module):
             if is_done.any():
                 reward = reward.masked_fill(is_done, 0.)
 
-            cumulative_rewards.add_(reward)
+            cumulative_rewards.add_(reward.flatten())
             episode_len.add_((~is_done).long())
 
             if is_last_step:
@@ -2510,8 +2608,6 @@ class Agent(Module):
 
             state_seq = tree_map_tensor(lambda t: rearrange(t, 'b ... -> b 1 ...'), state)
 
-            # encode state with ema model for bootstrapping value
-
             ema_encoded_state, _, _ = self.encode_states(self.ema_state_encoder, state_seq)
 
             # encode state with ema model for bootstrapping value
@@ -2542,6 +2638,11 @@ class Agent(Module):
         actor_log_probs = actor_log_probs if not is_empty(actor_log_probs) else None
         actor_log_probs = maybe(stack)(actor_log_probs, dim = 1)
 
+        skill_ids_tensor = None
+        if exists(skill_id):
+            seq_len = actions.shape[1]
+            skill_ids_tensor = repeat(skill_id, 'b -> b t', t = seq_len) if is_tensor(skill_id) else torch.full((batch, seq_len), fill_value = skill_id, dtype = torch.long)
+
         experience = Experience(
             states = states,
             actions = actions,
@@ -2553,7 +2654,8 @@ class Agent(Module):
             episode_len = episode_len,
             cumulative_rewards = cumulative_rewards,
             returns = returns,
-            state_latents = all_ema_state_latents
+            state_latents = all_ema_state_latents,
+            skill_ids = skill_ids_tensor
         )
 
         if return_cpu:
