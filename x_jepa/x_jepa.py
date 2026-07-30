@@ -53,7 +53,7 @@ from x_jepa.regularizers import SigReg, uniform_wasserstein_loss, temporal_strai
 from x_jepa.min_gru import minGRUBlocks
 from x_jepa.goals import GoalGenerator
 from x_jepa.flow_matching import FlowMatching
-from x_jepa.diayn import SkillLatents, SkillDiscriminator
+from x_jepa.intrinsic import SkillLatents, SkillDiscriminator
 
 # constants
 
