@@ -128,8 +128,8 @@ class SkillDiscriminator(Module):
         if exists(self.state_encoder):
             states = self.state_encoder(states)
 
-        if exists(actions) and states.ndim == 3 and actions.ndim == 3 and states.shape[1] == actions.shape[1] + 1:
-            states = states[:, :actions.shape[1]]
+        if exists(actions) and states.ndim == actions.ndim and states.shape[-2] == (actions.shape[-2] + 1):
+            states = states[..., :actions.shape[-2], :]
 
         if not exists(actions) and self.has_action:
             actions = states.new_zeros(*states.shape[:-1], self.dim_action)
@@ -137,10 +137,8 @@ class SkillDiscriminator(Module):
         to_cat = [t for t in (states, actions) if exists(t)]
         behavior = cat(to_cat, dim = -1) if len(to_cat) > 1 else states
 
-        if not self.has_chunking or behavior.ndim < 3 or not divisible_by(behavior.shape[1], self.chunk_len):
+        if not self.has_chunking or behavior.ndim < 3 or not divisible_by(behavior.shape[-2], self.chunk_len):
             return self.net(behavior)
 
-        batch = behavior.shape[0]
-        behavior = rearrange(behavior, 'b (n c) d -> (b n) (c d)', c = self.chunk_len)
-        logits = self.net(behavior)
-        return rearrange(logits, '(b n) k -> b n k', b = batch)
+        behavior = rearrange(behavior, '... (n c) d -> ... n (c d)', c = self.chunk_len)
+        return self.net(behavior)

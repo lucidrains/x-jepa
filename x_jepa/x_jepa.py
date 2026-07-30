@@ -641,13 +641,15 @@ def calc_returns(
     mask = None,
     lens = None
 ):
+    assert rewards.ndim == 2, 'rewards in calc_returns must be 2 dimensional (b, n)'
+
     seq_len = rewards.shape[1]
 
     assert not (exists(mask) and exists(lens)), 'either mask or lens is given, but not both'
 
     mask = default(mask, maybe(lens_to_mask)(lens, seq_len))
 
-    scan = AssocScan(reverse = True)
+    scan = AssocScan(reverse = True, has_no_feature_dim = True)
 
     # pack to ensure at least 2 dimensions for assoc scan
 
@@ -708,19 +710,27 @@ class Value(Module):
         discount = discount.broadcast_to(state_tokens.shape[:-1])
         return self.embed_discount(discount, ema = ema)
 
-    def forward_ema(self, state_tokens, state_latents, discount = None):
+    def forward_ema(self, state_tokens, state_latents, discount = None, squeeze_out = True):
         discount_embed = self.get_discount_embed(state_tokens, discount, ema = True)
         out = self.ema_net((state_tokens, state_latents, discount_embed))
-        return rearrange(out, '... 1 -> ...')
+
+        if squeeze_out:
+            out = rearrange(out, '... 1 -> ...')
+
+        return out
 
     def update(self):
         self.ema_discount_embedder.update()
         self.ema_net.update()
 
-    def forward(self, state_tokens, state_latents, discount = None):
+    def forward(self, state_tokens, state_latents, discount = None, squeeze_out = True):
         discount_embed = self.get_discount_embed(state_tokens, discount, ema = False)
         out = self.net((state_tokens, state_latents, discount_embed))
-        return rearrange(out, '... 1 -> ...')
+
+        if squeeze_out:
+            out = rearrange(out, '... 1 -> ...')
+
+        return out
 
 # classes
 
@@ -2423,6 +2433,7 @@ class Agent(Module):
         commit_k_steps: int | None = None,
         horizon = 8,
         skill_id: int | Tensor | None = None,
+        diversity_skill_loss_weight = 0.1,
         **plan_kwargs
     ):
         world_model = self.get_world_model(world_model_index)
@@ -2449,18 +2460,21 @@ class Agent(Module):
         action_queue = []
         pred_state_latent_queue = []
 
-        # handle maybe skill conditioning for environment interaction - can also be used for evolution later on
+        # skills
 
         if self.use_diayn and not exists(skill_id):
             skill_id = torch.randint(0, self.num_skills, (batch,), device = device)
 
         if exists(skill_id):
+            if is_tensor(skill_id):
+                assert skill_id.numel() in (1, batch), f'skill_id numel ({skill_id.numel()}) must be 1 or match number of environments ({batch})'
+
             if not is_tensor(skill_id) or skill_id.numel() == 1:
                 skill_id_val = skill_id.item() if is_tensor(skill_id) else skill_id
                 skill_id = torch.full((batch,), skill_id_val, dtype = torch.long, device = device)
 
             skill_id = skill_id.to(device)
-            assert skill_id.shape == (batch,)
+            assert skill_id.numel() == batch, f'skill_ids numel ({skill_id.numel()}) must equal number of environments ({batch})'
 
         skill_actor_cond = self.get_skill_actor_cond(skill_id)
 
@@ -2622,7 +2636,13 @@ class Agent(Module):
 
             # get next values
 
-            next_values = self.value_network.forward_ema(ema_state_tokens, ema_state_latents)
+            next_values = self.value_network.forward_ema(ema_state_tokens, ema_state_latents, squeeze_out = True)
+
+        all_ema_state_latents = None
+        has_diayn = self.use_diayn and diversity_skill_loss_weight > 0.
+        requires_state_latents = has_diayn or exists(self.value_network)
+
+        if requires_state_latents:
 
             # encode the entire trajectory to store state latents
 
@@ -2630,18 +2650,36 @@ class Agent(Module):
             all_ema_encoded_states, _, _ = self.encode_states(self.ema_state_encoder, all_states)
             all_ema_state_latents = self.to_state_latent(all_ema_encoded_states)
 
+        # diayn
+
+        skill_ids_tensor = None
+        if exists(skill_id):
+            seq_len = actions.shape[1]
+            skill_ids_tensor = repeat(skill_id, 'b -> b t', t = seq_len) if is_tensor(skill_id) else torch.full((batch, seq_len), fill_value = skill_id, dtype = torch.long, device = self.device)
+
+        has_intrinsic_skill_reward = self.use_diayn and diversity_skill_loss_weight > 0. and exists(skill_ids_tensor)
+
+        if has_intrinsic_skill_reward:
+            with torch.no_grad():
+                diversity_skill_reward = self.skill_discriminator.compute_intrinsic_reward(
+                    all_ema_state_latents,
+                    skill_ids_tensor,
+                    actions = actions
+                )
+
+            rewards = rewards + diversity_skill_reward * diversity_skill_loss_weight
+
+        # returns
+
         returns = calc_returns(rewards, terminateds, next_values, self.discount_factor)
 
         batch_discount = self.value_network.discount_factor.expand(batch)
         returns = (batch_discount, returns)
 
+        # actor log prob for ppo
+
         actor_log_probs = actor_log_probs if not is_empty(actor_log_probs) else None
         actor_log_probs = maybe(stack)(actor_log_probs, dim = 1)
-
-        skill_ids_tensor = None
-        if exists(skill_id):
-            seq_len = actions.shape[1]
-            skill_ids_tensor = repeat(skill_id, 'b -> b t', t = seq_len) if is_tensor(skill_id) else torch.full((batch, seq_len), fill_value = skill_id, dtype = torch.long)
 
         experience = Experience(
             states = states,

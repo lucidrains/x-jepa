@@ -61,9 +61,23 @@ def masked_mean(tensor, mask = None, dim = None, average_mode = 'timestep'):
     return trajectory_means.mean()
 
 def is_vectorized(env):
-    num_envs = getattr(env, 'num_envs', 0)
-    is_vector_env = getattr(env, 'is_vector_env', False)
-    return num_envs > 0 or is_vector_env
+    if getattr(env, 'is_vector', False):
+        return True
+
+    curr = env
+    while exists(curr):
+        if isinstance(curr, EnvWrapper):
+            return True
+        curr = getattr(curr, 'env', None)
+
+    if hasattr(env, 'num_envs') and getattr(env, 'num_envs', 0) > 0:
+        return True
+
+    try:
+        from gymnasium.vector import VectorEnv
+        return isinstance(getattr(env, 'unwrapped', env), VectorEnv)
+    except ImportError:
+        return False
 
 def to_torch_and_batch(x, is_vector, device = None, cast_double_to_float = True):
     def transform(t):
@@ -79,7 +93,11 @@ def to_torch_and_batch(x, is_vector, device = None, cast_double_to_float = True)
             t = t.float()
 
         if not is_vector:
-            t = rearrange(t, '... -> 1 ...')
+            # single non-vector env: scalars (rewards/dones) -> 1D (1,), multi-element (obs) -> prepended batch (1, ...)
+            if t.numel() == 1:
+                t = t.reshape(1)
+            else:
+                t = rearrange(t, '... -> 1 ...')
 
         if exists(device):
             t = t.to(device)

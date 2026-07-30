@@ -225,7 +225,7 @@ def test_reg_loss(reg_type):
     assert loss.ndim == 0
     loss.backward()
 
-@pytest.mark.parametrize('samples', (tensor([[0.]]), tensor([[-0.5], [0.5]])))
+@param('samples', (tensor([[0.]]), tensor([[-0.5], [0.5]])))
 def test_uniform_wasserstein_uses_bin_midpoints(samples):
     loss = uniform_wasserstein_loss(samples)
     assert_close(loss, torch.tensor(0.))
@@ -907,8 +907,8 @@ def test_custom_mingru_actor():
 
     assert planned_actions.shape == (2, 3, dim_action)
 
-@pytest.mark.parametrize('use_perception_film', [True, False])
-@pytest.mark.parametrize('episodic_mem_len', [0, 4])
+@param('use_perception_film', [True, False])
+@param('episodic_mem_len', [0, 4])
 def test_world_model_ttt(use_perception_film, episodic_mem_len):
     dim = 256
 
@@ -1806,7 +1806,9 @@ def test_world_model_temporal_compression(temporal_compression):
 
     assert planned_actions.shape == (2, horizon, dim_action)
 
-def test_interact_with_env_with_skills():
+@param('is_vectorized_env', (False, True))
+@param('diversity_skill_loss_weight', (0., 0.1))
+def test_interact_with_env_with_skills(is_vectorized_env, diversity_skill_loss_weight):
     dim = 32
     num_skills = 4
     dim_skill = 16
@@ -1852,23 +1854,37 @@ def test_interact_with_env_with_skills():
     )
 
     class MultimodalMockEnv:
-        def __init__(self):
+        def __init__(self, is_vector = False):
             self.step_count = 0
+            self.is_vector = is_vector
+            if is_vector:
+                self.is_vector_env = True
+                self.num_envs = 2
 
         def reset(self):
             self.step_count = 0
-            img = torch.randn(1, 3, 32, 32)
-            prop = torch.randn(1, 4)
-            return [img, prop], {}
+            if self.is_vector:
+                return [torch.randn(2, 3, 32, 32), torch.randn(2, 4)], {}
+            return [torch.randn(3, 32, 32), torch.randn(4)], {}
 
         def step(self, action):
             self.step_count += 1
             done = self.step_count >= 10
-            img = torch.randn(1, 3, 32, 32)
-            prop = torch.randn(1, 4)
-            return [img, prop], torch.tensor([1.0]), done, False, {}
+            if self.is_vector:
+                img = torch.randn(2, 3, 32, 32)
+                prop = torch.randn(2, 4)
+                reward = torch.ones(2)
+                terminated = torch.full((2,), done)
+                truncated = torch.full((2,), False)
+            else:
+                img = torch.randn(3, 32, 32)
+                prop = torch.randn(4)
+                reward = 1.0
+                terminated = done
+                truncated = False
+            return [img, prop], reward, terminated, truncated, {}
 
-    env = MultimodalMockEnv()
+    env = MultimodalMockEnv(is_vector = is_vectorized_env)
     opt = torch.optim.Adam(agent.skill_discriminator.parameters(), lr = 1e-3)
 
     # interact with env across skills
@@ -1881,11 +1897,15 @@ def test_interact_with_env_with_skills():
             actor_module = 'reflexive',
             max_steps = 10,
             skill_id = active_skill,
+            diversity_skill_loss_weight = diversity_skill_loss_weight,
             return_cpu = False
         )
 
         assert exists(exp.skill_ids)
         assert (exp.skill_ids == active_skill).all()
+        if diversity_skill_loss_weight == 0.:
+            assert torch.allclose(exp.rewards, torch.full_like(exp.rewards, 1.0))
+
         experiences.append(exp)
 
     # learn on experience
