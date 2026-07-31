@@ -707,6 +707,10 @@ class Value(Module):
 
     def get_discount_embed(self, state_tokens, discount = None, ema = False):
         discount = default(discount, self.discount_factor)
+
+        if is_tensor(discount) and discount.ndim == 1:
+            discount = rearrange(discount, 'b -> b 1')
+
         discount = discount.broadcast_to(state_tokens.shape[:-1])
         return self.embed_discount(discount, ema = ema)
 
@@ -1074,45 +1078,20 @@ def extract_temporal_compressed_lanes(
     if compressed_len <= 0:
         return states, actions, mask, returns
 
-    # build shifted memory lanes
-
-    lanes_states = []
-    lanes_actions = []
-    lanes_mask = None
-    lanes_returns = None
+    stop_offset = temporal_compression * compressed_len
+    states = slice_state_seq(states, start = 0, stop = stop_offset + 1, step = temporal_compression)
+    actions = pool_actions(actions.narrow(1, 0, stop_offset), temporal_compression = temporal_compression)
 
     if exists(mask):
-        lanes_mask = []
+        mask = mask.narrow(1, 0, stop_offset + 1)[:, ::temporal_compression]
 
     if exists(returns):
-        lanes_returns = []
+        if is_tensor(returns):
+            returns = returns.narrow(1, 0, stop_offset + 1)[:, ::temporal_compression] if returns.ndim >= 2 else returns
+        elif isinstance(returns, (tuple, list)):
+            returns = tuple(r.narrow(1, 0, stop_offset + 1)[:, ::temporal_compression] if (is_tensor(r) and r.ndim >= 2) else r for r in returns)
 
-    for lane_shift in range(temporal_compression):
-        stop_offset = lane_shift + temporal_compression * compressed_len
-        lane_state = slice_state_seq(states, start = lane_shift, stop = stop_offset + 1, step = temporal_compression)
-        lane_action = pool_actions(actions.narrow(1, lane_shift, temporal_compression * compressed_len), temporal_compression = temporal_compression)
-
-        lanes_states.append(lane_state)
-        lanes_actions.append(lane_action)
-
-        if exists(mask):
-            lanes_mask.append(mask.narrow(1, lane_shift, temporal_compression * compressed_len + 1)[:, ::temporal_compression])
-
-        if exists(returns):
-            lanes_returns.append(returns.narrow(1, lane_shift, temporal_compression * compressed_len + 1)[:, ::temporal_compression])
-
-    # stack lanes along batch dimension
-
-    if is_tensor(states):
-        stacked_states = cat(lanes_states, dim = 0)
-    else:
-        stacked_states = [cat(encoder_lanes, dim = 0) for encoder_lanes in zip(*lanes_states)]
-
-    stacked_actions = cat(lanes_actions, dim = 0)
-    stacked_mask = maybe(cat)(lanes_mask, dim = 0)
-    stacked_returns = maybe(cat)(lanes_returns, dim = 0)
-
-    return stacked_states, stacked_actions, stacked_mask, stacked_returns
+    return states, actions, mask, returns
 
 # world model module
 
@@ -2749,11 +2728,6 @@ class Agent(Module):
 
         if exists(memories):
             state_rnn_memories, action_rnn_memories, model_memories = memories
-
-            if has_temporal_compression:
-                state_rnn_memories = tree_map_tensor(lambda t: repeat(t, 'b ... -> (n b) ...', n = temporal_compression), state_rnn_memories)
-                action_rnn_memories = tree_map_tensor(lambda t: repeat(t, 'b ... -> (n b) ...', n = temporal_compression), action_rnn_memories)
-                model_memories = tree_map_tensor(lambda t: repeat(t, 'b ... -> (n b) ...', n = temporal_compression), model_memories)
 
         next_model_memories = dict()
 
