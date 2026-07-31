@@ -25,6 +25,7 @@ import torch
 from torch import tensor
 import torch.nn.functional as F
 from torch.optim import Adam
+from torch.nn.utils import clip_grad_norm_
 
 from accelerate import Accelerator
 import gymnasium as gym
@@ -99,7 +100,8 @@ def train_wm_epoch(
     device,
     batch_size,
     epochs_per_train,
-    grad_accum_steps
+    grad_accum_steps,
+    max_grad_norm = 1.0
 ):
     dl = buffer.dataloader(batch_size = batch_size, shuffle = True)
     wm.train()
@@ -116,6 +118,9 @@ def train_wm_epoch(
             (loss / grad_accum_steps).backward()
 
             if divisible_by(step + 1, grad_accum_steps):
+                if exists(max_grad_norm) and max_grad_norm > 0:
+                    clip_grad_norm_(wm.parameters(), max_grad_norm)
+
                 optimizer.step()
                 optimizer.zero_grad()
                 wm.update()
@@ -132,7 +137,8 @@ def main(
     depth = 2,
     batch_size = 16,
     grad_accum_steps = 2,
-    lr = 1e-3,
+    lr = 5e-4,
+    max_grad_norm = 1.0,
     wm_loss_ema_beta = 0.9,
     temporal_compression = 2,
     curriculum_cem_horizon = True,
@@ -140,15 +146,16 @@ def main(
     cem_max_horizon = 10,
     high_loss_thresh = 40.0,
     low_loss_thresh = 15.0,
-    num_episodes = 3000,
-    train_every_eps = 10,
-    epochs_per_train = 1,
+    num_episodes = 5000,
+    train_every_eps = 5,
+    epochs_per_train = 2,
     max_episodes_buffer = 400,
     max_timesteps = 1000,
-    cem_num_samples = 64,
-    cem_num_iters = 2,
-    cem_elite_frac = 0.1,
-    random_action_eps = 10,
+    cem_num_samples = 256,
+    cem_num_iters = 4,
+    cem_elite_frac = 0.125,
+    random_action_eps = 32,
+    start_train_eps = 32,
     gamma = 0.99,
     reward_avg_window = 100,
     print_every_eps = 10,
@@ -173,6 +180,7 @@ def main(
                 low_loss_thresh = low_loss_thresh,
                 wm_loss_ema_beta = wm_loss_ema_beta,
                 batch_size = batch_size,
+                start_train_eps = start_train_eps,
                 lr = lr
             )
         )
@@ -274,11 +282,14 @@ def main(
             overwrite = (episode == 1)
         )
 
-        if divisible_by(episode, train_every_eps):
+        should_train = episode >= start_train_eps and divisible_by(episode, train_every_eps)
+
+        if should_train:
             wm_loss_val = train_wm_epoch(
                 wm, buffer, optimizer, device,
-                batch_size, epochs_per_train, grad_accum_steps
+                batch_size, epochs_per_train, grad_accum_steps, max_grad_norm
             )
+
             wm_loss_tensor.copy_(tensor(wm_loss_val))
             wm_loss_ema.update()
 
@@ -320,7 +331,7 @@ def main(
             horizon_str = f" | horizon: {effective_horizon:2d}"
             print(f"episode {episode:4d} {phase_str:25s} | reward: {total_reward:8.2f}{avg_str}{horizon_str}", flush = True)
 
-        if divisible_by(episode, train_every_eps):
+        if should_train:
             ema_val = wm_loss_ema.ema_model.item()
             log_dict.update(wm_loss = wm_loss_val, wm_loss_ema = ema_val)
             print(f"  --> trained time compressed world model | wm_loss: {wm_loss_val:.4f} (ema: {ema_val:.4f})", flush = True)
