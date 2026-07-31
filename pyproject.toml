@@ -1,6 +1,6 @@
 [project]
 name = "x-jepa"
-version = "0.0.80"
+version = "0.0.81"
 description = "Explorations into JEPA"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -28,7 +28,7 @@ dependencies = [
     "assoc-scan>=0.0.5",
     "einops>=0.8.1",
     "einx>=0.3.0",
-    "ema-pytorch",
+    "ema-pytorch>=0.8.3",
     "loguru",
     "memmap-replay-buffer>=0.1.10",
     "PoPE-pytorch",
