@@ -221,3 +221,15 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
     url     = {https://arxiv.org/abs/1802.06070}
 }
 ```
+
+```bibtex
+@misc{jiang2022generalintelligencerequiresrethinking,
+    title   = {General Intelligence Requires Rethinking Exploration}, 
+    author  = {Minqi Jiang and Tim Rocktäschel and Edward Grefenstette},
+    year    = {2022},
+    eprint  = {2211.07819},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.AI},
+    url     = {https://arxiv.org/abs/2211.07819}, 
+}
+```
