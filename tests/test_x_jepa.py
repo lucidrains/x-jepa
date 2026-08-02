@@ -2056,3 +2056,27 @@ def test_interact_with_env_with_skills(is_vectorized_env, diversity_skill_loss_w
         actions = exp_mm.actions
     )
     assert not torch.isnan(mm_loss)
+
+def test_transformer_prepend_embeds():
+    model = Transformer(
+        dim = 32,
+        depth = 2,
+        causal = True
+    )
+
+    tokens = torch.randn(2, 10, 32)
+    prepend = torch.randn(2, 4, 32)
+
+    # test without excision
+    out = model(tokens, prepend_embeds = prepend, excise_prepend_embeds = False)
+    assert out.shape == (2, 14, 32)
+
+    # test with excision
+    out_excised = model(tokens, prepend_embeds = prepend, excise_prepend_embeds = True)
+    assert out_excised.shape == (2, 10, 32)
+
+    # test return_hiddens with excision
+    out_hiddens, hiddens = model(tokens, prepend_embeds = prepend, excise_prepend_embeds = True, return_hiddens = True)
+    assert out_hiddens.shape == (2, 10, 32)
+    for h in hiddens:
+        assert h.shape == (2, 10, 32)

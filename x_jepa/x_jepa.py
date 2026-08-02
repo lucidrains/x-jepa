@@ -490,9 +490,15 @@ class Transformer(Module):
         memories = None,
         prepend_memories = None,
         return_memories = False,
-        cond = None
+        cond = None,
+        prepend_embeds = None,
+        excise_prepend_embeds = False
     ):
         has_cond = exists(self.dim_cond)
+
+        unpack_prepend = None
+        if exists(prepend_embeds):
+            tokens, unpack_prepend = pack_with_inverse([prepend_embeds, tokens], 'b * d')
 
         seq_len = tokens.shape[-2]
 
@@ -549,6 +555,10 @@ class Transformer(Module):
             layer_hiddens.append(tokens)
 
             tokens = attn_res(layer_hiddens, mask = past_layers_mask)
+
+        if exists(unpack_prepend) and excise_prepend_embeds:
+            _, tokens = unpack_prepend(tokens)
+            layer_hiddens = [unpack_prepend(h)[1] for h in layer_hiddens]
 
         ret = (tokens, layer_hiddens) if return_hiddens else tokens
 
@@ -1187,7 +1197,10 @@ class WorldModel(Module):
         model_memories = None,
         prepend_memories = None,
         has_episodic_mem: bool = False,
-        episodic_mems = None
+        episodic_mems = None,
+        return_per_sample_loss: bool = False,
+        prepend_embeds = None,
+        excise_prepend_embeds = False
     ):
         batch = tokens.shape[0]
 
@@ -1201,12 +1214,16 @@ class WorldModel(Module):
             return_hiddens = True,
             memories = model_memories,
             prepend_memories = prepend_memories,
-            return_memories = True
+            return_memories = True,
+            prepend_embeds = prepend_embeds,
+            excise_prepend_embeds = excise_prepend_embeds
         )
 
         target_embeds = self.ema_model(
             tokens,
-            prepend_memories = prepend_memories
+            prepend_memories = prepend_memories,
+            prepend_embeds = prepend_embeds,
+            excise_prepend_embeds = excise_prepend_embeds
         )
 
         target_state_embeds, _ = rearrange(target_embeds, 'b (n sa) d -> sa b n d', sa = 2)
@@ -1247,8 +1264,6 @@ class WorldModel(Module):
             next_state_pred = state_latents + pred_residual
             state_transition_loss = F.smooth_l1_loss(next_state_pred, next_target_state_latents.detach(), reduction = 'none')
 
-        next_state_latent_pred_loss = masked_mean(state_transition_loss, valid_target_mask, average_mode = masked_loss_average_mode)
-
         if self.probabilistic_plan_state_transition:
             plan_next_state_pred_logits = self.state_transition_for_planning((state_latents, action_cond))
             plan_neg_log_probs = self.plan_state_transition_beta_distr(plan_next_state_pred_logits, target = next_target_state_latents.detach())
@@ -1258,15 +1273,21 @@ class WorldModel(Module):
             plan_next_state_pred = state_latents + plan_pred_residual
             plan_state_transition_loss = F.smooth_l1_loss(plan_next_state_pred, next_target_state_latents.detach(), reduction = 'none')
 
-        plan_state_pred_loss = masked_mean(plan_state_transition_loss, valid_target_mask, average_mode = masked_loss_average_mode)
-
         pred_next_encoded_state = self.to_next_encoded_state_pred((state_latents, action_cond))
 
         next_ema_encoded_state_target = ema_encoded_state[:, 1:].contiguous()
 
         raw_next_encoded_loss = F.smooth_l1_loss(pred_next_encoded_state, next_ema_encoded_state_target.detach(), reduction = 'none')
 
-        next_encoded_state_pred_loss = masked_mean(raw_next_encoded_loss, valid_target_mask, average_mode = masked_loss_average_mode)
+        if return_per_sample_loss:
+            loss_dim = tuple(range(1, state_transition_loss.ndim))
+            next_state_latent_pred_loss = masked_mean(state_transition_loss, valid_target_mask, dim = loss_dim, average_mode = masked_loss_average_mode)
+            plan_state_pred_loss = masked_mean(plan_state_transition_loss, valid_target_mask, dim = loss_dim, average_mode = masked_loss_average_mode)
+            next_encoded_state_pred_loss = masked_mean(raw_next_encoded_loss, valid_target_mask, dim = loss_dim, average_mode = masked_loss_average_mode)
+        else:
+            next_state_latent_pred_loss = masked_mean(state_transition_loss, valid_target_mask, average_mode = masked_loss_average_mode)
+            plan_state_pred_loss = masked_mean(plan_state_transition_loss, valid_target_mask, average_mode = masked_loss_average_mode)
+            next_encoded_state_pred_loss = masked_mean(raw_next_encoded_loss, valid_target_mask, average_mode = masked_loss_average_mode)
 
         reg_next_state_loss = self.zero
         reg_next_encoded_loss = self.zero
