@@ -45,7 +45,8 @@ Repository = "https://codeberg.org/lucidrains/x-jepa"
 examples = []
 test = [
     "pytest",
-    "gymnasium"
+    "gymnasium",
+    "populora"
 ]
 
 [tool.pytest.ini_options]
