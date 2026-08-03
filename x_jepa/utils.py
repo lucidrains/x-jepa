@@ -8,7 +8,7 @@ from torch import tensor, is_tensor, Tensor
 from torch.utils._pytree import tree_map
 
 from einops import rearrange
-from torch_einops_utils import tree_map_tensor, lens_to_mask, masked_mean as torch_einops_masked_mean
+from torch_einops_utils import tree_map_tensor, masked_mean as torch_einops_masked_mean
 
 # constants
 
@@ -25,6 +25,11 @@ class Experience(NamedTuple):
     returns: Tensor | tuple[Tensor, Tensor] | None = None
     state_latents: Tensor | None = None
     skill_ids: Tensor | None = None
+    discount_factor: float | Tensor | None = None
+    risk_factor: float | Tensor | None = None
+    base_reward: Tensor | None = None
+    risk_reward: Tensor | None = None
+    skill_reward: Tensor | None = None
 
 # fn inspection helpers
 

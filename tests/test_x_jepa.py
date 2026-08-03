@@ -2080,3 +2080,65 @@ def test_transformer_prepend_embeds():
     assert out_hiddens.shape == (2, 10, 32)
     for h in hiddens:
         assert h.shape == (2, 10, 32)
+
+def test_risk_conditioning_e2e_rollout_and_experience():
+    from x_jepa.rl import ppo_loss
+
+    class DummyVectorEnv:
+        def __init__(self, batch = 2, state_dim = 3):
+            self.batch = batch
+            self.state_dim = state_dim
+            self.is_vector_env = True
+            self.num_envs = batch
+
+        def reset(self):
+            return torch.randn(self.batch, self.state_dim), {}
+
+        def step(self, action):
+            state = torch.randn(self.batch, self.state_dim)
+            reward = torch.ones(self.batch)
+            terminated = torch.zeros(self.batch, dtype = torch.bool)
+            truncated = torch.zeros(self.batch, dtype = torch.bool)
+            return state, reward, terminated, truncated, {}
+
+    dim = 32
+    state_encoder = nn.Linear(3, dim)
+    action_encoder = nn.Linear(2, dim)
+    model = Transformer(dim = dim, depth = 2, dim_head = 16, heads = 2)
+
+    agent = Agent(
+        state_encoder = state_encoder,
+        action_encoder = action_encoder,
+        model = model,
+        dim_action = 2,
+        add_reflexive_actor = True,
+        risk_factor = 0.0,
+        probabilistic_state_transition = True
+    )
+
+    env_optimistic = DummyVectorEnv()
+    env_pessimistic = DummyVectorEnv()
+
+    exp_optimistic = agent.interact_with_environment(
+        env_optimistic,
+        max_steps = 4,
+        actor_module = 'reflexive',
+        risk_factor = 1.0,
+        risk_entropy_bonus_weight = 1.0
+    )
+
+    exp_pessimistic = agent.interact_with_environment(
+        env_pessimistic,
+        max_steps = 4,
+        actor_module = 'reflexive',
+        risk_factor = -2.0,
+        risk_entropy_bonus_weight = 1.0
+    )
+
+    assert exists(exp_optimistic.base_reward)
+    assert exists(exp_optimistic.risk_reward)
+
+    loss_opt, _ = ppo_loss(agent, exp_optimistic, actor_module = 'reflexive', return_breakdown = True)
+    loss_pess, _ = ppo_loss(agent, exp_pessimistic, actor_module = 'reflexive', return_breakdown = True)
+
+    (loss_opt + loss_pess).backward()

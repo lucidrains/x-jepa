@@ -233,3 +233,15 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
     url     = {https://arxiv.org/abs/2211.07819},
 }
 ```
+
+```bibtex
+@misc{greenberg2022efficientriskaversereinforcementlearning,
+    title   = {Efficient Risk-Averse Reinforcement Learning}, 
+    author  = {Ido Greenberg and Yinlam Chow and Mohammad Ghavamzadeh and Shie Mannor},
+    year    = {2022},
+    eprint  = {2205.05138},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2205.05138}, 
+}
+```

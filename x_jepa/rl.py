@@ -26,7 +26,12 @@ def coerce_experience(experience: Experience | dict) -> Experience:
         cumulative_rewards = experience.get('cumulative_rewards'),
         returns = experience.get('returns'),
         state_latents = experience.get('state_latents'),
-        skill_ids = experience.get('skill_ids')
+        skill_ids = experience.get('skill_ids'),
+        discount_factor = experience.get('discount_factor'),
+        risk_factor = experience.get('risk_factor'),
+        base_reward = experience.get('base_reward'),
+        risk_reward = experience.get('risk_reward'),
+        skill_reward = experience.get('skill_reward')
     )
 
 def get_actor_log_probs_and_entropy(
@@ -37,7 +42,8 @@ def get_actor_log_probs_and_entropy(
     detach_base_state_encoder = False,
     skill_latent = None,
     skill_id = None,
-    discount = None
+    discount: float | Tensor | None = None,
+    risk: float | Tensor | None = None
 ):
     batch, seq_len = actions.shape[:2]
     actor = world_model.actors[actor_module]
@@ -61,7 +67,8 @@ def get_actor_log_probs_and_entropy(
         sensory_layer_hiddens = sensory_hiddens,
         world_model_hiddens = wm_hiddens,
         skill_latent = skill_latent,
-        discount = discount
+        discount = discount,
+        risk = risk
     )
 
     action_preds = action_preds[:, :seq_len]
@@ -97,9 +104,16 @@ def ppo_loss(
 
     assert exists(returns), 'experience.returns must be provided for ppo_loss'
     returns = returns.to(device)
+    discounts = default(discounts, experience.discount_factor)
 
     log_probs, entropy, state_tokens, state_latents = get_actor_log_probs_and_entropy(
-        world_model, actor_module, states, actions, detach_base_state_encoder = detach_base_state_encoder, discount = discounts
+        world_model,
+        actor_module,
+        states,
+        actions,
+        detach_base_state_encoder = detach_base_state_encoder,
+        discount = discounts,
+        risk = experience.risk_factor
     )
 
     old_log_probs = default(experience.actor_log_probs, log_probs.detach()).to(device)
@@ -176,7 +190,13 @@ def tpo_loss(
     u = z_score(cum_rewards)
 
     log_probs, entropy, _, _ = get_actor_log_probs_and_entropy(
-        world_model, actor_module, states, actions, detach_base_state_encoder = detach_base_state_encoder
+        world_model,
+        actor_module,
+        states,
+        actions,
+        detach_base_state_encoder = detach_base_state_encoder,
+        discount = experience.discount_factor,
+        risk = experience.risk_factor
     )
 
     log_scores_sum = masked_sum(log_probs, mask = mask, dim = 1)
