@@ -746,9 +746,11 @@ class Value(Module):
         dim,
         dim_state_latent,
         discount_factor = 0.99,
+        risk_factor: float | Tensor | None = None,
         ema_beta = 0.999,
+        discount_embedder: DiscountEmbedder | Module | None = None,
+        risk_embedder: RiskEmbedder | Module | None = None,
         eps = 1e-20,
-        discount_embedder: DiscountEmbedder | Module | None = None
     ):
         super().__init__()
         self.eps = eps
@@ -765,6 +767,22 @@ class Value(Module):
 
         self.ema_discount_embedder = EMA(self.discount_embedder, beta = ema_beta)
         self.discount_factor = discount_factor
+
+        # risk embedder
+
+        if exists(risk_embedder):
+            self.risk_embedder = risk_embedder
+        elif exists(risk_factor):
+            self.risk_embedder = RiskEmbedder(dim)
+        else:
+            self.risk_embedder = None
+
+        if exists(self.risk_embedder):
+            self.ema_risk_embedder = EMA(self.risk_embedder, beta = ema_beta)
+        else:
+            self.ema_risk_embedder = None
+
+        self.risk_factor = risk_factor
 
     def embed_discount(self, discount, ema = False):
         discount_embedder = self.ema_discount_embedder if ema else self.discount_embedder
@@ -784,9 +802,33 @@ class Value(Module):
         discount = discount.broadcast_to(target_tensor.shape[:-1])
         return self.embed_discount(discount, ema = ema)
 
-    def forward_ema(self, state_tokens, state_latents, discount = None, squeeze_out = True):
+    def embed_risk(self, risk, ema = False):
+        if not exists(self.risk_embedder):
+            return 0.
+        risk_embedder = self.ema_risk_embedder if ema else self.risk_embedder
+        return risk_embedder(risk)
+
+    def get_risk_embed(self, target_tensor, risk = None, ema = False):
+        if not exists(self.risk_embedder):
+            return 0.
+
+        risk = default(risk, self.risk_factor)
+
+        if not exists(risk):
+            return 0.
+
+        risk = cast_tensor(risk)
+
+        if risk.ndim == 1 and target_tensor.ndim == 3:
+            risk = rearrange(risk, 'b -> b 1')
+
+        risk = risk.broadcast_to(target_tensor.shape[:-1])
+        return self.embed_risk(risk, ema = ema)
+
+    def forward_ema(self, state_tokens, state_latents, discount = None, risk = None, squeeze_out = True):
         discount_embed = self.get_discount_embed(state_tokens, discount, ema = True)
-        state_tokens = state_tokens + discount_embed
+        risk_embed = self.get_risk_embed(state_tokens, risk, ema = True)
+        state_tokens = state_tokens + discount_embed + risk_embed
         out = self.ema_net((state_tokens, state_latents))
 
         if squeeze_out:
@@ -798,9 +840,14 @@ class Value(Module):
         self.ema_discount_embedder.update()
         self.ema_net.update()
 
-    def forward(self, state_tokens, state_latents, discount = None, squeeze_out = True):
+        if exists(self.ema_risk_embedder):
+            self.ema_risk_embedder.update()
+
+    def forward(self, state_tokens, state_latents, discount = None, risk = None, squeeze_out = True):
         discount_embed = self.get_discount_embed(state_tokens, discount, ema = False)
-        state_tokens = state_tokens + discount_embed
+        risk_embed = self.get_risk_embed(state_tokens, risk, ema = False)
+
+        state_tokens = state_tokens + discount_embed + risk_embed
         out = self.net((state_tokens, state_latents))
 
         if squeeze_out:
@@ -1788,8 +1835,10 @@ class Agent(Module):
             dim = dim,
             dim_state_latent = dim_state_latent,
             discount_factor = discount_factor,
+            risk_factor = risk_factor,
             ema_beta = ema_beta,
-            discount_embedder = discount_embedder
+            discount_embedder = discount_embedder,
+            risk_embedder = risk_embedder
         )
         self.value_state_encoder = copy.deepcopy(self.state_encoder)
         self.frac_gradient = FracGradient(frac_gradients)

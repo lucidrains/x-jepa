@@ -124,7 +124,7 @@ def ppo_loss(
     )
     val_state_latents = world_model.to_state_latent(val_state_tokens)
 
-    values = world_model.value_network(val_state_tokens, val_state_latents, discounts)
+    values = world_model.value_network(val_state_tokens, val_state_latents, discount = discounts, risk = experience.risk_factor)
     values = values[:, :seq_len]
     returns = returns[:, :seq_len]
 
