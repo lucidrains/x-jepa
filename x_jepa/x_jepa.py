@@ -121,6 +121,9 @@ def xnor(x, y):
 def cast_tuple(t, length = 1):
     return t if isinstance(t, (tuple, list)) else ((t,) * length)
 
+def cast_tensor(t):
+    return t if is_tensor(t) else tensor(t)
+
 def first_tensor(t):
     tensors, _ = tree_flatten(t)
     return first(tensors)
@@ -682,6 +685,34 @@ def calc_returns(
 
     return returns
 
+class DiscountEmbedder(Module):
+    def __init__(
+        self,
+        dim,
+        eps = 1e-20
+    ):
+        super().__init__()
+        self.eps = eps
+        self.net = Sequential(
+            LinearNoBias(3, dim),
+            nn.SiLU(),
+            LinearNoBias(dim, dim)
+        )
+
+    def forward(
+        self,
+        discount
+    ):
+        discount = cast_tensor(discount)
+
+        cond = stack([
+            discount,
+            1. - discount,
+            -log(1. - discount, eps = self.eps)
+        ], dim = -1)
+
+        return self.net(cond)
+
 class Value(Module):
     def __init__(
         self,
@@ -689,44 +720,48 @@ class Value(Module):
         dim_state_latent,
         discount_factor = 0.99,
         ema_beta = 0.999,
-        eps = 1e-20
+        eps = 1e-20,
+        discount_embedder: DiscountEmbedder | Module | None = None
     ):
         super().__init__()
         self.eps = eps
 
-        self.discount_embedder = Sequential(
-            LinearNoBias(3, dim),
-            nn.SiLU(),
-            LinearNoBias(dim, dim)
-        )
-        self.net = MLP(dim_state_latent + dim + dim, *((dim * 2,) * 2), 1)
+        self.net = MLP(dim_state_latent + dim, *((dim * 2,) * 2), 1)
         self.ema_net = EMA(self.net, beta = ema_beta)
+
+        # discount embedder
+
+        if exists(discount_embedder):
+            self.discount_embedder = discount_embedder
+        else:
+            self.discount_embedder = DiscountEmbedder(dim, eps = eps)
+
         self.ema_discount_embedder = EMA(self.discount_embedder, beta = ema_beta)
 
-        self.register_buffer('discount_factor', tensor(discount_factor), persistent = False)
+        self.register_buffer('discount_factor', maybe(cast_tensor)(discount_factor), persistent = False)
 
     def embed_discount(self, discount, ema = False):
-        cond = stack([
-            discount,
-            1. - discount,
-            -log(1. - discount, eps = self.eps)
-        ], dim = -1)
-
         discount_embedder = self.ema_discount_embedder if ema else self.discount_embedder
-        return discount_embedder(cond)
+        return discount_embedder(discount)
 
-    def get_discount_embed(self, state_tokens, discount = None, ema = False):
+    def get_discount_embed(self, target_tensor, discount = None, ema = False):
         discount = default(discount, self.discount_factor)
 
-        if is_tensor(discount) and discount.ndim == 1:
+        if not exists(discount):
+            return 0.
+
+        discount = cast_tensor(discount)
+
+        if discount.ndim == 1 and target_tensor.ndim == 3:
             discount = rearrange(discount, 'b -> b 1')
 
-        discount = discount.broadcast_to(state_tokens.shape[:-1])
+        discount = discount.broadcast_to(target_tensor.shape[:-1])
         return self.embed_discount(discount, ema = ema)
 
     def forward_ema(self, state_tokens, state_latents, discount = None, squeeze_out = True):
         discount_embed = self.get_discount_embed(state_tokens, discount, ema = True)
-        out = self.ema_net((state_tokens, state_latents, discount_embed))
+        state_tokens = state_tokens + discount_embed
+        out = self.ema_net((state_tokens, state_latents))
 
         if squeeze_out:
             out = rearrange(out, '... 1 -> ...')
@@ -739,7 +774,8 @@ class Value(Module):
 
     def forward(self, state_tokens, state_latents, discount = None, squeeze_out = True):
         discount_embed = self.get_discount_embed(state_tokens, discount, ema = False)
-        out = self.net((state_tokens, state_latents, discount_embed))
+        state_tokens = state_tokens + discount_embed
+        out = self.net((state_tokens, state_latents))
 
         if squeeze_out:
             out = rearrange(out, '... 1 -> ...')
@@ -768,7 +804,11 @@ class Actor(Module):
         self,
         continuous_actions,
         dim_action,
-        action_eps = 1e-5
+        action_eps = 1e-5,
+        discount_factor: float | Tensor | None = None,
+        dim: int | None = None,
+        discount_embedder: DiscountEmbedder | Module | None = None,
+        eps = 1e-20
     ):
         super().__init__()
         self.continuous_actions = continuous_actions
@@ -776,6 +816,36 @@ class Actor(Module):
         self.pass_world_model_hiddens = False
         if continuous_actions:
             self.action_distr = BetaDistrReadout(source_range = (-1., 1.), eps = action_eps)
+
+        self.eps = eps
+
+        # discount embedder
+
+        if exists(discount_embedder):
+            self.discount_embedder = discount_embedder
+        elif exists(dim):
+            self.discount_embedder = DiscountEmbedder(dim, eps = eps)
+        else:
+            self.discount_embedder = None
+
+        self.register_buffer('discount_factor', maybe(cast_tensor)(discount_factor), persistent = False)
+
+    def get_discount_embed(self, target_tensor, discount = None):
+        if not exists(self.discount_embedder):
+            return 0.
+
+        discount = default(discount, self.discount_factor)
+
+        if not exists(discount):
+            return 0.
+
+        discount = cast_tensor(discount)
+
+        if discount.ndim == 1 and target_tensor.ndim == 3:
+            discount = rearrange(discount, 'b -> b 1')
+
+        discount = discount.broadcast_to(target_tensor.shape[:-1])
+        return self.discount_embedder(discount)
 
     def compute_loss(self, action_preds, target_actions, mask = None, masked_loss_average_mode = 'timestep'):
         if self.continuous_actions:
@@ -874,9 +944,18 @@ class ReflexiveActor(Actor):
         dim_action,
         continuous_actions,
         hidden_dim = 256,
-        action_eps = 1e-5
+        action_eps = 1e-5,
+        discount_factor: float | Tensor | None = 0.99,
+        discount_embedder: DiscountEmbedder | Module | None = None
     ):
-        super().__init__(continuous_actions, dim_action, action_eps = action_eps)
+        super().__init__(
+            continuous_actions = continuous_actions,
+            dim_action = dim_action,
+            action_eps = action_eps,
+            discount_factor = discount_factor,
+            dim = dim_state_latent,
+            discount_embedder = discount_embedder
+        )
         dim_out = dim_action * 2 if continuous_actions else dim_action
         self.net = MLP(dim_state_latent, hidden_dim, dim_out)
 
@@ -884,9 +963,12 @@ class ReflexiveActor(Actor):
         self,
         state_latents,
         actor_cond = None,
+        discount = None,
         return_memories = False,
         **kwargs
     ):
+        discount_embed = self.get_discount_embed(state_latents, discount)
+        state_latents = state_latents + discount_embed
         state_latents = add_actor_conditioning(state_latents, actor_cond)
         pred = self.net(state_latents)
 
@@ -908,12 +990,17 @@ class TransformerActor(Actor):
         pass_sensory_hiddens = False,
         pass_world_model_hiddens = True,
         dropout_all_but_state_latents = 0.,
-        action_eps = 1e-5
+        action_eps = 1e-5,
+        discount_factor: float | Tensor | None = 0.99,
+        discount_embedder: DiscountEmbedder | Module | None = None
     ):
         super().__init__(
-            continuous_actions,
-            dim_action,
-            action_eps = action_eps
+            continuous_actions = continuous_actions,
+            dim_action = dim_action,
+            action_eps = action_eps,
+            discount_factor = discount_factor,
+            dim = dim,
+            discount_embedder = discount_embedder
         )
 
         self.model = model
@@ -947,6 +1034,7 @@ class TransformerActor(Actor):
         memories = None,
         return_memories = False,
         actor_cond = None,
+        discount = None,
         **kwargs
     ):
         batch, seq_len = state_latents.shape[:2]
@@ -965,6 +1053,8 @@ class TransformerActor(Actor):
             return state_latents.new_zeros(*state_latents.shape[:-1], feature_dim) if not exists(t) else t[:, :seq_len]
 
         state_tokens = default_zeros(state_tokens, self.dim)
+        discount_embed = self.get_discount_embed(state_tokens, discount)
+        state_tokens = state_tokens + discount_embed
         state_tokens = add_actor_conditioning(state_tokens, actor_cond)
 
         # project

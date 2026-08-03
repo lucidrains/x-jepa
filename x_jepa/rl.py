@@ -36,7 +36,8 @@ def get_actor_log_probs_and_entropy(
     actions,
     detach_base_state_encoder = False,
     skill_latent = None,
-    skill_id = None
+    skill_id = None,
+    discount = None
 ):
     batch, seq_len = actions.shape[:2]
     actor = world_model.actors[actor_module]
@@ -59,7 +60,8 @@ def get_actor_log_probs_and_entropy(
         state_tokens = state_tokens,
         sensory_layer_hiddens = sensory_hiddens,
         world_model_hiddens = wm_hiddens,
-        skill_latent = skill_latent
+        skill_latent = skill_latent,
+        discount = discount
     )
 
     action_preds = action_preds[:, :seq_len]
@@ -97,7 +99,7 @@ def ppo_loss(
     returns = returns.to(device)
 
     log_probs, entropy, state_tokens, state_latents = get_actor_log_probs_and_entropy(
-        world_model, actor_module, states, actions, detach_base_state_encoder = detach_base_state_encoder
+        world_model, actor_module, states, actions, detach_base_state_encoder = detach_base_state_encoder, discount = discounts
     )
 
     old_log_probs = default(experience.actor_log_probs, log_probs.detach()).to(device)
