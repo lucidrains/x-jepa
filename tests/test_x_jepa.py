@@ -2142,3 +2142,116 @@ def test_risk_conditioning_e2e_rollout_and_experience():
     loss_pess, _ = ppo_loss(agent, exp_pessimistic, actor_module = 'reflexive', return_breakdown = True)
 
     (loss_opt + loss_pess).backward()
+
+def test_plan_with_seed_action():
+    dim = 32
+    dim_action = 4
+    model = Transformer(dim = dim, depth = 2, causal = True)
+
+    agent = Agent(
+        state_encoder = nn.Linear(16, dim),
+        action_encoder = nn.Linear(dim_action, dim),
+        model = model,
+        dim_action = dim_action,
+        continuous_actions = True,
+        transition_action_space = 'raw'
+    )
+
+    batch, seq_len = 2, 4
+    states = torch.randn(batch, seq_len, 16)
+    actions = torch.randn(batch, seq_len - 1, dim_action)
+    goal_state = torch.randn(batch, 16)
+    horizon = 4
+
+    seed_act = torch.randn(batch, horizon, dim_action)
+
+    planned = agent.plan(
+        states,
+        actions,
+        goal_state = goal_state,
+        horizon = horizon,
+        seed_action = seed_act,
+        include_unperturbed_seed = True,
+        pop_size = 8,
+        generations = 2
+    )
+
+    assert planned.shape == (batch, horizon, dim_action)
+
+    planned_no_unperturbed = agent.plan(
+        states,
+        actions,
+        goal_state = goal_state,
+        horizon = horizon,
+        seed_action = seed_act,
+        include_unperturbed_seed = False,
+        pop_size = 8,
+        generations = 2
+    )
+
+    assert planned_no_unperturbed.shape == (batch, horizon, dim_action)
+
+def test_hierarchical_temporal_refinement_plan():
+    dim = 32
+    dim_action = 4
+    model = Transformer(dim = dim, depth = 2, causal = True)
+
+    agent = Agent(
+        state_encoder = nn.Linear(16, dim),
+        action_encoder = nn.Linear(dim_action, dim),
+        model = model,
+        dim_action = dim_action,
+        continuous_actions = True,
+        transition_action_space = 'raw',
+        temporal_compression = (1, 2, 4)
+    )
+
+    batch, seq_len = 2, 5
+    states = torch.randn(batch, seq_len, 16)
+    actions = torch.randn(batch, seq_len - 1, dim_action)
+    goal_state = torch.randn(batch, 16)
+    horizon = 8  # divisible by highest compression 4
+
+    # 4x
+
+    actions_4x = agent.plan(
+        states,
+        actions,
+        world_model_index = 2,
+        discount_factor = 0.999,
+        goal_state = goal_state,
+        horizon = horizon,
+        pop_size = 16,
+        generations = 2
+    )
+    assert actions_4x.shape == (batch, horizon, dim_action)
+
+    # 2x
+
+    actions_2x = agent.plan(
+        states,
+        actions,
+        world_model_index = 1,
+        discount_factor = 0.99,
+        seed_action = actions_4x,
+        goal_state = goal_state,
+        horizon = horizon,
+        pop_size = 16,
+        generations = 2
+    )
+    assert actions_2x.shape == (batch, horizon, dim_action)
+
+    # 1x
+
+    actions_1x = agent.plan(
+        states,
+        actions,
+        world_model_index = 0,
+        discount_factor = 0.95,
+        seed_action = actions_2x,
+        goal_state = goal_state,
+        horizon = horizon,
+        pop_size = 16,
+        generations = 2
+    )
+    assert actions_1x.shape == (batch, horizon, dim_action)

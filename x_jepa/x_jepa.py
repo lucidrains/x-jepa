@@ -103,6 +103,9 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def at_most_one_of(*args):
+    return sum(map(exists, args)) <= 1
+
 def divisible_by(num, den):
     return (num % den) == 0
 
@@ -2168,6 +2171,8 @@ class Agent(Module):
         gradient_lr = 1e-2,
         gradient_optimizer: Callable[..., Optimizer] = Adam,
         seed_with_actor: str | None = None,
+        seed_action: Tensor | None = None,
+        include_unperturbed_seed: bool = True,
         latent_action_model = None,
         latent_action_model_steps = 10,
         latent_action_model_chunk_size = None,
@@ -2180,12 +2185,14 @@ class Agent(Module):
         return_pred_state_latents = False,
         return_pred_states = False,
         skill_id: int | Tensor | None = None,
-        risk_factor: float | Tensor | None = None
+        risk_factor: float | Tensor | None = None,
+        discount_factor: float | Tensor | None = None
     ):
         batch, device = first_tensor(states).shape[0], self.device
         state_len, action_len = first_tensor(states).shape[1], actions.shape[1]
 
         risk_factor = default(risk_factor, self.risk_factor)
+        discount_factor = default(discount_factor, self.discount_factor)
 
         # handle skill conditioning for planning
 
@@ -2212,7 +2219,7 @@ class Agent(Module):
 
         # validation
 
-        assert not (exists(seed_with_actor) and exists(latent_action_model)), 'cannot seed planning with both an actor and a latent action model'
+        assert at_most_one_of(seed_with_actor, latent_action_model, seed_action), 'can only seed planning with at most one of seed_with_actor, latent_action_model, or seed_action'
         assert exists(fitness_fn) or exists(goal_state), 'either fitness_fn or goal_state must be provided'
         assert action_len == (state_len - 1)
         assert generations > 0
@@ -2303,9 +2310,19 @@ class Agent(Module):
 
         shape = (batch, 1, horizon, dim_action)
 
-        means = torch.rand(shape, device = device) * 2. - 1.
+        if exists(seed_action):
+            if seed_action.ndim == 3:
+                seed_action, _ = pack_with_inverse(seed_action, 'b * h d')
+
+            seed_action = rearrange(seed_action, 'b 1 h d -> b 1 h d', b = batch, h = horizon, d = dim_action)
+            means = seed_action.clone()
+        else:
+            means = torch.rand(shape, device = device) * 2. - 1.
+
         stds = torch.rand(shape, device = device)
-        variances = (stds ** 2).clamp_min(cem_min_var)        # precompute past rnn memories for rnn action latents, repeating to population size
+        variances = (stds ** 2).clamp_min(cem_min_var)
+
+        # precompute past rnn memories for rnn action latents, repeating to population size
 
         past_rnn_memories = tree_map_tensor(partial(batch_repeat, r = pop_size), next_action_rnn_memories)
 
@@ -2461,7 +2478,7 @@ class Agent(Module):
 
                 pred_next_encoded_states.append(pred_next_encoded_state)
 
-                step_pred_value = self.value_network(pred_next_encoded_state, step_state_latents, risk = risk_factor)
+                step_pred_value = self.value_network(pred_next_encoded_state, step_state_latents, discount = discount_factor, risk = risk_factor)
                 pred_values.append(step_pred_value)
 
             pred_state_latents = rearrange(pred_state_latents, 'h b p d -> b p h d')
@@ -2482,7 +2499,8 @@ class Agent(Module):
                     pred_values = pred_values,
                     encoded_goal = encoded_goal,
                     pred_state_entropies = pred_state_entropies,
-                    skill_discriminator = self.skill_discriminator
+                    skill_discriminator = self.skill_discriminator,
+                    discount_factor = discount_factor
                 )
 
                 if 'pred_intrinsic_bonuses' in fitness_fn_params:
@@ -2571,6 +2589,9 @@ class Agent(Module):
                 actions = latent_drawn_actions
             else:
                 actions = means + variances.sqrt() * torch.randn((batch, pop_size, horizon, dim_action), device = device)
+
+                if is_first and exists(seed_action) and include_unperturbed_seed:
+                    actions[:, :1] = seed_action
 
             actions = actions.clamp(-1., 1.)
 
