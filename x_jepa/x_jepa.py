@@ -2179,10 +2179,13 @@ class Agent(Module):
         return_memories = False,
         return_pred_state_latents = False,
         return_pred_states = False,
-        skill_id: int | Tensor | None = None
+        skill_id: int | Tensor | None = None,
+        risk_factor: float | Tensor | None = None
     ):
         batch, device = first_tensor(states).shape[0], self.device
         state_len, action_len = first_tensor(states).shape[1], actions.shape[1]
+
+        risk_factor = default(risk_factor, self.risk_factor)
 
         # handle skill conditioning for planning
 
@@ -2361,7 +2364,8 @@ class Agent(Module):
                     state_latents = step_state_reshaped,
                     temperature = actor_temperature,
                     memories = seed_actor_memory,
-                    return_memories = True
+                    return_memories = True,
+                    risk = risk_factor
                 )
 
                 if exists(skill_actor_cond):
@@ -2457,7 +2461,7 @@ class Agent(Module):
 
                 pred_next_encoded_states.append(pred_next_encoded_state)
 
-                step_pred_value = self.value_network(pred_next_encoded_state, step_state_latents)
+                step_pred_value = self.value_network(pred_next_encoded_state, step_state_latents, risk = risk_factor)
                 pred_values.append(step_pred_value)
 
             pred_state_latents = rearrange(pred_state_latents, 'h b p d -> b p h d')
@@ -2787,6 +2791,7 @@ class Agent(Module):
                         return_pred_state_latents = True,
                         world_model_index = world_model_index,
                         skill_id = skill_id,
+                        risk_factor = risk_factor,
                         **plan_kwargs
                     )
 

@@ -1,6 +1,6 @@
 [project]
 name = "x-jepa"
-version = "0.0.85"
+version = "0.0.86"
 description = "Explorations into JEPA"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
