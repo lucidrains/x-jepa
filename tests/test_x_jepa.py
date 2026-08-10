@@ -2255,3 +2255,41 @@ def test_hierarchical_temporal_refinement_plan():
         generations = 2
     )
     assert actions_1x.shape == (batch, horizon, dim_action)
+
+# coin-flip network: a frequent state's bonus should collapse, a novel state's stay high
+# (Lobel et al. 2023)
+
+def test_coin_flip_network_novelty():
+    from x_jepa.intrinsic import CoinFlipNetwork
+
+    torch.manual_seed(42)
+
+    state_dim, dim = 10, 64
+    cfn = CoinFlipNetwork(
+        net = nn.Sequential(nn.Linear(state_dim, 128), nn.ReLU(), nn.Linear(128, dim)),
+        dim = dim
+    )
+    optimizer = torch.optim.Adam(cfn.parameters(), lr = 1e-3, weight_decay = 1e-4)
+
+    state_a = torch.randn(1, state_dim)
+    state_b = torch.randn(1, state_dim)
+
+    # warm up the prior running stats
+    cfn.train()
+    for _ in range(100):
+        cfn(torch.randn(16, state_dim))
+
+    # overfit state A only
+    cfn.train()
+    for _ in range(200):
+        optimizer.zero_grad()
+        loss = cfn.compute_loss(state_a, coin_flips = cfn.sample_coin_flips(1))
+        loss.backward()
+        optimizer.step()
+
+    cfn.eval()
+    bonus_a = cfn.compute_bonus(state_a).item()
+    bonus_b = cfn.compute_bonus(state_b).item()
+
+    assert bonus_a < 0.2, f'bonus for frequent state should drop, got {bonus_a:.4f}'
+    assert bonus_b > 0.5, f'bonus for novel state should stay high, got {bonus_b:.4f}'

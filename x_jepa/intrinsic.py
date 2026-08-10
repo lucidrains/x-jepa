@@ -8,8 +8,7 @@ from torch import nn, is_tensor, cat
 import torch.nn.functional as F
 from torch.nn import Module
 
-from einops import rearrange, repeat, reduce
-from torch_einops_utils import safe_cat
+from einops import rearrange, repeat
 from x_mlps_pytorch import MLP
 
 # functions
@@ -24,6 +23,8 @@ def l2norm(t, dim = -1):
     return F.normalize(t, p = 2, dim = dim)
 
 # Sam Lobel et al. https://arxiv.org/abs/2306.03186
+# learns f(s) predicting a rademacher vector c(s) such that ||f(s)|| ~ 1/sqrt(N(s)),
+# giving the pseudocount bonus B(s) = sqrt(||f(s)||^2 / d)
 
 class CoinFlipNetwork(Module):
     def __init__(
@@ -43,25 +44,31 @@ class CoinFlipNetwork(Module):
         self.accepts_actions = accepts_actions
         self.eps = eps
 
-        self.prior_net = None
+        # running stats of the prior output, for z-scoring (section 3.5.2)
+        self.register_buffer('prior_mean', torch.zeros(dim))
+        self.register_buffer('prior_var', torch.ones(dim))
+
+        # stored (state, coin-flip) pairs, reused across updates
+        self.register_buffer('stored_inputs', torch.empty(0, dim), persistent = False)
+        self.register_buffer('stored_flips', torch.empty(0, dim), persistent = False)
 
         if use_prior:
             self.prior_net = deepcopy(net)
             self.prior_net.requires_grad_(False)
 
-            # running stats for normalizing the prior
-            self.register_buffer('prior_mean', torch.zeros(dim))
-            self.register_buffer('prior_var', torch.ones(dim))
-
     def reset(self):
-        if not self.use_prior:
-            return
-
         self.prior_mean.zero_()
         self.prior_var.fill_(1.)
+        self.stored_inputs = torch.empty(0, self.dim, device = self.stored_inputs.device)
+        self.stored_flips = torch.empty(0, self.dim, device = self.stored_flips.device)
+
+    def get_net_input(self, states, actions = None):
+        if self.accepts_actions and exists(actions):
+            return cat((states, actions), dim = -1)
+        return states
 
     def update_prior_stats(self, prior_out):
-        if not self.use_prior or not self.training:
+        if not self.training:
             return
 
         batch_mean = prior_out.mean(dim = 0)
@@ -71,49 +78,57 @@ class CoinFlipNetwork(Module):
         self.prior_var.lerp_(batch_var, 1 - self.prior_decay)
 
     def get_normalized_prior(self, x):
-        batch, device = x.shape[0], x.device
-
-        if not self.use_prior:
-            return torch.zeros(batch, self.dim, device = device)
-
         prior_out = self.prior_net(x).detach()
         self.update_prior_stats(prior_out)
 
-        # section 3.5.2: optimistic initialization of bonus
-        normalized_prior = (prior_out - self.prior_mean) / self.prior_var.clamp(min = self.eps).sqrt()
-        return normalized_prior
+        return (prior_out - self.prior_mean) / self.prior_var.clamp(min = self.eps).sqrt()
 
     def compute_bonus(self, states, actions = None):
-        f_phi = self(states, actions)
+        # equation 5: B(s) = ||f(s)|| / sqrt(d)
+        return (self(states, actions) ** 2).mean(dim = -1).clamp(min = self.eps).sqrt()
 
-        # equation 5
-        return reduce(f_phi ** 2, '... d -> ...', 'mean').clamp(min = self.eps).sqrt()
+    def compute_loss(
+        self,
+        states,
+        actions = None,
+        coin_flips = None,
+        batch_size = 1024,
+        buffer_size = 100000
+    ):
+        # reuse stored (s, c) pairs so f(s) converges to the mean flip ~ 1/sqrt(N(s));
+        # fresh noise each batch has no fixed point but f = 0, collapsing the bonus (section 3.3)
+        device = states.device
 
-    def compute_loss(self, states, actions = None, coin_flips = None):
-        f_phi = self(states, actions)
+        if exists(coin_flips):
+            return F.mse_loss(self(states, actions), coin_flips)
 
-        if not exists(coin_flips):
-            batch, device = f_phi.shape[0], f_phi.device
-            coin_flips = self.sample_coin_flips(batch, device = device)
+        inputs = rearrange(self.get_net_input(states, actions), '... d -> (...) d').detach()
+        batch = inputs.shape[0]
+        num_pairs = self.stored_inputs.shape[0]
+        flips = self.sample_coin_flips(batch, device = device)
 
-        return F.mse_loss(f_phi, coin_flips)
+        if num_pairs == 0:
+            self.stored_inputs = inputs
+            self.stored_flips = flips
+        else:
+            self.stored_inputs = cat((self.stored_inputs, inputs))[-buffer_size:]
+            self.stored_flips = cat((self.stored_flips, flips))[-buffer_size:]
+
+        num_pairs = min(num_pairs + batch, buffer_size)
+        num_samples = min(batch_size, num_pairs)
+        idx = torch.randint(0, num_pairs, (num_samples,), device = device)
+
+        return F.mse_loss(self(self.stored_inputs[idx]), self.stored_flips[idx])
 
     @torch.no_grad()
     def sample_coin_flips(self, batch_size, device = None):
-        # section 3.1: rademacher distribution (coin flips)
-        coin_flips = torch.randint(0, 2, (batch_size, self.dim), device = device)
-        return (coin_flips * 2 - 1).float()
+        # section 3.1: rademacher distribution
+        return (torch.randint(0, 2, (batch_size, self.dim), device = device) * 2 - 1).float()
 
     def forward(self, states, actions = None):
-        actions = actions if self.accepts_actions else None
-        x = safe_cat((states, actions), dim = -1)
+        x = self.get_net_input(states, actions)
         pred = self.net(x)
-
-        if not self.use_prior:
-            return pred
-
-        prior = self.get_normalized_prior(x)
-        return pred + prior
+        return pred + self.get_normalized_prior(x) if self.use_prior else pred
 
 # diayn
 
