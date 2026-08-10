@@ -702,11 +702,17 @@ class DiscountEmbedder(Module):
             LinearNoBias(dim, dim)
         )
 
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
+    @property
+    def device(self):
+        return self.zero.device
+
     def forward(
         self,
         discount
     ):
-        discount = cast_tensor(discount)
+        discount = cast_tensor(discount).to(self.device)
 
         cond = stack([
             discount,
