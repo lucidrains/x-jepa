@@ -182,10 +182,7 @@ def tpo_loss(
     cum_rewards = cum_rewards.to(device)
 
     num_episodes = cum_rewards.numel()
-    assert num_episodes > 1, 'tpo_loss requires a batch of more than one episode'
-
-    if num_episodes < 8:
-        logger.warning(f'tpo_loss received a batch size of {num_episodes}, which is less than recommended minimum of 8 episodes.')
+    assert num_episodes >= 8, f'tpo_loss requires at least 8 episodes in a batch (got {num_episodes}) - recommend 16 or 32'
 
     u = z_score(cum_rewards)
 

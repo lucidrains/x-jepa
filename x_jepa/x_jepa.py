@@ -647,6 +647,116 @@ class BetaDistrReadout(Module):
 
         return out, distr.entropy()
 
+# mean-concentration reparameterization of the beta - mean is a sigmoid for direct regression,
+# concentration sets the noise floor for sampling
+
+class BetaMeanConcentrationReadout(Module):
+    def __init__(
+        self,
+        source_range: tuple[float, float] = (0., 1.),
+        init_conc = 10.,
+        conc_cutoff = 100.,
+        conc_nudge_weight = 0.00025,
+        eps = 1e-5
+    ):
+        super().__init__()
+        self.source_range = source_range
+        self.init_conc = init_conc
+        self.conc_cutoff = conc_cutoff
+        self.conc_nudge_weight = conc_nudge_weight
+        self.eps = eps
+
+    def concentration(
+        self,
+        raw_conc
+    ):
+        return F.softplus(raw_conc + self.init_conc) + 2.
+
+    def compute_raw_loss(
+        self,
+        x,
+        target_actions
+    ):
+        raw_mean, raw_conc = rearrange(x, '... (mean_conc d) -> mean_conc ... d', mean_conc = 2)
+
+        # regress the mean onto the expert actions
+
+        mean = raw_mean.sigmoid()
+
+        source_min, source_max = self.source_range
+        target_actions = (target_actions - source_min) / (source_max - source_min)
+        target_actions = target_actions.clamp(self.eps, 1. - self.eps)
+
+        raw_loss = F.mse_loss(mean, target_actions, reduction = 'none')
+        raw_loss = reduce(raw_loss, '... d -> ...', 'mean')
+
+        # nudge the concentration upward, with a cutoff so it does not fly off
+
+        conc = self.concentration(raw_conc)
+        conc_nudge = F.relu(self.conc_cutoff - conc)
+
+        raw_loss = raw_loss + self.conc_nudge_weight * reduce(conc_nudge, '... d -> ...', 'mean')
+
+        return raw_loss
+
+    def forward(
+        self,
+        x,
+        target = None,
+        sample = False,
+        temperature = 1.,
+        return_distr = False
+    ):
+        source_min, source_max = self.source_range
+
+        # derive the mean and concentration from the raw logits
+
+        raw_mean, raw_conc = rearrange(x, '... (mean_conc d) -> mean_conc ... d', mean_conc = 2)
+
+        # mean mapped to (0, 1), concentration positive with a floor of 2
+
+        mean = raw_mean.sigmoid()
+        conc = self.concentration(raw_conc)
+
+        # maybe apply temperature
+
+        if temperature != 1.:
+            conc = (conc - 2.) / temperature + 2.
+
+        # convert to beta distribution with exact mean = mean
+
+        alpha = mean * conc + self.eps
+        beta = (1. - mean) * conc + self.eps
+
+        distr = Beta(alpha, beta)
+
+        # maybe calculate negative log probs if target is passed in
+
+        if exists(target):
+            # scale from source range to (0, 1) bounds for beta distribution
+            target = (target - source_min) / (source_max - source_min)
+
+            target = target.clamp(self.eps, 1. - self.eps)
+            return -distr.log_prob(target)
+
+        # maybe return the distribution itself
+
+        if return_distr:
+            return distr
+
+        # sample or get the mean
+
+        if sample:
+            out = distr.rsample()
+        else:
+            out = mean
+
+        # scale back to source range
+
+        out = out * (source_max - source_min) + source_min
+
+        return out
+
 # value / cost network section
 
 def calc_returns(
@@ -899,7 +1009,7 @@ class Actor(Module):
         self.dim_action = dim_action
         self.pass_world_model_hiddens = False
         if continuous_actions:
-            self.action_distr = BetaDistrReadout(source_range = (-1., 1.), eps = action_eps)
+            self.action_distr = BetaMeanConcentrationReadout(source_range = (-1., 1.), eps = action_eps)
 
         self.eps = eps
 
@@ -963,8 +1073,7 @@ class Actor(Module):
 
     def compute_loss(self, action_preds, target_actions, mask = None, masked_loss_average_mode = 'timestep'):
         if self.continuous_actions:
-            neg_log_probs = self.action_distr(action_preds, target = target_actions)
-            raw_loss = reduce(neg_log_probs, '... d -> ...', 'sum')
+            raw_loss = self.action_distr.compute_raw_loss(action_preds, target_actions)
         else:
             raw_loss = F.cross_entropy(
                 rearrange(action_preds, 'b ... c -> b c ...'),
@@ -3272,7 +3381,9 @@ class Agent(Module):
                     continue
 
                 actor_state_tokens, actor_sensory_hiddens = self.get_actor_state_tokens(
-                    name, tree_map_tensor(lambda t: t[:, :bc_seq_len], states), base_state_tokens = state_tokens[:, :bc_seq_len]
+                    name,
+                    tree_map_tensor(lambda t: t[:, :bc_seq_len], states),
+                    base_state_tokens = tree_map_detach(state_tokens[:, :bc_seq_len])
                 )
                 actor_state_latents = self.to_state_latent(actor_state_tokens)
 
@@ -3280,11 +3391,11 @@ class Agent(Module):
                     target_actions = orig_actions[:, :bc_seq_len],
                     mask = valid_input_mask,
                     masked_loss_average_mode = masked_loss_average_mode,
-                    state_latents = tree_map_detach(actor_state_latents),
-                    state_tokens = tree_map_detach(actor_state_tokens),
+                    state_latents = actor_state_latents,
+                    state_tokens = actor_state_tokens,
                     action_cond = tree_map_detach(action_cond),
                     action_tokens = tree_map_detach(action_tokens),
-                    sensory_layer_hiddens = tree_map_detach(actor_sensory_hiddens) if exists(actor_sensory_hiddens) else None,
+                    sensory_layer_hiddens = actor_sensory_hiddens,
                     world_model_hiddens = tree_map_detach(world_model_hiddens) if exists(world_model_hiddens) else None,
                     memories = model_memories[name] if exists(model_memories) and name in model_memories else None,
                     return_memories = return_memories
