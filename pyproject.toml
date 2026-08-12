@@ -1,6 +1,6 @@
 [project]
 name = "x-jepa"
-version = "0.0.92"
+version = "0.0.93"
 description = "Explorations into JEPA"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -46,7 +46,7 @@ examples = []
 test = [
     "pytest",
     "gymnasium",
-    "populora>=0.1.0"
+    "populora>=0.1.12"
 ]
 
 [tool.pytest.ini_options]
