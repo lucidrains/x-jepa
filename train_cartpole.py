@@ -24,8 +24,6 @@
 import os
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
-import math
-
 import fire
 import numpy as np
 import torch
@@ -33,8 +31,6 @@ import torch.nn.functional as F
 from torch.optim import Adam
 
 from accelerate import Accelerator
-import gymnasium as gym
-from gymnasium import spaces
 import wandb
 
 from torch_einops_utils import tree_map_tensor_to_device
@@ -44,103 +40,7 @@ from x_jepa import Agent
 from x_jepa.x_jepa import Transformer
 from x_jepa.utils import store_experience_in_replay_buffer, divisible_by
 
-# continuous cartpole - same physics as CartPole-v1, but the action is the raw force in [-1, 1]
-
-class ContinuousCartPole(gym.Env):
-    metadata = {'render_modes': []}
-
-    def __init__(self, force_mag = 10.0, max_episode_steps = 500, seed = None):
-        self.gravity = 9.8
-        self.masscart = 1.0
-        self.masspole = 0.1
-        self.total_mass = self.masspole + self.masscart
-        self.length = 0.5
-        self.polemass_length = self.masspole * self.length
-        self.tau = 0.02
-        self.theta_threshold_radians = 12 * 2 * math.pi / 360
-        self.x_threshold = 2.4
-        self.force_mag = force_mag
-        self.max_episode_steps = max_episode_steps
-
-        self.observation_space = spaces.Box(-np.inf, np.inf, (4,), dtype = np.float32)
-        self.action_space = spaces.Box(-1.0, 1.0, (1,), dtype = np.float32)
-        if seed is not None:
-            self.np_random = np.random.default_rng(seed)
-
-    def reset(self, seed = None, options = None):
-        super().reset(seed = seed)
-        self.steps = 0
-        self.state = np.array([0.0, 0.0, self.np_random.uniform(-0.05, 0.05), 0.0], dtype = np.float32)
-        return self.state.copy(), {}
-
-    def step(self, action):
-        action = np.clip(np.asarray(action).squeeze(), -1.0, 1.0).item()
-        force = action * self.force_mag
-        x, x_dot, theta, theta_dot = self.state
-        costheta = math.cos(theta)
-        sintheta = math.sin(theta)
-
-        temp = (force + self.polemass_length * theta_dot**2 * sintheta) / self.total_mass
-        thetaacc = (self.gravity * sintheta - costheta * temp) / (self.length * (4.0/3.0 - self.masspole * costheta**2 / self.total_mass))
-        xacc = temp - self.polemass_length * thetaacc * costheta / self.total_mass
-
-        x = x + self.tau * x_dot
-        x_dot = x_dot + self.tau * xacc
-        theta = theta + self.tau * theta_dot
-        theta_dot = theta_dot + self.tau * thetaacc
-        self.state = np.array([x, x_dot, theta, theta_dot], dtype = np.float32)
-
-        self.steps += 1
-        terminated = bool(abs(x) > self.x_threshold or abs(theta) > self.theta_threshold_radians)
-        truncated = self.steps >= self.max_episode_steps
-        reward = 1.0
-        return self.state.copy(), reward, terminated, truncated, {}
-
-# batched wrapper (no auto-reset - done envs freeze so each env contributes exactly one episode per rollout)
-
-class BatchedEnv:
-    def __init__(self, seeds, max_episode_steps = 500):
-        self.envs = [ContinuousCartPole(seed = s, max_episode_steps = max_episode_steps) for s in seeds]
-        self.num_envs = len(self.envs)
-        self.observation_space = spaces.Box(-np.inf, np.inf, (4,), dtype = np.float32)
-        self.action_space = spaces.Box(-1.0, 1.0, (self.num_envs, 1), dtype = np.float32)
-        self._done = [False] * self.num_envs
-        self._last_obs = [None] * self.num_envs
-
-    def reset(self, seed = None, options = None):
-        self._done = [False] * self.num_envs
-        obs = []
-        for i, e in enumerate(self.envs):
-            o, _ = e.reset()
-            self._last_obs[i] = o
-            obs.append(o)
-        return np.stack(obs), {}
-
-    def step(self, actions):
-        obs, rewards, terminateds, truncateds = [], [], [], []
-        for i, (e, a) in enumerate(zip(self.envs, actions)):
-            if self._done[i]:
-                obs.append(self._last_obs[i])
-                rewards.append(0.0)
-                terminateds.append(True)
-                truncateds.append(False)
-                continue
-
-            o, r, terminated, truncated, _ = e.step(a)
-            self._last_obs[i] = o
-            if terminated or truncated:
-                self._done[i] = True
-
-            obs.append(o)
-            rewards.append(r)
-            terminateds.append(terminated)
-            truncateds.append(truncated)
-
-        return np.stack(obs), np.array(rewards, dtype = np.float32), np.array(terminateds, dtype = bool), np.array(truncateds, dtype = bool), {}
-
-    def close(self):
-        for e in self.envs:
-            e.close()
+from env_cartpole import BatchedEnv
 
 # fitness - reach and stay at the upright state (goal = all zeros)
 #
