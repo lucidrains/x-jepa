@@ -181,6 +181,7 @@ def main(
     cem_num_iters = 8,
     cem_elite_frac = 0.1,
     random_action_eps = 12,
+    transition_lookahead = 3, # mtp lookahead for the prefix state transition on both lanes
     target_avg_reward = 100.,
     reward_avg_window = 10,
     print_every_eps = 1,
@@ -224,7 +225,8 @@ def main(
         value_loss_weight = 1.0,
         discount_factor = 0.99,
         reg_next_state_weight = 0.1,
-        temporal_compression = temporal_compressions
+        temporal_compression = temporal_compressions,
+        transition_lookahead = transition_lookahead
     ).to(device)
 
     optimizer = Adam(wm.parameters(), lr = lr)

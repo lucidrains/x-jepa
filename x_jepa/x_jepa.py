@@ -577,6 +577,13 @@ class Transformer(Module):
 
 # fast-lewm state transition - https://arxiv.org/abs/2606.26217
 # causal transformer over [state latent] [action 1] [action 2] ..., each prefix supervises the future latent, all predicted in parallel
+#
+# with lookahead > 1, each prefix becomes an mtp (multi-token prediction) head that predicts the next
+# `lookahead` state latents in parallel - planning still consumes the immediate next latent (offset 0)
+#
+# with temporal_compression > 1, each state step is driven by `temporal_compression` raw actions,
+# flattened into a single chunk token instead of mean-pooled - so the transition needs to know the
+# compression to build the chunk projection
 
 class PrefixStateTransition(Module):
     def __init__(
@@ -592,7 +599,9 @@ class PrefixStateTransition(Module):
         dim_head = 16,
         ff_expand_factor = 4.,
         use_pope = True,
-        use_pseudo_queries = False
+        use_pseudo_queries = False,
+        lookahead = 1,
+        temporal_compression = 1
     ):
         super().__init__()
         self.dim = dim
@@ -600,9 +609,17 @@ class PrefixStateTransition(Module):
         self.dim_transition_action_input = dim_transition_action_input
         self.dim_out = default(dim_out, dim_state_latent)
         self.horizon = horizon
+        self.lookahead = lookahead
+        self.temporal_compression = temporal_compression
+        self.has_temporal_compression = temporal_compression > 1
 
         self.to_state_tokens = LinearNoBias(dim_state_latent, dim)
         self.to_action_tokens = LinearNoBias(dim_transition_action_input, dim)
+
+        if self.has_temporal_compression:
+            # chunk projection - the `temporal_compression` raw actions of each state step flattened into one token
+
+            self.to_action_tokens_chunked = LinearNoBias(temporal_compression * dim_transition_action_input, dim)
 
         self.transformer = Transformer(
             dim = dim,
@@ -615,57 +632,91 @@ class PrefixStateTransition(Module):
             use_pseudo_queries = use_pseudo_queries
         )
 
-        self.to_pred = Sequential(RMSNorm(dim), LinearNoBias(dim, self.dim_out))
+        self.to_pred = Sequential(RMSNorm(dim), LinearNoBias(dim, self.dim_out * lookahead))
 
     def _build_tokens(
         self,
         state_latents, # (..., 1, d) anchor latent token
-        actions        # (..., h, d_a) action prefix tokens
+        actions,       # (..., h, c, d_a) chunked action tokens, or (..., h, d_a) flat
+        chunked = False
     ):
-        return cat((self.to_state_tokens(state_latents), self.to_action_tokens(actions)), dim = -2)
+        if chunked:
+            # flatten the `temporal_compression` raw actions of each step into one token
+            actions = rearrange(actions, '... h c d_a -> ... h (c d_a)', c = self.temporal_compression)
+            to_action_tokens = self.to_action_tokens_chunked
+        else:
+            to_action_tokens = self.to_action_tokens
+
+        return cat((self.to_state_tokens(state_latents), to_action_tokens(actions)), dim = -2)
 
     def predict(
         self,
         state_latents, # (..., 1, d) anchor latent
-        actions        # (..., h, d_a) candidate action sequence
+        actions,       # (..., h, c, d_a) chunked candidate action sequence, or (..., h, d_a) flat
+        lookahead = None # plan-time lookahead, clamped to the trained one
     ):
         # predict all future latents after each action prefix in parallel
 
-        tokens = self._build_tokens(state_latents, actions) # (..., 1 + h, dim)
+        tokens = self._build_tokens(state_latents, actions, chunked = self.has_temporal_compression) # (..., 1 + h, dim)
         tokens, unpack = pack_with_inverse(tokens, '* t d')
 
         out = self.transformer(tokens)
         out = unpack(out, '* t d')
 
-        return self.to_pred(out[..., 1:, :])
+        lookahead = min(default(lookahead, 1), self.lookahead)
+        pred = self.to_pred(out[..., 1:, :])
+        pred = rearrange(pred, '... t (l d) -> ... t l d', l = self.lookahead)[..., :lookahead, :]
+
+        return pred[..., 0, :] if lookahead == 1 else pred
 
     def forward(
         self,
         state_latents, # (b, n, d) anchor latent states
-        action_cond,   # (b, n, d_a) actions aligned with the states
+        action_cond,   # (b, n, c, d_a) chunked actions aligned with the states, or (b, n, d_a) flat
         valid_target_mask = None, # (b, n) validity of each next state latent target
         horizon = None
     ):
-        # training - non-overlapping windows (stride = horizon), multi-horizon supervision on every prefix
+        # training - non-overlapping windows (stride = horizon), multi-horizon supervision on every prefix,
+        # mtp lookahead - each prefix predicts the next `lookahead` future latents
 
         batch, seq_len = state_latents.shape[:2]
+        lookahead = self.lookahead
 
         h = min(default(horizon, self.horizon), seq_len)
         num_windows = (seq_len - h) // h + 1
 
         anchor_windows = state_latents[:, :num_windows * h:h]                              # (b, w, d)
-        action_windows = rearrange(action_cond[:, :num_windows * h], 'b (w h) d_a -> b w h d_a', h = h) # (b, w, h, d_a)
+        is_chunked = action_cond.ndim == 4
+        action_pattern = 'b (w h) c d_a -> b w h c d_a' if is_chunked else 'b (w h) d_a -> b w h d_a'
+        action_windows = rearrange(action_cond[:, :num_windows * h], action_pattern, h = h) # (b, w, h, [c, ]d_a)
 
-        tokens = self._build_tokens(rearrange(anchor_windows, 'b w d -> b w 1 d'), action_windows) # (b, w, 1 + h, dim)
+        tokens = self._build_tokens(rearrange(anchor_windows, 'b w d -> b w 1 d'), action_windows, chunked = is_chunked) # (b, w, 1 + h, dim)
         tokens = rearrange(tokens, 'b w t d -> (b w) t d')
 
         out = self.transformer(tokens)
         out = rearrange(out, '(b w) t d -> b w t d', b = batch)
 
-        pred = self.to_pred(out[:, :, 1:]) # (b, w, h, d_out)
+        pred = self.to_pred(out[:, :, 1:]) # (b, w, h, lookahead * d_out)
 
-        mask = None
-        if exists(valid_target_mask):
+        if lookahead > 1:
+            pred = rearrange(pred, 'b w h (l d) -> b w h l d', l = lookahead) # (b, w, h, l, d_out)
+
+        if not exists(valid_target_mask) and lookahead == 1:
+            return pred, None
+
+        if not exists(valid_target_mask):
+            valid_target_mask = torch.ones((batch, seq_len), dtype = torch.bool, device = state_latents.device)
+
+        if lookahead > 1:
+            # pad so the last lookahead offsets stay in-bounds, then shift per offset -
+            # the level-k target of a prefix at t is the next-state latent at t + k
+
+            padded_mask = F.pad(valid_target_mask, (0, lookahead - 1))
+            mask = stack([
+                rearrange(padded_mask[:, k : k + num_windows * h], 'b (w h) -> b w h', h = h)
+                for k in range(lookahead)
+            ], dim = -1) # (b, w, h, l)
+        else:
             mask = rearrange(valid_target_mask[:, :num_windows * h], 'b (w h) -> b w h', h = h)
 
         return pred, mask
@@ -1490,6 +1541,15 @@ def slice_state_seq(
 ):
     return tree_map_tensor(lambda t: t[:, start:stop:step], states)
 
+def compressed_lane_bounds(
+    state_len,
+    temporal_compression
+):
+    # number of compressed steps and the raw timestep offset they cover
+
+    compressed_len = (state_len - temporal_compression) // temporal_compression
+    return compressed_len, temporal_compression * compressed_len
+
 def extract_temporal_compressed_lanes(
     states,
     actions,
@@ -1500,15 +1560,12 @@ def extract_temporal_compressed_lanes(
     if temporal_compression <= 1:
         return states, actions, mask, returns
 
-    # derive compressed sequence length
-
     state_len = first_tensor(states).shape[1]
-    compressed_len = (state_len - temporal_compression) // temporal_compression
+    compressed_len, stop_offset = compressed_lane_bounds(state_len, temporal_compression)
 
     if compressed_len <= 0:
         return states, actions, mask, returns
 
-    stop_offset = temporal_compression * compressed_len
     states = slice_state_seq(states, start = 0, stop = stop_offset + 1, step = temporal_compression)
     actions = pool_actions(actions.narrow(1, 0, stop_offset), temporal_compression = temporal_compression)
 
@@ -1546,6 +1603,7 @@ class WorldModel(Module):
         state_transition_depth = 2,
         state_transition_heads = 4,
         state_transition_dim_head = 16,
+        transition_lookahead = 1,
         temporal_compression = 1
     ):
         super().__init__()
@@ -1575,7 +1633,9 @@ class WorldModel(Module):
                 horizon = transition_horizon,
                 depth = state_transition_depth,
                 heads = state_transition_heads,
-                dim_head = state_transition_dim_head
+                dim_head = state_transition_dim_head,
+                lookahead = transition_lookahead,
+                temporal_compression = temporal_compression
             )
 
         if not exists(state_transition):
@@ -1643,16 +1703,30 @@ class WorldModel(Module):
             pred_logits, mask = transition(state_latents, action_cond, valid_target_mask = valid_target_mask)
 
             num_windows, h = pred_logits.shape[1], pred_logits.shape[2]
+            lookahead = getattr(transition, 'lookahead', 1)
 
             anchor_windows = rearrange(state_latents[:, :num_windows * h:h], 'b w d -> b w 1 d')
-            target_windows = rearrange(next_target_state_latents[:, :num_windows * h], 'b (w h) d -> b w h d', h = h)
+
+            if lookahead > 1:
+                # mtp - level k of each prefix supervises the next state latent k steps out, padded at the tail
+
+                padded_targets = F.pad(next_target_state_latents, (0, 0, 0, lookahead - 1))
+                target_windows = stack([
+                    rearrange(padded_targets[:, k : k + num_windows * h], 'b (w h) d -> b w h d', h = h)
+                    for k in range(lookahead)
+                ], dim = 3) # (b, w, h, l, d)
+
+                anchor_windows = rearrange(anchor_windows, 'b w 1 d -> b w 1 1 d')
+            else:
+                target_windows = rearrange(next_target_state_latents[:, :num_windows * h], 'b (w h) d -> b w h d', h = h)
 
             if probabilistic:
                 loss = beta_distr(pred_logits, target = target_windows.detach()).sum(dim = -1)
                 pred = beta_distr(pred_logits)
             else:
                 pred = anchor_windows + pred_logits
-                loss = reduce(F.smooth_l1_loss(pred, target_windows.detach(), reduction = 'none'), 'b w h d -> b w h', 'mean')
+                loss_pattern = 'b w h l d -> b w h l' if lookahead > 1 else 'b w h d -> b w h'
+                loss = reduce(F.smooth_l1_loss(pred, target_windows.detach(), reduction = 'none'), loss_pattern, 'mean')
 
             return loss, pred, mask
 
@@ -1686,7 +1760,8 @@ class WorldModel(Module):
         episodic_mems = None,
         return_per_sample_loss: bool = False,
         prepend_embeds = None,
-        excise_prepend_embeds = False
+        excise_prepend_embeds = False,
+        transition_action_cond = None
     ):
         batch = tokens.shape[0]
 
@@ -1739,11 +1814,12 @@ class WorldModel(Module):
         state_embeds, state_latents, action_embeds = (t[:, :-1] for t in (state_embeds_full, state_latents_full, action_embeds_full))
 
         action_cond = action_cond[:, :state_latents.shape[1]]
+        transition_action_cond = default(transition_action_cond, action_cond)
 
         state_transition_loss, next_state_pred, transition_mask = self._compute_transition_loss(
             self.state_transition,
             state_latents,
-            action_cond,
+            transition_action_cond,
             next_target_state_latents,
             valid_target_mask,
             self.probabilistic_state_transition,
@@ -1753,7 +1829,7 @@ class WorldModel(Module):
         plan_state_transition_loss, _, plan_transition_mask = self._compute_transition_loss(
             self.state_transition_for_planning,
             state_latents,
-            action_cond,
+            transition_action_cond,
             next_target_state_latents,
             valid_target_mask,
             self.probabilistic_plan_state_transition,
@@ -1782,6 +1858,7 @@ class WorldModel(Module):
         if exists(reg):
             if self.reg_next_state_weight > 0.:
                 reg_target = next_state_pred[:, :, :1] if self.transition_is_prefix else next_state_pred
+                reg_target = reg_target[..., 0, :] if reg_target.ndim == 5 else reg_target
                 reg_next_state_loss = reg(reg_target)
 
             if self.reg_next_encoded_weight > 0.:
@@ -1880,6 +1957,7 @@ class Agent(Module):
         state_transition_depth = 2,
         state_transition_heads = 4,
         state_transition_dim_head = 16,
+        transition_lookahead = 1,
         reg: Module | None = None,
         reg_loss_kwargs: dict | None = None,
         state_linear_rnn_depth = 1,
@@ -2044,6 +2122,7 @@ class Agent(Module):
                     state_transition_depth = state_transition_depth,
                     state_transition_heads = state_transition_heads,
                     state_transition_dim_head = state_transition_dim_head,
+                    transition_lookahead = transition_lookahead,
                     temporal_compression = temporal_compressions[idx if idx < len(temporal_compressions) else 0]
                 ) for idx in range(num_world_models)
             ]
@@ -2266,6 +2345,36 @@ class Agent(Module):
         assert 0 <= world_model_index < len(self.world_models), f'world_model_index {world_model_index} is out of bounds for agent with {len(self.world_models)} world model(s)'
         return self.world_models[world_model_index]
 
+    def chunked_transition_actions(
+        self,
+        raw_actions, # (b, n, d) raw actions over the full lane
+        states_len,  # raw sequence length, used to derive the compressed lane bounds
+        temporal_compression
+    ):
+        # chunk the `temporal_compression` raw actions of each compressed step into one token for
+        # the prefix transition - (b, n, d) -> (b, n, c, d), encoded into the transition action space;
+        # None when the sequence is too short for a full compressed lane
+
+        compressed_len, stop_offset = compressed_lane_bounds(states_len, temporal_compression)
+
+        if compressed_len <= 0:
+            return None, None
+
+        chunked_actions = rearrange(raw_actions.narrow(1, 0, stop_offset), 'b (n c) ... -> b n c ...', n = compressed_len, c = temporal_compression)
+
+        if not self.is_transition_action_space_raw:
+            encoded = self.encode_actions(chunked_actions)
+
+            if self.transition_action_space == 'global':
+                # rnn over the raw temporal order - chunks are contiguous across compressed steps
+                encoded = rearrange(encoded, 'b n c d -> b (n c) d')
+                encoded = self.action_linear_rnn(encoded)
+                encoded = rearrange(encoded, 'b (n c) d -> b n c d', n = compressed_len, c = temporal_compression)
+
+            chunked_actions = self.to_action_latent(encoded)
+
+        return chunked_actions, stop_offset
+
     def encode_actions(self, actions):
 
         if isinstance(self.action_encoder, nn.Embedding) and actions.is_floating_point():
@@ -2471,7 +2580,8 @@ class Agent(Module):
         return_pred_states = False,
         skill_id: int | Tensor | None = None,
         risk_factor: float | Tensor | None = None,
-        discount_factor: float | Tensor | None = None
+        discount_factor: float | Tensor | None = None,
+        plan_lookahead: int | None = None # prefix transition only - steps to predict per re-anchored pass, defaults to the full horizon in one parallel pass; fall back to fewer and redo the prediction until the horizon is covered
     ):
         batch, device = first_tensor(states).shape[0], self.device
         state_len, action_len = first_tensor(states).shape[1], actions.shape[1]
@@ -2636,7 +2746,10 @@ class Agent(Module):
             transition = world_model.ema_state_transition_for_planning
 
             if world_model.transition_is_prefix:
-                logits = transition.predict(rearrange(state, '... d -> ... 1 d'), rearrange(action, '... d -> ... 1 d'))
+                # with temporal compression, one step is a chunk of `temporal_compression` raw actions
+
+                transition_action = rearrange(action, '... c d -> ... 1 c d') if has_temporal_compression else rearrange(action, '... d -> ... 1 d')
+                logits = transition.predict(rearrange(state, '... d -> ... 1 d'), transition_action)
                 logits = rearrange(logits, '... 1 d -> ... d')
             else:
                 logits = transition((state, action))
@@ -2651,6 +2764,21 @@ class Agent(Module):
 
             return (next_state, None) if return_entropy else next_state
 
+        # helper for advancing one step - with temporal compression, a step is a chunk of
+        # `temporal_compression` raw actions, buffered here until complete
+
+        def step_state_by_actions(state, step_action_cond, chunk_action_conds):
+            if has_temporal_compression and world_model.transition_is_prefix:
+                chunk_action_conds.append(step_action_cond)
+
+                if len(chunk_action_conds) < temporal_compression:
+                    return state, chunk_action_conds
+
+                step_action_cond = stack(chunk_action_conds, dim = -2)
+                chunk_action_conds = []
+
+            return advance_state(state, step_action_cond), chunk_action_conds
+
         # actor seeding logic
 
         seed_actor = None
@@ -2663,6 +2791,7 @@ class Agent(Module):
             seed_actor_memory = None
             seed_last_action_cond = None
             seed_last_action_tokens = None
+            chunk_action_conds = []
 
             for _ in range(horizon):
                 step_state_reshaped, unpack_actor = pack_with_inverse(step_state, '* d')
@@ -2700,7 +2829,7 @@ class Agent(Module):
                 step_action_cond, step_rnn_memories = encode_action_step(step_action, step_rnn_memories)
 
                 seeded_actions.append(step_action if is_search_space_raw_action else step_action_cond)
-                step_state = advance_state(step_state, step_action_cond)
+                step_state, chunk_action_conds = step_state_by_actions(step_state, step_action_cond, chunk_action_conds)
 
             seeded_actions = stack(seeded_actions, dim = 2)
 
@@ -2719,47 +2848,93 @@ class Agent(Module):
 
         # helper for evaluating actions
 
+        def to_transition_action_latents(actions, chunked):
+            # raw search actions converted to the transition action space (latents)
+
+            actions, unpack = pack_with_inverse(actions, '* h n d' if chunked else '* h d')
+            encoded = self.encode_actions(actions)
+
+            # global action latents pass through linear rnn with past memories
+
+            if self.transition_action_space == 'global':
+                if chunked:
+                    encoded = rearrange(encoded, 'b h n d -> b (h n) d')
+
+                encoded = self.action_linear_rnn(encoded, memories = past_rnn_memories)
+
+                if chunked:
+                    encoded = rearrange(encoded, 'b (h n) d -> b h n d', n = temporal_compression)
+
+            return unpack(self.to_action_latent(encoded))
+
         def evaluate_actions(eval_actions):
             # transition action space could be raw actions or action latents
 
-            actions_cond = eval_actions
-
             if has_temporal_compression:
+                # mean-pooled per compressed step for the encoded-state predictor, chunked raw
+                # for the prefix transition (which sees all `temporal_compression` actions per step)
+
                 actions_cond = reduce(eval_actions, 'b p (h n) d -> b p h d', 'mean', n = temporal_compression)
+                transition_actions_cond = rearrange(eval_actions, 'b p (h n) d -> b p h n d', n = temporal_compression) # (b, p, h, c, d)
+            else:
+                actions_cond = transition_actions_cond = eval_actions
 
             if is_search_space_raw_action and not self.is_transition_action_space_raw:
-                actions_cond, unpack = pack_with_inverse(actions_cond, '* h d')
-                actions_cond = self.encode_actions(actions_cond)
-
-                # global action latents pass through linear rnn with past memories
-
-                if self.transition_action_space == 'global':
-                    actions_cond = self.action_linear_rnn(actions_cond, memories = past_rnn_memories)
-
-                actions_cond = self.to_action_latent(actions_cond)
-                actions_cond = unpack(actions_cond)
+                actions_cond = to_transition_action_latents(actions_cond, chunked = False)
+                transition_actions_cond = to_transition_action_latents(transition_actions_cond, chunked = has_temporal_compression)
 
             pred_state_entropies = None
 
             if world_model.transition_is_prefix:
-                # fast-lewm - all future latents predicted in a single parallel pass
+                # fast-lewm - all future latents predicted in parallel; with `plan_lookahead`,
+                # fall back to a shorter lookahead, re-anchor on the last predicted state and
+                # redo the prediction until the horizon is covered
 
-                anchor_latents = rearrange(state_latents, 'b p d -> b p 1 d')
-                pred_residuals = world_model.ema_state_transition_for_planning.predict(anchor_latents, actions_cond) # (b, p, h, d)
+                num_steps = transition_actions_cond.shape[2]
+                chunk_size = min(max(default(plan_lookahead, num_steps), 1), num_steps)
 
-                if world_model.probabilistic_plan_state_transition:
-                    pred_state_latents, pred_state_entropies = world_model.plan_state_transition_beta_distr(pred_residuals, sample = True, return_entropy = True)
-                else:
-                    pred_state_latents = anchor_latents + pred_residuals
+                pred_state_latents = []
+                pred_next_encoded_states = []
+                pred_values = []
+                pred_state_entropies = [] if world_model.probabilistic_plan_state_transition else None
 
-                    if clamp_state_latent_to_range and self.has_state_latent_clamp:
-                        pred_state_latents.clamp_(-self.state_latent_clamp_value, self.state_latent_clamp_value)
+                step_state_latents = state_latents
 
-                # encoded-state predictions are conditioned on the state before each step, so shift latents by one
+                for chunk_start in range(0, num_steps, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, num_steps)
+                    chunk_actions_cond = transition_actions_cond[:, :, chunk_start:chunk_end]
+                    chunk_step_actions_cond = actions_cond[:, :, chunk_start:chunk_end]
 
-                prev_state_latents = cat((anchor_latents, pred_state_latents[:, :, :-1]), dim = -2)
-                pred_next_encoded_states = world_model.to_next_encoded_state_pred((prev_state_latents, actions_cond))
-                pred_values = self.value_network(pred_next_encoded_states, pred_state_latents, discount = discount_factor, risk = risk_factor)
+                    step_anchor = rearrange(step_state_latents, 'b p d -> b p 1 d')
+                    pred_residuals = world_model.ema_state_transition_for_planning.predict(step_anchor, chunk_actions_cond) # (b, p, l, d)
+
+                    if world_model.probabilistic_plan_state_transition:
+                        chunk_pred_states, chunk_entropies = world_model.plan_state_transition_beta_distr(pred_residuals, sample = True, return_entropy = True)
+                        pred_state_entropies.append(chunk_entropies)
+                    else:
+                        chunk_pred_states = step_anchor + pred_residuals
+
+                        if clamp_state_latent_to_range and self.has_state_latent_clamp:
+                            chunk_pred_states.clamp_(-self.state_latent_clamp_value, self.state_latent_clamp_value)
+
+                    # encoded-state predictions are conditioned on the state before each step, so shift latents by one
+
+                    chunk_prev_state_latents = cat((step_anchor, chunk_pred_states[:, :, :-1]), dim = -2)
+                    chunk_encoded_states = world_model.to_next_encoded_state_pred((chunk_prev_state_latents, chunk_step_actions_cond))
+                    chunk_values = self.value_network(chunk_encoded_states, chunk_pred_states, discount = discount_factor, risk = risk_factor)
+
+                    pred_state_latents.append(chunk_pred_states)
+                    pred_next_encoded_states.append(chunk_encoded_states)
+                    pred_values.append(chunk_values)
+
+                    step_state_latents = chunk_pred_states[:, :, -1]
+
+                pred_state_latents = cat(pred_state_latents, dim = 2)
+                pred_next_encoded_states = cat(pred_next_encoded_states, dim = 2)
+                pred_values = cat(pred_values, dim = 2)
+
+                if exists(pred_state_entropies):
+                    pred_state_entropies = cat(pred_state_entropies, dim = 2)
             else:
                 # classic one-step autoregressive rollout
 
@@ -2865,6 +3040,7 @@ class Agent(Module):
             latent_drawn_actions = []
             step_state_latents = pop_state_latents
             step_rnn_memories = tree_map_tensor(partial(batch_repeat, r = pop_size), next_action_rnn_memories)
+            chunk_action_conds = []
 
             for ind, chunk_size in enumerate(chunk_sizes):
                 chunk_actions = latent_action_model.sample(
@@ -2881,7 +3057,7 @@ class Agent(Module):
                     for step in range(chunk_size):
                         step_action = chunk_actions[:, step]
                         step_action_cond, step_rnn_memories = encode_action_step(step_action, step_rnn_memories)
-                        step_state_latents = advance_state(step_state_latents, step_action_cond)
+                        step_state_latents, chunk_action_conds = step_state_by_actions(step_state_latents, step_action_cond, chunk_action_conds)
 
             latent_drawn_actions = cat(latent_drawn_actions, dim = 1)
             latent_drawn_actions = rearrange(latent_drawn_actions, '(b p) h d -> b p h d', b = batch, p = pop_size)
@@ -3205,16 +3381,38 @@ class Agent(Module):
                 state_latents = self.to_state_latent(self.encode_states(self.ema_state_encoder, states)[0])
                 action_cond = actions if self.is_transition_action_space_raw else self.to_action_latent(actions)
 
+                is_chunked = False
+
                 if world_model.transition_is_prefix:
-                    transition_logits, _ = world_model.state_transition(state_latents, action_cond, horizon = 1)
-                    transition_logits = rearrange(transition_logits, 'b n 1 d -> b n d')
+                    transition_state_latents, transition_action_cond = state_latents, action_cond
+
+                    if has_temporal_compression:
+                        chunked_actions, stop_offset = self.chunked_transition_actions(actions, states.shape[1], temporal_compression)
+
+                        if exists(chunked_actions):
+                            is_chunked = True
+                            transition_state_latents = transition_state_latents[:, :stop_offset][:, ::temporal_compression]
+                            transition_action_cond = chunked_actions
+
+                    transition_logits, _ = world_model.state_transition(transition_state_latents, transition_action_cond, horizon = 1)
+
+                    # mtp - risk rewards only the executed transition, so take the immediate next latent (offset 0)
+
+                    transition_logits = transition_logits[:, :, 0, 0] if transition_logits.ndim == 5 else transition_logits[:, :, 0]
                 else:
                     transition_logits = world_model.state_transition((state_latents, action_cond))
 
                 distr = world_model.state_transition_beta_distr(transition_logits, return_distr = True)
 
-                transition_entropy = reduce(distr.entropy().exp(), 'b n d -> b n', 'sum')
+                transition_entropy = reduce(distr.entropy().exp(), 'b n ... d -> b n', 'sum')
                 risk_reward = cast_tensor(risk_factor) * transition_entropy * risk_entropy_bonus_weight
+
+                if is_chunked:
+                    # spread each compressed-step risk over its `temporal_compression` raw steps, zero for the tail
+
+                    risk_reward = risk_reward.repeat_interleave(temporal_compression, dim = 1)
+                    risk_reward = F.pad(risk_reward, (0, states.shape[1] - stop_offset))
+
                 rewards = rewards + risk_reward
 
         with torch.no_grad():
@@ -3346,6 +3544,15 @@ class Agent(Module):
         states, orig_actions, mask, returns = extract_temporal_compressed_lanes(
             states, actions, mask = mask, returns = returns, temporal_compression = temporal_compression
         )
+
+        # with temporal compression, the prefix transition consumes the `temporal_compression` raw
+        # actions of each compressed step as a flattened chunk (instead of the mean-pooled action),
+        # so build the chunked action lane here
+
+        transition_action_cond = None
+
+        if has_temporal_compression and world_model.transition_is_prefix:
+            transition_action_cond, _ = self.chunked_transition_actions(actions, state_len, temporal_compression)
 
         (batch, state_len), action_len = first_tensor(states).shape[:2], orig_actions.shape[1]
         valid_target_mask = mask[:, 1:] if exists(mask) else None
@@ -3521,7 +3728,8 @@ class Agent(Module):
             model_memories = model_memories,
             prepend_memories = None,
             has_episodic_mem = self.has_episodic_mem,
-            episodic_mems = getattr(self, 'episodic_mems', None)
+            episodic_mems = getattr(self, 'episodic_mems', None),
+            transition_action_cond = transition_action_cond
         )
 
         embeds = agent_outputs['embeds']

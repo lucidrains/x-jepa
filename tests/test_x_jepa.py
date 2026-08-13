@@ -11,7 +11,7 @@ from einops.layers.torch import Rearrange
 
 from x_mlps_pytorch import MLP
 
-from x_jepa.x_jepa import Agent, WorldModel, Transformer, Actor, exists, AgentRolloutWrapper, TTTMetaLearningLoss
+from x_jepa.x_jepa import Agent, WorldModel, Transformer, Actor, exists, AgentRolloutWrapper, TTTMetaLearningLoss, PrefixStateTransition
 from x_jepa.min_gru import minGRUBlocks
 from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
 from x_jepa.goals import GoalGenerator, MetricResidualNetwork
@@ -211,6 +211,183 @@ def test_behavior_cloning(
 
     assert loss.ndim == 0
     loss.backward()
+
+def test_prefix_transition_mtp():
+    # fast-lewm prefix transition with mtp lookahead, end-to-end: each prefix predicts the next
+    # `lookahead` state latents during training, planning still consumes the immediate next latent,
+    # and can fall back to a shorter plan-time lookahead via re-anchored re-prediction
+
+    dim = 32
+    dim_action = 4
+    lookahead = 3
+
+    model = Transformer(
+        dim = dim,
+        depth = 1,
+        causal = True
+    )
+
+    agent = Agent(
+        state_encoder = nn.Linear(16, dim),
+        action_encoder = nn.Linear(dim_action, dim),
+        model = model,
+        dim_action = dim_action,
+        continuous_actions = True,
+        transition_action_space = 'raw',
+        transition_horizon = 8,
+        transition_lookahead = lookahead,
+        reg_next_state_weight = 0.1,
+        add_reflexive_actor = True
+    )
+
+    transition = agent.world_models[0].state_transition
+
+    assert isinstance(transition, PrefixStateTransition)
+    assert transition.lookahead == lookahead
+
+    # positional info for the prefix transformer - pope (rotary / polar positions)
+
+    assert exists(transition.transformer.pope)
+
+    # plan-time lookahead is clamped to the trained one - fewer offsets can be requested
+
+    pred = transition.predict(torch.randn(2, 1, dim), torch.randn(2, 4, dim_action), lookahead = 1)
+    assert pred.shape == (2, 4, dim)
+
+    pred = transition.predict(torch.randn(2, 1, dim), torch.randn(2, 4, dim_action), lookahead = lookahead)
+    assert pred.shape == (2, 4, lookahead, dim)
+
+    states = torch.randn(2, 64, 16)
+    actions = torch.randn(2, 63, dim_action).tanh()
+    returns = torch.randn(2, 64)
+    lens = torch.full((2,), 64, dtype = torch.long)
+
+    optimizer = torch.optim.Adam(agent.parameters(), lr = 3e-3)
+
+    losses = []
+
+    for _ in range(3):
+        loss, _ = agent(states, actions, returns = returns, lens = lens, behavior_clone = True)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        agent.update()
+        losses.append(loss.item())
+
+    assert losses[-1] < losses[0]
+
+    # planning rolls out with the immediate next latent after each prefix - full parallel pass by
+    # default, single-step re-anchored fallback with plan_lookahead = 1
+
+    goal_state = torch.randn(2, 16)
+
+    for plan_lookahead in (1, None):
+        planned_actions = agent.plan(
+            states[:, :2],
+            actions[:, :1],
+            goal_state = goal_state,
+            horizon = 8,
+            pop_size = 16,
+            generations = 2,
+            plan_lookahead = plan_lookahead
+        )
+
+        assert planned_actions.shape == (2, 8, dim_action)
+
+    # ema transition used for planning must share the lookahead
+
+    planned_ema_transition = agent.world_models[0].ema_state_transition_for_planning.online_model
+
+    assert planned_ema_transition.lookahead == lookahead
+
+def test_prefix_transition_temporal_compression():
+    # fast-lewm prefix transition under temporal compression, end-to-end: each compressed state step
+    # is driven by a chunk of `temporal_compression` raw actions flattened into one token - training
+    # on the chunked lane, then planning with chunked predicts, and degenerate short windows that
+    # fall back to flat per-step actions
+
+    dim = 32
+    dim_action = 4
+
+    for temporal_compression in (2, 4):
+        model = Transformer(
+            dim = dim,
+            depth = 1,
+            causal = True
+        )
+
+        agent = Agent(
+            state_encoder = nn.Linear(16, dim),
+            action_encoder = nn.Linear(dim_action, dim),
+            model = model,
+            dim_action = dim_action,
+            continuous_actions = True,
+            transition_action_space = 'raw',
+            transition_horizon = 8,
+            transition_lookahead = 2,
+            temporal_compression = temporal_compression
+        )
+
+        transition = agent.world_models[0].state_transition
+
+        assert isinstance(transition, PrefixStateTransition)
+        assert transition.temporal_compression == temporal_compression
+        assert transition.to_action_tokens_chunked.in_features == temporal_compression * dim_action
+
+        seq_len = temporal_compression * 3 + 1
+        states = torch.randn(2, seq_len, 16)
+        actions = torch.randn(2, seq_len - 1, dim_action).tanh()
+        lens = torch.full((2,), seq_len, dtype = torch.long)
+
+        optimizer = torch.optim.Adam(agent.parameters(), lr = 3e-3)
+
+        losses = []
+
+        for _ in range(3):
+            loss, _ = agent(states, actions, lens = lens, behavior_clone = True)
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            agent.update()
+            losses.append(loss.item())
+
+        assert losses[-1] < losses[0]
+
+        # chunked predict - consumes (h, c, d) actions, returns the immediate next latent per step
+
+        pred = transition.predict(
+            torch.randn(2, 1, dim),
+            torch.randn(2, 2, temporal_compression, dim_action)
+        )
+
+        assert pred.shape == (2, 2, dim)
+
+        # planning searches raw actions; horizon must be divisible by the compression
+
+        horizon = temporal_compression * 2
+        planned_actions = agent.plan(
+            states[:, :temporal_compression + 1],
+            actions[:, :temporal_compression],
+            goal_state = torch.zeros(2, 16),
+            horizon = horizon,
+            pop_size = 16,
+            generations = 2
+        )
+
+        assert planned_actions.shape == (2, horizon, dim_action)
+
+        # a sequence too short for a full compressed lane (fewer than 2 compression steps) falls
+        # back to flat per-step actions for the prefix transition - must not crash
+
+        short_seq_len = temporal_compression + 1
+        short_states = torch.randn(2, short_seq_len, 16)
+        short_actions = torch.randn(2, short_seq_len - 1, dim_action).tanh()
+        short_lens = torch.full((2,), short_seq_len, dtype = torch.long)
+
+        loss, _ = agent(short_states, short_actions, lens = short_lens, behavior_clone = True)
+
+        assert torch.isfinite(loss)
+        loss.backward()
 
 @param('reg_type', ('sigreg', 'visreg'))
 def test_reg_loss(reg_type):

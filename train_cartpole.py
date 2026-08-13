@@ -23,6 +23,9 @@
 #   python train_cartpole.py
 #   python train_cartpole.py --transition_type mlp
 #
+# the prefix transition trains with an mtp lookahead of 3 (each prefix predicts the next 3 latents),
+# override with `--transition_lookahead 1` for the classic single-step-per-prefix setup
+#
 # overridable via fire, e.g.:
 #   python train_cartpole.py --num_envs 16 --num_episodes 30 --cpu true
 
@@ -137,7 +140,9 @@ def main(
     project_name = 'x-jepa-cartpole',
     use_wandb = False,
     cpu = False,
-    transition_type = 'prefix' # 'prefix' for fast-lewm action-prefix transformer, 'mlp' for classic one-step
+    transition_type = 'prefix', # 'prefix' for fast-lewm action-prefix transformer, 'mlp' for classic one-step
+    transition_lookahead = 3, # mtp lookahead for the prefix transition - each prefix predicts the next `lookahead` latents
+    plan_lookahead = None # plan-time lookahead (prefix transition) - steps predicted per re-anchored pass; fall back to fewer and redo the prediction until the horizon is covered; defaults to the full horizon in one parallel pass
 ):
     device = Accelerator(cpu = cpu).device
     print(f"using device: {device}", flush = True)
@@ -182,6 +187,7 @@ def main(
         discount_factor = gamma,
         reg_next_state_weight = reg_next_state_weight,
         transition_horizon = cem_horizon,
+        transition_lookahead = transition_lookahead,
         add_reflexive_actor = True
     ).to(device)
 
@@ -209,7 +215,8 @@ def main(
             pop_size = cem_num_samples,
             generations = cem_num_iters,
             elite_frac = cem_elite_frac,
-            commit_k_steps = commit_k_steps
+            commit_k_steps = commit_k_steps,
+            plan_lookahead = plan_lookahead
         )
 
         total_rewards = experience.cumulative_rewards.tolist()
