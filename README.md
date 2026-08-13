@@ -28,6 +28,18 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
 ```
 
 ```bibtex
+@misc{gao2026fastleworldmodel,
+    title   = {Fast LeWorldModel},
+    author  = {Yuntian Gao and Xiangyu Xu},
+    year    = {2026},
+    eprint  = {2606.26217},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2606.26217},
+}
+```
+
+```bibtex
 @misc{teoh2026nextlatentpredictiontransformerslearn,
     title   = {Next-Latent Prediction Transformers Learn Compact World Models},
     author  = {Jayden Teoh and Manan Tomar and Kwangjun Ahn and Edward S. Hu and Tim Pearce and Pratyusha Sharma and Akshay Krishnamurthy and Riashat Islam and Alex Lamb and John Langford},

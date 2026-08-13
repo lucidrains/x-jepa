@@ -166,7 +166,7 @@ def set_module_by_path(model, path, new_mod):
     mod = ft_reduce(getattr, parts, model)
     setattr(mod, last, new_mod)
 
-# film, for perception gating for starters, but eventually will be used for configurator modulation in the jepa diagram
+# film, for perception gating for starters
 
 class FiLM(Module):
     def __init__(self, dim):
@@ -574,6 +574,101 @@ class Transformer(Module):
         next_memories = (past_seq_len + seq_len, next_layer_memories)
 
         return ret, next_memories
+
+# fast-lewm state transition - https://arxiv.org/abs/2606.26217
+# causal transformer over [state latent] [action 1] [action 2] ..., each prefix supervises the future latent, all predicted in parallel
+
+class PrefixStateTransition(Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        dim_state_latent,
+        dim_transition_action_input,
+        dim_out = None,
+        horizon = 8,
+        depth = 2,
+        heads = 4,
+        dim_head = 16,
+        ff_expand_factor = 4.,
+        use_pope = True,
+        use_pseudo_queries = False
+    ):
+        super().__init__()
+        self.dim = dim
+        self.dim_state_latent = dim_state_latent
+        self.dim_transition_action_input = dim_transition_action_input
+        self.dim_out = default(dim_out, dim_state_latent)
+        self.horizon = horizon
+
+        self.to_state_tokens = LinearNoBias(dim_state_latent, dim)
+        self.to_action_tokens = LinearNoBias(dim_transition_action_input, dim)
+
+        self.transformer = Transformer(
+            dim = dim,
+            depth = depth,
+            heads = heads,
+            dim_head = dim_head,
+            ff_expand_factor = ff_expand_factor,
+            causal = True,
+            use_pope = use_pope,
+            use_pseudo_queries = use_pseudo_queries
+        )
+
+        self.to_pred = Sequential(RMSNorm(dim), LinearNoBias(dim, self.dim_out))
+
+    def _build_tokens(
+        self,
+        state_latents, # (..., 1, d) anchor latent token
+        actions        # (..., h, d_a) action prefix tokens
+    ):
+        return cat((self.to_state_tokens(state_latents), self.to_action_tokens(actions)), dim = -2)
+
+    def predict(
+        self,
+        state_latents, # (..., 1, d) anchor latent
+        actions        # (..., h, d_a) candidate action sequence
+    ):
+        # predict all future latents after each action prefix in parallel
+
+        tokens = self._build_tokens(state_latents, actions) # (..., 1 + h, dim)
+        tokens, unpack = pack_with_inverse(tokens, '* t d')
+
+        out = self.transformer(tokens)
+        out = unpack(out, '* t d')
+
+        return self.to_pred(out[..., 1:, :])
+
+    def forward(
+        self,
+        state_latents, # (b, n, d) anchor latent states
+        action_cond,   # (b, n, d_a) actions aligned with the states
+        valid_target_mask = None, # (b, n) validity of each next state latent target
+        horizon = None
+    ):
+        # training - non-overlapping windows (stride = horizon), multi-horizon supervision on every prefix
+
+        batch, seq_len = state_latents.shape[:2]
+
+        h = min(default(horizon, self.horizon), seq_len)
+        num_windows = (seq_len - h) // h + 1
+
+        anchor_windows = state_latents[:, :num_windows * h:h]                              # (b, w, d)
+        action_windows = rearrange(action_cond[:, :num_windows * h], 'b (w h) d_a -> b w h d_a', h = h) # (b, w, h, d_a)
+
+        tokens = self._build_tokens(rearrange(anchor_windows, 'b w d -> b w 1 d'), action_windows) # (b, w, 1 + h, dim)
+        tokens = rearrange(tokens, 'b w t d -> (b w) t d')
+
+        out = self.transformer(tokens)
+        out = rearrange(out, '(b w) t d -> b w t d', b = batch)
+
+        pred = self.to_pred(out[:, :, 1:]) # (b, w, h, d_out)
+
+        mask = None
+        if exists(valid_target_mask):
+            mask = rearrange(valid_target_mask[:, :num_windows * h], 'b (w h) -> b w h', h = h)
+
+        return pred, mask
 
 class BetaDistrReadout(Module):
     def __init__(
@@ -1447,6 +1542,10 @@ class WorldModel(Module):
         plan_state_pred_loss_weight = 1.,
         reg_next_state_weight = 0.,
         reg_next_encoded_weight = 0.,
+        transition_horizon = 8,
+        state_transition_depth = 2,
+        state_transition_heads = 4,
+        state_transition_dim_head = 16,
         temporal_compression = 1
     ):
         super().__init__()
@@ -1459,22 +1558,42 @@ class WorldModel(Module):
 
         dim_model = model.dim
 
-        # state transition MLPs for training & planning
+        # state transition - fast-lewm action-prefix transformer (or an MLP for classic one-step transitions)
+
+        def create_transition(probabilistic):
+            assert exists(dim_state_latent) and exists(dim_transition_action_input)
+            dim_out = dim_state_latent * 2 if probabilistic else dim_state_latent
+
+            if exists(state_transition) and not isinstance(state_transition, PrefixStateTransition):
+                return MLP(dim_state_latent + dim_transition_action_input, *((dim_model * 2,) * 2), dim_out)
+
+            return PrefixStateTransition(
+                dim = dim_model,
+                dim_state_latent = dim_state_latent,
+                dim_transition_action_input = dim_transition_action_input,
+                dim_out = dim_out,
+                horizon = transition_horizon,
+                depth = state_transition_depth,
+                heads = state_transition_heads,
+                dim_head = state_transition_dim_head
+            )
 
         if not exists(state_transition):
-            assert exists(dim_state_latent) and exists(dim_transition_action_input)
-            dim_out = dim_state_latent * 2 if probabilistic_state_transition else dim_state_latent
-            state_transition = MLP(dim_state_latent + dim_transition_action_input, *((dim_model * 2,) * 2), dim_out)
+            state_transition = create_transition(probabilistic_state_transition)
 
         if not exists(state_transition_for_planning):
-            dim_out = dim_state_latent * 2 if probabilistic_plan_state_transition else dim_state_latent
-            state_transition_for_planning = MLP(dim_state_latent + dim_transition_action_input, *((dim_model * 2,) * 2), dim_out)
+            state_transition_for_planning = create_transition(probabilistic_plan_state_transition)
 
         self.state_transition = state_transition
         self.state_transition_for_planning = state_transition_for_planning
 
-        self.ema_state_transition = EMA(state_transition, beta = ema_beta)
-        self.ema_state_transition_for_planning = EMA(state_transition_for_planning, beta = ema_beta)
+        self.transition_is_prefix = isinstance(state_transition, PrefixStateTransition)
+        assert self.transition_is_prefix == isinstance(state_transition_for_planning, PrefixStateTransition), 'state_transition and state_transition_for_planning must be of the same type'
+
+        forward_method_names = ('predict',) if self.transition_is_prefix else tuple()
+
+        self.ema_state_transition = EMA(state_transition, beta = ema_beta, forward_method_names = forward_method_names)
+        self.ema_state_transition_for_planning = EMA(state_transition_for_planning, beta = ema_beta, forward_method_names = forward_method_names)
 
         self.to_next_encoded_state_pred = MLP(dim_state_latent + dim_transition_action_input, *((dim_model * 2,) * 2), dim_model)
 
@@ -1507,6 +1626,48 @@ class WorldModel(Module):
         self.ema_model.update()
         self.ema_state_transition.update()
         self.ema_state_transition_for_planning.update()
+
+    def _compute_transition_loss(
+        self,
+        transition,
+        state_latents,
+        action_cond,
+        next_target_state_latents,
+        valid_target_mask,
+        probabilistic,
+        beta_distr
+    ):
+        # fast-lewm style - transformer over action prefixes, multi-horizon supervision
+
+        if self.transition_is_prefix:
+            pred_logits, mask = transition(state_latents, action_cond, valid_target_mask = valid_target_mask)
+
+            num_windows, h = pred_logits.shape[1], pred_logits.shape[2]
+
+            anchor_windows = rearrange(state_latents[:, :num_windows * h:h], 'b w d -> b w 1 d')
+            target_windows = rearrange(next_target_state_latents[:, :num_windows * h], 'b (w h) d -> b w h d', h = h)
+
+            if probabilistic:
+                loss = beta_distr(pred_logits, target = target_windows.detach()).sum(dim = -1)
+                pred = beta_distr(pred_logits)
+            else:
+                pred = anchor_windows + pred_logits
+                loss = reduce(F.smooth_l1_loss(pred, target_windows.detach(), reduction = 'none'), 'b w h d -> b w h', 'mean')
+
+            return loss, pred, mask
+
+        # classic one-step MLP transition
+
+        if probabilistic:
+            pred_logits = transition((state_latents, action_cond))
+            loss = beta_distr(pred_logits, target = next_target_state_latents.detach()).sum(dim = -1)
+            pred = beta_distr(pred_logits)
+        else:
+            pred_residual = transition((state_latents, action_cond))
+            pred = state_latents + pred_residual
+            loss = F.smooth_l1_loss(pred, next_target_state_latents.detach(), reduction = 'none')
+
+        return loss, pred, valid_target_mask
 
     def forward(
         self,
@@ -1579,24 +1740,25 @@ class WorldModel(Module):
 
         action_cond = action_cond[:, :state_latents.shape[1]]
 
-        if self.probabilistic_state_transition:
-            next_state_pred_logits = self.state_transition((state_latents, action_cond))
-            neg_log_probs = self.state_transition_beta_distr(next_state_pred_logits, target = next_target_state_latents.detach())
-            state_transition_loss = neg_log_probs.sum(dim = -1)
-            next_state_pred = self.state_transition_beta_distr(next_state_pred_logits)
-        else:
-            pred_residual = self.state_transition((state_latents, action_cond))
-            next_state_pred = state_latents + pred_residual
-            state_transition_loss = F.smooth_l1_loss(next_state_pred, next_target_state_latents.detach(), reduction = 'none')
+        state_transition_loss, next_state_pred, transition_mask = self._compute_transition_loss(
+            self.state_transition,
+            state_latents,
+            action_cond,
+            next_target_state_latents,
+            valid_target_mask,
+            self.probabilistic_state_transition,
+            getattr(self, 'state_transition_beta_distr', None)
+        )
 
-        if self.probabilistic_plan_state_transition:
-            plan_next_state_pred_logits = self.state_transition_for_planning((state_latents, action_cond))
-            plan_neg_log_probs = self.plan_state_transition_beta_distr(plan_next_state_pred_logits, target = next_target_state_latents.detach())
-            plan_state_transition_loss = plan_neg_log_probs.sum(dim = -1)
-        else:
-            plan_pred_residual = self.state_transition_for_planning((state_latents, action_cond))
-            plan_next_state_pred = state_latents + plan_pred_residual
-            plan_state_transition_loss = F.smooth_l1_loss(plan_next_state_pred, next_target_state_latents.detach(), reduction = 'none')
+        plan_state_transition_loss, _, plan_transition_mask = self._compute_transition_loss(
+            self.state_transition_for_planning,
+            state_latents,
+            action_cond,
+            next_target_state_latents,
+            valid_target_mask,
+            self.probabilistic_plan_state_transition,
+            getattr(self, 'plan_state_transition_beta_distr', None)
+        )
 
         pred_next_encoded_state = self.to_next_encoded_state_pred((state_latents, action_cond))
 
@@ -1606,12 +1768,12 @@ class WorldModel(Module):
 
         if return_per_sample_loss:
             loss_dim = tuple(range(1, state_transition_loss.ndim))
-            next_state_latent_pred_loss = masked_mean(state_transition_loss, valid_target_mask, dim = loss_dim, average_mode = masked_loss_average_mode)
-            plan_state_pred_loss = masked_mean(plan_state_transition_loss, valid_target_mask, dim = loss_dim, average_mode = masked_loss_average_mode)
+            next_state_latent_pred_loss = masked_mean(state_transition_loss, transition_mask, dim = loss_dim, average_mode = masked_loss_average_mode)
+            plan_state_pred_loss = masked_mean(plan_state_transition_loss, plan_transition_mask, dim = loss_dim, average_mode = masked_loss_average_mode)
             next_encoded_state_pred_loss = masked_mean(raw_next_encoded_loss, valid_target_mask, dim = loss_dim, average_mode = masked_loss_average_mode)
         else:
-            next_state_latent_pred_loss = masked_mean(state_transition_loss, valid_target_mask, average_mode = masked_loss_average_mode)
-            plan_state_pred_loss = masked_mean(plan_state_transition_loss, valid_target_mask, average_mode = masked_loss_average_mode)
+            next_state_latent_pred_loss = masked_mean(state_transition_loss, transition_mask, average_mode = masked_loss_average_mode)
+            plan_state_pred_loss = masked_mean(plan_state_transition_loss, plan_transition_mask, average_mode = masked_loss_average_mode)
             next_encoded_state_pred_loss = masked_mean(raw_next_encoded_loss, valid_target_mask, average_mode = masked_loss_average_mode)
 
         reg_next_state_loss = self.zero
@@ -1619,7 +1781,8 @@ class WorldModel(Module):
 
         if exists(reg):
             if self.reg_next_state_weight > 0.:
-                reg_next_state_loss = reg(next_state_pred)
+                reg_target = next_state_pred[:, :, :1] if self.transition_is_prefix else next_state_pred
+                reg_next_state_loss = reg(reg_target)
 
             if self.reg_next_encoded_weight > 0.:
                 reg_next_encoded_loss = reg(pred_next_encoded_state)
@@ -1713,6 +1876,10 @@ class Agent(Module):
         probabilistic_state_transition = False,
         probabilistic_plan_state_transition = False,
         state_transition_eps = 1e-5,
+        transition_horizon = 8,
+        state_transition_depth = 2,
+        state_transition_heads = 4,
+        state_transition_dim_head = 16,
         reg: Module | None = None,
         reg_loss_kwargs: dict | None = None,
         state_linear_rnn_depth = 1,
@@ -1759,8 +1926,7 @@ class Agent(Module):
                 dim_head = model.dim_head
             )
 
-        # handle state encoders
-        # which could have multiple states, and each could have multiple views (ie. eyes, ears)
+        # handle state encoders, possibly multiple states and views
 
         if not isinstance(state_encoder, (list, tuple, ModuleList)):
             state_encoder = [state_encoder]
@@ -1803,7 +1969,7 @@ class Agent(Module):
         self.state_linear_rnn = minGRUBlocks(dim = dim, depth = state_linear_rnn_depth)
         self.action_linear_rnn = minGRUBlocks(dim = dim, depth = action_linear_rnn_depth)
 
-        # the learnt state transition that is popularly used for learning the so called world model, but may not be the only prediction needed
+        # the learnt state transition for the world model
 
         # different types of action spaces for the transition
 
@@ -1874,6 +2040,10 @@ class Agent(Module):
                     plan_state_pred_loss_weight = plan_state_pred_loss_weight,
                     reg_next_state_weight = reg_next_state_weight,
                     reg_next_encoded_weight = reg_next_encoded_weight,
+                    transition_horizon = transition_horizon,
+                    state_transition_depth = state_transition_depth,
+                    state_transition_heads = state_transition_heads,
+                    state_transition_dim_head = state_transition_dim_head,
                     temporal_compression = temporal_compressions[idx if idx < len(temporal_compressions) else 0]
                 ) for idx in range(num_world_models)
             ]
@@ -2037,7 +2207,7 @@ class Agent(Module):
         assert len(intrinsic_frac_gradient) == len(self.intrinsics)
         self.intrinsic_frac_gradients = ModuleList([FracGradient(frac) for frac in intrinsic_frac_gradient])
 
-        # regularizer - defaults to sigreg, but any drop-in (ex. visreg) can be passed in
+        # regularizer - defaults to sigreg, any drop-in can be passed in
 
         self.reg = default(reg, SigReg(**default(reg_loss_kwargs, dict())))
 
@@ -2463,7 +2633,13 @@ class Agent(Module):
         # helper for advancing state
 
         def advance_state(state, action, return_entropy = False):
-            logits = world_model.ema_state_transition_for_planning((state, action))
+            transition = world_model.ema_state_transition_for_planning
+
+            if world_model.transition_is_prefix:
+                logits = transition.predict(rearrange(state, '... d -> ... 1 d'), rearrange(action, '... d -> ... 1 d'))
+                logits = rearrange(logits, '... 1 d -> ... d')
+            else:
+                logits = transition((state, action))
 
             if world_model.probabilistic_plan_state_transition:
                 return world_model.plan_state_transition_beta_distr(logits, sample = True, return_entropy = return_entropy)
@@ -2544,9 +2720,7 @@ class Agent(Module):
         # helper for evaluating actions
 
         def evaluate_actions(eval_actions):
-            # the action condition into the step
-
-            # the state transition for planning could take raw actions or action latents depending on the transition action space
+            # transition action space could be raw actions or action latents
 
             actions_cond = eval_actions
 
@@ -2557,7 +2731,7 @@ class Agent(Module):
                 actions_cond, unpack = pack_with_inverse(actions_cond, '* h d')
                 actions_cond = self.encode_actions(actions_cond)
 
-                # if using actions with global context of past actions, pass through linear rnn with previous memories
+                # global action latents pass through linear rnn with past memories
 
                 if self.transition_action_space == 'global':
                     actions_cond = self.action_linear_rnn(actions_cond, memories = past_rnn_memories)
@@ -2565,48 +2739,70 @@ class Agent(Module):
                 actions_cond = self.to_action_latent(actions_cond)
                 actions_cond = unpack(actions_cond)
 
-            # accumulating predictions across horizon
+            pred_state_entropies = None
 
-            pred_state_latents = []
-            pred_next_encoded_states = []
-            pred_values = []
-            pred_state_entropies = [] if world_model.probabilistic_plan_state_transition else None
+            if world_model.transition_is_prefix:
+                # fast-lewm - all future latents predicted in a single parallel pass
 
-            # step through the learnt world model
+                anchor_latents = rearrange(state_latents, 'b p d -> b p 1 d')
+                pred_residuals = world_model.ema_state_transition_for_planning.predict(anchor_latents, actions_cond) # (b, p, h, d)
 
-            step_state_latents = state_latents
+                if world_model.probabilistic_plan_state_transition:
+                    pred_state_latents, pred_state_entropies = world_model.plan_state_transition_beta_distr(pred_residuals, sample = True, return_entropy = True)
+                else:
+                    pred_state_latents = anchor_latents + pred_residuals
 
-            for step_action_cond in actions_cond.unbind(dim = 2):
+                    if clamp_state_latent_to_range and self.has_state_latent_clamp:
+                        pred_state_latents.clamp_(-self.state_latent_clamp_value, self.state_latent_clamp_value)
 
-                # encoded state for goal
+                # encoded-state predictions are conditioned on the state before each step, so shift latents by one
 
-                pred_next_encoded_state = world_model.to_next_encoded_state_pred((step_state_latents, step_action_cond))
+                prev_state_latents = cat((anchor_latents, pred_state_latents[:, :, :-1]), dim = -2)
+                pred_next_encoded_states = world_model.to_next_encoded_state_pred((prev_state_latents, actions_cond))
+                pred_values = self.value_network(pred_next_encoded_states, pred_state_latents, discount = discount_factor, risk = risk_factor)
+            else:
+                # classic one-step autoregressive rollout
 
-                # state transition
+                pred_state_latents = []
+                pred_next_encoded_states = []
+                pred_values = []
+                pred_state_entropies = [] if world_model.probabilistic_plan_state_transition else None
 
-                step_state_latents, step_entropy = advance_state(step_state_latents, step_action_cond, return_entropy = True)
+                # step through the learnt world model
 
-                if exists(step_entropy):
-                    pred_state_entropies.append(step_entropy)
+                step_state_latents = state_latents
 
-                pred_state_latents.append(step_state_latents)
+                for step_action_cond in actions_cond.unbind(dim = 2):
 
-                pred_next_encoded_states.append(pred_next_encoded_state)
+                    # encoded state for goal
 
-                step_pred_value = self.value_network(pred_next_encoded_state, step_state_latents, discount = discount_factor, risk = risk_factor)
-                pred_values.append(step_pred_value)
+                    pred_next_encoded_state = world_model.to_next_encoded_state_pred((step_state_latents, step_action_cond))
 
-            pred_state_latents = rearrange(pred_state_latents, 'h b p d -> b p h d')
-            if exists(pred_state_entropies):
-                pred_state_entropies = rearrange(pred_state_entropies, 'h b p d -> b p h d')
+                    # state transition
 
-            pred_next_encoded_states = rearrange(pred_next_encoded_states, 'h b p d -> b p h d')
-            pred_values = rearrange(pred_values, 'h b p -> b p h')
+                    step_state_latents, step_entropy = advance_state(step_state_latents, step_action_cond, return_entropy = True)
+
+                    if exists(step_entropy):
+                        pred_state_entropies.append(step_entropy)
+
+                    pred_state_latents.append(step_state_latents)
+
+                    pred_next_encoded_states.append(pred_next_encoded_state)
+
+                    step_pred_value = self.value_network(pred_next_encoded_state, step_state_latents, discount = discount_factor, risk = risk_factor)
+                    pred_values.append(step_pred_value)
+
+                pred_state_latents = rearrange(pred_state_latents, 'h b p d -> b p h d')
+                if exists(pred_state_entropies):
+                    pred_state_entropies = rearrange(pred_state_entropies, 'h b p d -> b p h d')
+
+                pred_next_encoded_states = rearrange(pred_next_encoded_states, 'h b p d -> b p h d')
+                pred_values = rearrange(pred_values, 'h b p -> b p h')
 
             # evaluate
 
             if exists(fitness_fn):
-                # simple introspect and dependency inject into fitness function
+                # introspect fitness fn params to dependency inject
 
                 kwargs = dict(
                     pred_state_latents = pred_state_latents,
@@ -2957,7 +3153,12 @@ class Agent(Module):
 
             is_done |= terminated | truncated
 
-            if is_done.any():
+            # invalidate the plan only when an env newly becomes done - a frozen env returns terminated = True
+            # on every step, which would otherwise force a full replan of the batch each step after the first death
+
+            newly_done = (terminated | truncated) & ~is_done
+
+            if newly_done.any():
                 action_queue = []
                 pred_state_latent_queue = []
 
@@ -3004,10 +3205,13 @@ class Agent(Module):
                 state_latents = self.to_state_latent(self.encode_states(self.ema_state_encoder, states)[0])
                 action_cond = actions if self.is_transition_action_space_raw else self.to_action_latent(actions)
 
-                distr = world_model.state_transition_beta_distr(
-                    world_model.state_transition((state_latents, action_cond)),
-                    return_distr = True
-                )
+                if world_model.transition_is_prefix:
+                    transition_logits, _ = world_model.state_transition(state_latents, action_cond, horizon = 1)
+                    transition_logits = rearrange(transition_logits, 'b n 1 d -> b n d')
+                else:
+                    transition_logits = world_model.state_transition((state_latents, action_cond))
+
+                distr = world_model.state_transition_beta_distr(transition_logits, return_distr = True)
 
                 transition_entropy = reduce(distr.entropy().exp(), 'b n d -> b n', 'sum')
                 risk_reward = cast_tensor(risk_factor) * transition_entropy * risk_entropy_bonus_weight

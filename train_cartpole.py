@@ -13,10 +13,15 @@
 #
 # continuous cartpole, trained purely with world model planning (CEM in the latent space, no RL)
 #
+# state transition can be the fast-lewm action-prefix transformer (https://arxiv.org/abs/2606.26217) -
+# tokens [state latent] [action 1] [action 2] ... predict all future latents after each action prefix
+# in parallel - or a classic one-step MLP transition (--transition_type mlp)
+#
 # default run: 6 vectorized envs (one per seed), 20 episodes, converges (avg reward >= 100)
 # within ~13-15 episodes; verify with:
 #
 #   python train_cartpole.py
+#   python train_cartpole.py --transition_type mlp
 #
 # overridable via fire, e.g.:
 #   python train_cartpole.py --num_envs 16 --num_episodes 30 --cpu true
@@ -43,12 +48,8 @@ from x_jepa.utils import store_experience_in_replay_buffer, divisible_by
 from env_cartpole import BatchedEnv
 
 # fitness - reach and stay at the upright state (goal = all zeros)
-#
-# distance is measured between the predicted next-step encoded states and the encoded goal.
-# both live in the same ema-encoder space, so the fitness is well calibrated for CEM.
-# (the alternative of comparing CEM rollout latents to a context-free goal latent is
-#  miscalibrated - rollout latents are contextualized, the goal latent is not - which
-#  produces a flat fitness landscape and coin-flip planning)
+# distance between predicted next-step encoded states and the encoded goal, both in the same
+# ema-encoder space, so the fitness is well calibrated for CEM
 
 def make_fitness():
     def fitness_fn(pred_next_encoded_states, encoded_goal):
@@ -66,7 +67,6 @@ def make_fitness():
 
 def train_wm_epoch(wm, buffer, optimizer, device, batch_size, epochs_per_train, grad_accum_steps, train_window = 64, batches_per_epoch = 6):
     # fixed-length window sampling - keeps training cost bounded regardless of episode length
-    # (full-sequence training on long episodes is O(T^2) in the causal attention and is very slow on mps)
 
     dl = buffer.dataloader(
         batch_size = batch_size,
@@ -136,7 +136,8 @@ def main(
     tag = '',
     project_name = 'x-jepa-cartpole',
     use_wandb = False,
-    cpu = False
+    cpu = False,
+    transition_type = 'prefix' # 'prefix' for fast-lewm action-prefix transformer, 'mlp' for classic one-step
 ):
     device = Accelerator(cpu = cpu).device
     print(f"using device: {device}", flush = True)
@@ -160,10 +161,18 @@ def main(
     state_encoder = MLP(state_dim, *((hidden_dim,) * (depth - 1)), dim)
     action_encoder = MLP(action_dim, hidden_dim, dim)
 
+    assert transition_type in ('prefix', 'mlp'), f'unknown transition_type: {transition_type}'
+
+    state_transition = None
+
+    if transition_type == 'mlp':
+        state_transition = MLP(dim + action_dim, *((dim * 2,) * 2), dim)
+
     wm = Agent(
         state_encoder = state_encoder,
         action_encoder = action_encoder,
         model = Transformer(dim = dim, depth = depth, causal = True),
+        state_transition = state_transition,
         dim_action = action_dim,
         continuous_actions = True,
         transition_action_space = 'raw',
@@ -172,6 +181,7 @@ def main(
         value_loss_weight = 1.0,
         discount_factor = gamma,
         reg_next_state_weight = reg_next_state_weight,
+        transition_horizon = cem_horizon,
         add_reflexive_actor = True
     ).to(device)
 
