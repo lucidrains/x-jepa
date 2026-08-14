@@ -3327,12 +3327,12 @@ class Agent(Module):
             if is_last_step:
                 truncated = truncated | ~is_done
 
-            is_done |= terminated | truncated
-
             # invalidate the plan only when an env newly becomes done - a frozen env returns terminated = True
             # on every step, which would otherwise force a full replan of the batch each step after the first death
 
             newly_done = (terminated | truncated) & ~is_done
+
+            is_done |= terminated | truncated
 
             if newly_done.any():
                 action_queue = []

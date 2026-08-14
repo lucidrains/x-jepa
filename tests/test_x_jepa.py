@@ -671,7 +671,15 @@ def test_interact_with_environment_commit_k_steps():
 
     world_model.eval()
 
-    env = gym.make('CartPole-v1')
+    class TerminatingOnFirstStep(gym.Wrapper):
+        def step(self, action):
+            obs, reward, terminated, truncated, info = self.env.step(action)
+            return obs, reward, True, truncated, info
+
+    env = gym.vector.SyncVectorEnv([
+        lambda: TerminatingOnFirstStep(gym.make('CartPole-v1')),
+        lambda: gym.make('CartPole-v1')
+    ])
 
     plan_count = 0
     orig_plan = world_model.plan
@@ -694,8 +702,9 @@ def test_interact_with_environment_commit_k_steps():
     )
 
     assert experience.states.shape[1] == 4
-    # With commit_k_steps = 2 for 4 steps, plan should be called exactly 2 times (steps 0, 2)
-    assert plan_count == 2
+    # With commit_k_steps = 2 for 4 steps, plan should be called exactly 3 times (steps 0 and 2,
+    # plus a replan at step 1 when the first env terminates mid-plan and invalidates the queue)
+    assert plan_count == 3
 
 
 @param('complex_sensory', (False, True))
