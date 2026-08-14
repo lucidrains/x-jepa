@@ -801,6 +801,7 @@ class BetaMeanConcentrationReadout(Module):
         self,
         source_range: tuple[float, float] = (0., 1.),
         init_conc = 10.,
+        min_conc = 2.,
         conc_cutoff = 100.,
         conc_nudge_weight = 0.00025,
         eps = 1e-5
@@ -808,6 +809,7 @@ class BetaMeanConcentrationReadout(Module):
         super().__init__()
         self.source_range = source_range
         self.init_conc = init_conc
+        self.min_conc = min_conc
         self.conc_cutoff = conc_cutoff
         self.conc_nudge_weight = conc_nudge_weight
         self.eps = eps
@@ -816,7 +818,7 @@ class BetaMeanConcentrationReadout(Module):
         self,
         raw_conc
     ):
-        return F.softplus(raw_conc + self.init_conc) + 2.
+        return F.softplus(raw_conc + self.init_conc) + self.min_conc
 
     def compute_raw_loss(
         self,
@@ -859,20 +861,26 @@ class BetaMeanConcentrationReadout(Module):
 
         raw_mean, raw_conc = rearrange(x, '... (mean_conc d) -> mean_conc ... d', mean_conc = 2)
 
-        # mean mapped to (0, 1), concentration positive with a floor of 2
+        # mean mapped to (0, 1), concentration positive with a floor of min_conc
 
-        mean = raw_mean.sigmoid()
+        mean = raw_mean.sigmoid().clamp(min = self.eps, max = 1. - self.eps)
         conc = self.concentration(raw_conc)
 
         # maybe apply temperature
 
         if temperature != 1.:
-            conc = (conc - 2.) / temperature + 2.
+            conc = (conc - self.min_conc) / temperature + self.min_conc
+
+        # concentration floor for unimodality (alpha > 1 and beta > 1), keeping the mean exact
+        # alpha = mean * conc > 1 and beta = (1 - mean) * conc > 1 need conc > 1 / min(mean, 1 - mean)
+
+        min_mean = torch.minimum(mean, 1. - mean).clamp(min = self.eps)
+        conc = conc + 1. / min_mean
 
         # convert to beta distribution with exact mean = mean
 
-        alpha = mean * conc + self.eps
-        beta = (1. - mean) * conc + self.eps
+        alpha = mean * conc
+        beta = (1. - mean) * conc
 
         distr = Beta(alpha, beta)
 
