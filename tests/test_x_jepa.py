@@ -2201,6 +2201,7 @@ def test_interact_with_env_with_skills(is_vectorized_env, diversity_skill_loss_w
     class MultimodalMockEnv:
         def __init__(self):
             self.step_count = 0
+            self.is_vector = True
 
         def reset(self):
             self.step_count = 0
@@ -2209,7 +2210,7 @@ def test_interact_with_env_with_skills(is_vectorized_env, diversity_skill_loss_w
         def step(self, action):
             self.step_count += 1
             done = self.step_count >= 5
-            return (torch.randn(1, 3, 32, 32), torch.randn(1, 4)), torch.tensor([1.0]), done, False, {}
+            return (torch.randn(1, 3, 32, 32), torch.randn(1, 4)), torch.tensor([1.0]), torch.tensor([done]), torch.tensor([False]), {}
 
     multimodal_agent = Agent(
         model = model,

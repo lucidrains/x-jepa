@@ -46,9 +46,9 @@ from torch_einops_utils import (
 from torch_einops_utils.device import module_device
 
 from PoPE_pytorch import PoPE, apply_pope_to_qk
+from env_ssl_wrapper import compose_env
 
-from x_jepa.utils import EnvWrapper, Experience, masked_mean, accepts_kwarg, filter_kwargs_for_fn
-
+from x_jepa.utils import Experience, masked_mean, accepts_kwarg, filter_kwargs_for_fn
 from x_jepa.regularizers import SigReg, uniform_wasserstein_loss, temporal_straightening_loss
 from x_jepa.min_gru import minGRUBlocks
 from x_jepa.goals import GoalGenerator
@@ -3204,7 +3204,11 @@ class Agent(Module):
             assert divisible_by(commit_k_steps, temporal_compression), f'commit_k_steps ({commit_k_steps}) must be a multiple of temporal compression ({temporal_compression}) when using temporal compressed world model'
             horizon = round_up(horizon, temporal_compression)
 
-        env = EnvWrapper(env, return_cpu = return_cpu, cast_double_to_float = cast_double_to_float)
+        env = compose_env(
+            env,
+            ('tensor', dict(device = 'cpu' if return_cpu else self.device, cast_obs_to_float = cast_double_to_float)),
+            'auto_batch'
+        )
 
         states, actions, actor_log_probs, rewards, terminateds, truncateds, infos = [], [], [], [], [], [], []
 

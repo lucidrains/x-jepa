@@ -1,14 +1,10 @@
 from typing import NamedTuple, Any
 import inspect
 
-import numpy as np
-
 import torch
-from torch import tensor, is_tensor, Tensor
-from torch.utils._pytree import tree_map
+from torch import is_tensor, Tensor
 
-from einops import rearrange
-from torch_einops_utils import tree_map_tensor, masked_mean as torch_einops_masked_mean
+from torch_einops_utils import masked_mean as torch_einops_masked_mean
 
 # constants
 
@@ -64,121 +60,6 @@ def masked_mean(tensor, mask = None, dim = None, average_mode = 'timestep'):
     seq_dim = dim if exists(dim) else 1
     trajectory_means = torch_einops_masked_mean(tensor, mask = mask, dim = seq_dim)
     return trajectory_means.mean()
-
-def is_vectorized(env):
-    if getattr(env, 'is_vector', False):
-        return True
-
-    curr = env
-    while exists(curr):
-        if isinstance(curr, EnvWrapper):
-            return True
-        curr = getattr(curr, 'env', None)
-
-    if hasattr(env, 'num_envs') and getattr(env, 'num_envs', 0) > 0:
-        return True
-
-    try:
-        from gymnasium.vector import VectorEnv
-        return isinstance(getattr(env, 'unwrapped', env), VectorEnv)
-    except ImportError:
-        return False
-
-def to_torch_and_batch(x, is_vector, device = None, cast_double_to_float = True):
-    def transform(t):
-        if isinstance(t, np.ndarray):
-            t = torch.from_numpy(t)
-        elif isinstance(t, (int, float, bool, np.number, np.bool_)):
-            t = tensor(t)
-
-        if not is_tensor(t):
-            return t
-
-        if cast_double_to_float and t.dtype == torch.float64:
-            t = t.float()
-
-        if not is_vector:
-            # single non-vector env: scalars (rewards/dones) -> 1D (1,), multi-element (obs) -> prepended batch (1, ...)
-            if t.numel() == 1:
-                t = t.reshape(1)
-            else:
-                t = rearrange(t, '... -> 1 ...')
-
-        if exists(device):
-            t = t.to(device)
-
-        return t
-
-    return tree_map(transform, x)
-
-def get_first_tensor_device(x):
-    devices = set()
-    tree_map_tensor(lambda t: devices.add(t.device), x)
-    return next(iter(devices), None)
-
-def to_numpy_and_unbatch(x, is_vector):
-    def transform(t):
-        if not is_vector:
-            t = rearrange(t, '1 ... -> ...')
-
-        return t.detach().cpu().numpy()
-
-    return tree_map_tensor(transform, x)
-
-# classes
-
-class EnvWrapper:
-    def __init__(
-        self,
-        env,
-        return_cpu = False,
-        cast_double_to_float = True
-    ):
-        assert not isinstance(env, EnvWrapper), 'EnvWrapper should only be applied once'
-
-        self.env = env
-        self.is_vector = is_vectorized(env)
-        self.return_cpu = return_cpu
-        self.cast_double_to_float = cast_double_to_float
-
-    def __getattr__(self, name):
-        if name.startswith('_'):
-            raise AttributeError(f"attempted to get missing private attribute '{name}'")
-        return getattr(self.env, name)
-
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        return to_torch_and_batch(obs, self.is_vector, cast_double_to_float = self.cast_double_to_float), info
-
-    def step(self, action):
-
-        # automatically unbatch and convert to numpy for the underlying environment
-
-        action_device = get_first_tensor_device(action) if not self.return_cpu else None
-        action = to_numpy_and_unbatch(action, self.is_vector)
-
-        out = self.env.step(action)
-
-        # auto-detect whether environment returns 4 or 5 items
-
-        if len(out) == 4:
-            obs, reward, terminated, info = out
-            truncated = np.zeros_like(terminated) if isinstance(terminated, np.ndarray) else False
-        elif len(out) == 5:
-            obs, reward, terminated, truncated, info = out
-        else:
-            raise ValueError(f"expected env.step to return 4 or 5 items, got {len(out)}")
-
-        # automatically batch and cast back to tensor on correct device
-
-        obs, reward, terminated, truncated = to_torch_and_batch(
-            (obs, reward, terminated, truncated),
-            self.is_vector,
-            action_device,
-            cast_double_to_float = self.cast_double_to_float
-        )
-
-        return obs, reward, terminated, truncated, info
 
 # replay buffer
 
