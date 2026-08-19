@@ -65,6 +65,8 @@ WorldModelLoss = namedtuple('WorldModelLoss', [
     'next_state_latent_pred',
     'plan_state_pred',
     'next_encoded_state_pred',
+    'reward_pred',
+    'discount_pred',
     'reg_next_state',
     'reg_next_encoded'
 ])
@@ -74,6 +76,8 @@ Losses = namedtuple('Losses', [
     'next_state_latent_pred',
     'plan_state_pred',
     'next_encoded_state_pred',
+    'reward_pred',
+    'discount_pred',
     'reg_next_state',
     'reg_next_encoded',
     'action_recon',
@@ -1563,16 +1567,18 @@ def extract_temporal_compressed_lanes(
     actions,
     mask = None,
     returns = None,
+    rewards = None,
+    dones = None,
     temporal_compression = 1
 ):
     if temporal_compression <= 1:
-        return states, actions, mask, returns
+        return states, actions, mask, returns, rewards, dones
 
     state_len = first_tensor(states).shape[1]
     compressed_len, stop_offset = compressed_lane_bounds(state_len, temporal_compression)
 
     if compressed_len <= 0:
-        return states, actions, mask, returns
+        return states, actions, mask, returns, rewards, dones
 
     states = slice_state_seq(states, start = 0, stop = stop_offset + 1, step = temporal_compression)
     actions = pool_actions(actions.narrow(1, 0, stop_offset), temporal_compression = temporal_compression)
@@ -1586,7 +1592,17 @@ def extract_temporal_compressed_lanes(
         elif isinstance(returns, (tuple, list)):
             returns = tuple(r.narrow(1, 0, stop_offset + 1)[:, ::temporal_compression] if (is_tensor(r) and r.ndim >= 2) else r for r in returns)
 
-    return states, actions, mask, returns
+    if exists(rewards) and is_tensor(rewards) and rewards.ndim >= 2:
+        # the chunk action covers `temporal_compression` raw steps - sum their rewards per chunk
+
+        rewards = reduce(rewards.narrow(1, 0, stop_offset), 'b (t n) -> b t', 'sum', n = temporal_compression)
+
+    if exists(dones) and is_tensor(dones) and dones.ndim >= 2:
+        # the chunk transition is done if its last raw step is done
+
+        dones = dones[:, temporal_compression - 1:stop_offset:temporal_compression]
+
+    return states, actions, mask, returns, rewards, dones
 
 # world model module
 
@@ -1605,6 +1621,8 @@ class WorldModel(Module):
         state_transition_eps = 1e-5,
         next_encoded_state_pred_loss_weight = 1.,
         plan_state_pred_loss_weight = 1.,
+        reward_pred_loss_weight = 1.,
+        discount_pred_loss_weight = 1.,
         reg_next_state_weight = 0.,
         reg_next_encoded_weight = 0.,
         transition_horizon = 8,
@@ -1665,6 +1683,12 @@ class WorldModel(Module):
 
         self.to_next_encoded_state_pred = MLP(dim_state_latent + dim_transition_action_input, *((dim_model * 2,) * 2), dim_model)
 
+        # reward and continuation heads - per-transition scalar reward and continuation probability
+        # (Hafner/Dreamer, BCE vs 1 - done), for rollout-return fitness with termination gating
+
+        self.to_reward_pred = MLP(dim_state_latent + dim_transition_action_input, *((dim_model * 2,) * 2), 1)
+        self.to_discount_pred = MLP(dim_state_latent + dim_transition_action_input, *((dim_model * 2,) * 2), 1)
+
         # probabilistic readouts
 
         self.probabilistic_state_transition = probabilistic_state_transition
@@ -1680,6 +1704,8 @@ class WorldModel(Module):
 
         self.next_encoded_state_pred_loss_weight = next_encoded_state_pred_loss_weight
         self.plan_state_pred_loss_weight = plan_state_pred_loss_weight
+        self.reward_pred_loss_weight = reward_pred_loss_weight
+        self.discount_pred_loss_weight = discount_pred_loss_weight
         self.reg_next_state_weight = reg_next_state_weight
         self.reg_next_encoded_weight = reg_next_encoded_weight
 
@@ -1769,7 +1795,9 @@ class WorldModel(Module):
         return_per_sample_loss: bool = False,
         prepend_embeds = None,
         excise_prepend_embeds = False,
-        transition_action_cond = None
+        transition_action_cond = None,
+        rewards = None,
+        dones = None
     ):
         batch = tokens.shape[0]
 
@@ -1804,7 +1832,7 @@ class WorldModel(Module):
 
         if state_embeds_full.shape[1] < 2:
             wm_loss_breakdown = WorldModelLoss(
-                self.zero, self.zero, self.zero, self.zero, self.zero
+                self.zero, self.zero, self.zero, self.zero, self.zero, self.zero, self.zero
             )
             outputs = dict(
                 embeds = embeds,
@@ -1860,6 +1888,22 @@ class WorldModel(Module):
             plan_state_pred_loss = masked_mean(plan_state_transition_loss, plan_transition_mask, average_mode = masked_loss_average_mode)
             next_encoded_state_pred_loss = masked_mean(raw_next_encoded_loss, valid_target_mask, average_mode = masked_loss_average_mode)
 
+        # reward and continuation heads - smooth-l1 onto the reward of each transition, BCE onto
+        # 1 - done for the continuation (Hafner/Dreamer)
+
+        reward_pred_loss = self.zero
+        discount_pred_loss = self.zero
+
+        if exists(rewards):
+            pred_rewards = rearrange(self.to_reward_pred((state_latents, action_cond)), '... 1 -> ...')
+            target_rewards = rewards[:, :state_latents.shape[1]].detach()
+            reward_pred_loss = masked_mean(F.smooth_l1_loss(pred_rewards, target_rewards, reduction = 'none'), valid_target_mask, average_mode = masked_loss_average_mode)
+
+        if exists(dones):
+            pred_discount_logits = rearrange(self.to_discount_pred((state_latents, action_cond)), '... 1 -> ...')
+            target_continuation = (1. - dones.float())[:, :state_latents.shape[1]].detach()
+            discount_pred_loss = masked_mean(F.binary_cross_entropy_with_logits(pred_discount_logits, target_continuation, reduction = 'none'), valid_target_mask, average_mode = masked_loss_average_mode)
+
         reg_next_state_loss = self.zero
         reg_next_encoded_loss = self.zero
 
@@ -1876,6 +1920,8 @@ class WorldModel(Module):
             next_state_latent_pred_loss +
             plan_state_pred_loss * self.plan_state_pred_loss_weight +
             next_encoded_state_pred_loss * self.next_encoded_state_pred_loss_weight +
+            reward_pred_loss * self.reward_pred_loss_weight +
+            discount_pred_loss * self.discount_pred_loss_weight +
             reg_next_state_loss * self.reg_next_state_weight +
             reg_next_encoded_loss * self.reg_next_encoded_weight
         )
@@ -1884,6 +1930,8 @@ class WorldModel(Module):
             next_state_latent_pred_loss,
             plan_state_pred_loss,
             next_encoded_state_pred_loss,
+            reward_pred_loss,
+            discount_pred_loss,
             reg_next_state_loss,
             reg_next_encoded_loss
         )
@@ -1943,6 +1991,8 @@ class Agent(Module):
         action_recon_loss_weight = 1.,
         next_encoded_state_pred_loss_weight = 1.,
         plan_state_pred_loss_weight = 1.,
+        reward_pred_loss_weight = 1.,
+        discount_pred_loss_weight = 1.,
         value_loss_weight = 1.,
         masked_loss_average_mode = 'timestep',
         discount_factor = 0.99,
@@ -2124,6 +2174,8 @@ class Agent(Module):
                     state_transition_eps = state_transition_eps,
                     next_encoded_state_pred_loss_weight = next_encoded_state_pred_loss_weight,
                     plan_state_pred_loss_weight = plan_state_pred_loss_weight,
+                    reward_pred_loss_weight = reward_pred_loss_weight,
+                    discount_pred_loss_weight = discount_pred_loss_weight,
                     reg_next_state_weight = reg_next_state_weight,
                     reg_next_encoded_weight = reg_next_encoded_weight,
                     transition_horizon = transition_horizon,
@@ -2617,6 +2669,9 @@ class Agent(Module):
         is_search_space_raw_action = search_space == 'raw'
         dim_action = self.dim_action if is_search_space_raw_action else self.dim_transition_action_input
 
+        has_reward_pred = exists(getattr(world_model, 'to_reward_pred', None))
+        has_discount_pred = exists(getattr(world_model, 'to_discount_pred', None))
+
         has_cem_temperature = cem_temperature > 0.
         has_gradient_steps = gradient_steps > 0
 
@@ -2831,12 +2886,33 @@ class Agent(Module):
                 else:
                     seed_last_action_cond = self.to_action_latent(seed_last_action_tokens)
 
-                step_action = rearrange(step_action, 'b 1 ... -> b ...')
-                step_action = unpack_actor(step_action)
+                if is_search_space_raw_action:
+                    # raw search space - the sampled raw actions are the seed
 
-                step_action_cond, step_rnn_memories = encode_action_step(step_action, step_rnn_memories)
+                    step_action = unpack_actor(rearrange(step_action, 'b 1 ... -> b ...'))
+                    step_action_cond, step_rnn_memories = encode_action_step(step_action, step_rnn_memories)
+                    seeded_actions.append(step_action)
+                else:
+                    # latent search space (local/global) - encode the sampled actions
+                    # to action latents, keeping the population dim
 
-                seeded_actions.append(step_action if is_search_space_raw_action else step_action_cond)
+                    if self.continuous_actions:
+                        step_action = unpack_actor(rearrange(step_action, 'b 1 d -> b d'))
+                        flat_action = rearrange(step_action, 'b p d -> (b p) d')
+                    else:
+                        step_action = unpack_actor(rearrange(step_action, 'b 1 -> b 1'))
+                        flat_action = rearrange(step_action, 'b p 1 -> (b p)')
+
+                    encoded = self.encode_actions(flat_action)
+
+                    if self.transition_action_space == 'global':
+                        encoded = rearrange(encoded, '... d -> ... 1 d')
+                        encoded, step_rnn_memories = self.action_linear_rnn(encoded, memories = step_rnn_memories, return_memories = True)
+                        encoded = rearrange(encoded, '... 1 d -> ... d')
+
+                    step_action_cond = unpack_actor(self.to_action_latent(encoded))
+                    seeded_actions.append(step_action_cond)
+
                 step_state, chunk_action_conds = step_state_by_actions(step_state, step_action_cond, chunk_action_conds)
 
             seeded_actions = stack(seeded_actions, dim = 2)
@@ -2853,6 +2929,13 @@ class Agent(Module):
         # introspect fitness_fn once
 
         fitness_fn_params = inspect.signature(fitness_fn).parameters if exists(fitness_fn) else None
+
+        if exists(fitness_fn):
+            # the rollout-return fitness needs the reward / continuation heads - fail loudly
+            # instead of silently injecting None when the world model cannot provide them
+
+            assert not ('pred_rewards' in fitness_fn_params and not has_reward_pred), 'fitness_fn requests pred_rewards, but the world model has no reward head (to_reward_pred)'
+            assert not ('pred_discounts' in fitness_fn_params and not has_discount_pred), 'fitness_fn requests pred_discounts, but the world model has no continuation head (to_discount_pred)'
 
         # helper for evaluating actions
 
@@ -2891,6 +2974,14 @@ class Agent(Module):
                 actions_cond = to_transition_action_latents(actions_cond, chunked = False)
                 transition_actions_cond = to_transition_action_latents(transition_actions_cond, chunked = has_temporal_compression)
 
+            def rollout_heads(prev_state_latents, action_cond):
+                # reward and continuation of each imagined transition, for rollout-return fitness
+
+                return (
+                    rearrange(world_model.to_reward_pred((prev_state_latents, action_cond)), '... 1 -> ...') if has_reward_pred else None,
+                    rearrange(world_model.to_discount_pred((prev_state_latents, action_cond)), '... 1 -> ...').sigmoid() if has_discount_pred else None
+                )
+
             pred_state_entropies = None
 
             if world_model.transition_is_prefix:
@@ -2903,6 +2994,8 @@ class Agent(Module):
 
                 pred_state_latents = []
                 pred_next_encoded_states = []
+                pred_rewards = [] if has_reward_pred else None
+                pred_discounts = [] if has_discount_pred else None
                 pred_values = []
                 pred_state_entropies = [] if world_model.probabilistic_plan_state_transition else None
 
@@ -2931,6 +3024,11 @@ class Agent(Module):
                     chunk_encoded_states = world_model.to_next_encoded_state_pred((chunk_prev_state_latents, chunk_step_actions_cond))
                     chunk_values = self.value_network(chunk_encoded_states, chunk_pred_states, discount = discount_factor, risk = risk_factor)
 
+                    chunk_rewards, chunk_discounts = rollout_heads(chunk_prev_state_latents, chunk_step_actions_cond)
+
+                    if exists(chunk_rewards): pred_rewards.append(chunk_rewards)
+                    if exists(chunk_discounts): pred_discounts.append(chunk_discounts)
+
                     pred_state_latents.append(chunk_pred_states)
                     pred_next_encoded_states.append(chunk_encoded_states)
                     pred_values.append(chunk_values)
@@ -2941,6 +3039,12 @@ class Agent(Module):
                 pred_next_encoded_states = cat(pred_next_encoded_states, dim = 2)
                 pred_values = cat(pred_values, dim = 2)
 
+                if has_reward_pred:
+                    pred_rewards = cat(pred_rewards, dim = 2)
+
+                if has_discount_pred:
+                    pred_discounts = cat(pred_discounts, dim = 2)
+
                 if exists(pred_state_entropies):
                     pred_state_entropies = cat(pred_state_entropies, dim = 2)
             else:
@@ -2948,6 +3052,8 @@ class Agent(Module):
 
                 pred_state_latents = []
                 pred_next_encoded_states = []
+                pred_rewards = [] if has_reward_pred else None
+                pred_discounts = [] if has_discount_pred else None
                 pred_values = []
                 pred_state_entropies = [] if world_model.probabilistic_plan_state_transition else None
 
@@ -2960,6 +3066,11 @@ class Agent(Module):
                     # encoded state for goal
 
                     pred_next_encoded_state = world_model.to_next_encoded_state_pred((step_state_latents, step_action_cond))
+
+                    step_rewards, step_discounts = rollout_heads(step_state_latents, step_action_cond)
+
+                    if exists(step_rewards): pred_rewards.append(step_rewards)
+                    if exists(step_discounts): pred_discounts.append(step_discounts)
 
                     # state transition
 
@@ -2982,6 +3093,12 @@ class Agent(Module):
                 pred_next_encoded_states = rearrange(pred_next_encoded_states, 'h b p d -> b p h d')
                 pred_values = rearrange(pred_values, 'h b p -> b p h')
 
+                if has_reward_pred:
+                    pred_rewards = rearrange(pred_rewards, 'h b p -> b p h')
+
+                if has_discount_pred:
+                    pred_discounts = rearrange(pred_discounts, 'h b p -> b p h')
+
             # evaluate
 
             if exists(fitness_fn):
@@ -2990,6 +3107,8 @@ class Agent(Module):
                 kwargs = dict(
                     pred_state_latents = pred_state_latents,
                     pred_next_encoded_states = pred_next_encoded_states,
+                    pred_rewards = pred_rewards,
+                    pred_discounts = pred_discounts,
                     pred_values = pred_values,
                     encoded_goal = encoded_goal,
                     pred_state_entropies = pred_state_entropies,
@@ -3330,6 +3449,20 @@ class Agent(Module):
 
             next_state, reward, terminated, truncated, info = env.step(action)
 
+            # episode padding zeroes done envs' obs - restore the true terminal obs from info,
+            # so the model never trains on zero states (which can masquerade as a goal)
+
+            if isinstance(info, dict) and 'final_observation' in info:
+                def restore_final_obs(real, final):
+                    mask = torch.as_tensor(info['_final_observation'], dtype = torch.bool, device = real.device)
+
+                    while mask.ndim < real.ndim:
+                        mask = mask.unsqueeze(-1)
+
+                    return torch.where(mask, torch.as_tensor(final, dtype = real.dtype, device = real.device), real)
+
+                next_state = tree_map(restore_final_obs, next_state, info['final_observation'])
+
             if is_done.any():
                 reward = reward.masked_fill(is_done, 0.)
 
@@ -3339,16 +3472,11 @@ class Agent(Module):
             if is_last_step:
                 truncated = truncated | ~is_done
 
-            # invalidate the plan only when an env newly becomes done - a frozen env returns terminated = True
-            # on every step, which would otherwise force a full replan of the batch each step after the first death
-
-            newly_done = (terminated | truncated) & ~is_done
-
             is_done |= terminated | truncated
 
-            if newly_done.any():
-                action_queue = []
-                pred_state_latent_queue = []
+            # envs freeze on done, so a dead env harmlessly consumes the remaining committed plan;
+            # do not invalidate the queue on death (a mid-commit full-batch replan re-anchors the
+            # model at a variable memory offset and destabilizes training)
 
             rewards.append(reward)
             terminateds.append(terminated)
@@ -3528,6 +3656,8 @@ class Agent(Module):
         mask: Tensor | None = None,
         lens: Tensor | None = None,
         returns = None,
+        rewards = None,
+        dones = None,
         behavior_clone: bool | str | tuple[str, ...] | list[str] = True,
         return_loss = True,
         memories = None,
@@ -3553,8 +3683,8 @@ class Agent(Module):
         if has_temporal_compression and exists(actions) and action_len > 0 and not actions.is_floating_point():
             actions = self.encode_actions(actions)
 
-        states, orig_actions, mask, returns = extract_temporal_compressed_lanes(
-            states, actions, mask = mask, returns = returns, temporal_compression = temporal_compression
+        states, orig_actions, mask, returns, rewards, dones = extract_temporal_compressed_lanes(
+            states, actions, mask = mask, returns = returns, rewards = rewards, dones = dones, temporal_compression = temporal_compression
         )
 
         # with temporal compression, the prefix transition consumes the `temporal_compression` raw
@@ -3741,7 +3871,9 @@ class Agent(Module):
             prepend_memories = None,
             has_episodic_mem = self.has_episodic_mem,
             episodic_mems = getattr(self, 'episodic_mems', None),
-            transition_action_cond = transition_action_cond
+            transition_action_cond = transition_action_cond,
+            rewards = rewards,
+            dones = dones
         )
 
         embeds = agent_outputs['embeds']

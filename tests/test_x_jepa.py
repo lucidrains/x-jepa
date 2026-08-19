@@ -101,6 +101,142 @@ def test_world_model(
 
     assert planned_actions.shape == (2, 2, 4)
 
+def test_world_model_train_without_rewards_or_dones():
+    """training must work without rewards/dones - the reward and continuation heads are optional,
+    and their losses must be exactly zero when no targets are provided"""
+
+    model = Transformer(dim = 32, depth = 1, causal = True)
+
+    wm = Agent(
+        state_encoder = nn.Linear(16, 32),
+        action_encoder = nn.Linear(4, 32),
+        action_decoder = nn.Linear(8, 4),
+        transition_action_space = 'local',
+        dim_action = 4,
+        dim_action_latent = 8,
+        model = model
+    )
+
+    states = torch.randn(2, 5, 16)
+    actions = torch.randn(2, 4, 4).tanh()
+
+    loss, lb = wm(states, actions)
+
+    assert loss.ndim == 0
+    assert lb.reward_pred == 0., 'reward head loss must be zero when no rewards are passed'
+    assert lb.discount_pred == 0., 'continuation head loss must be zero when no dones are passed'
+
+    loss.backward()
+    wm.update()
+
+    # with targets, both heads receive a loss and training still works
+
+    rewards = torch.randn(2, 4)
+    dones = torch.randint(0, 2, (2, 4)).bool()
+    returns = torch.randn(2, 5)
+
+    loss2, lb2 = wm(states, actions, returns = returns, rewards = rewards, dones = dones)
+
+    assert torch.isfinite(loss2)
+    assert lb2.reward_pred.item() > 0., 'reward head must receive a loss when rewards are passed'
+    assert lb2.discount_pred.item() > 0., 'continuation head must receive a loss when dones are passed'
+
+    loss2.backward()
+
+def test_plan_rollout_fitness_requires_reward_and_discount_heads():
+    """the rollout-return fitness (discounted sum of predicted rewards + bootstrap value) depends on
+    the reward / continuation heads - a fitness requesting them from a world model without the heads
+    must fail loudly, not silently inject None"""
+
+    def make_wm():
+        model = Transformer(dim = 32, depth = 1, causal = True)
+        return Agent(
+            state_encoder = nn.Linear(16, 32),
+            action_encoder = nn.Linear(4, 32),
+            action_decoder = nn.Linear(8, 4),
+            transition_action_space = 'local',
+            dim_action = 4,
+            dim_action_latent = 8,
+            model = model
+        )
+
+    def rollout_fitness(pred_rewards, pred_discounts, pred_values):
+        ret = pred_values[:, :, -1]
+        for t in range(pred_rewards.shape[-1] - 1, -1, -1):
+            ret = pred_rewards[:, :, t] + pred_discounts[:, :, t] * ret
+        return ret
+
+    states = torch.randn(2, 3, 16)
+    actions = torch.randn(2, 2, 4).tanh()
+
+    # with the default world model (heads present) the rollout-return fitness works
+
+    wm = make_wm()
+    planned = wm.plan(states, actions, horizon = 2, pop_size = 8, generations = 2, fitness_fn = rollout_fitness)
+    assert planned.shape == (2, 2, 4)
+
+    # a world model without the reward head must be rejected
+
+    wm_no_reward = make_wm()
+    wm_no_reward.world_models[0].to_reward_pred = None
+
+    with pytest.raises(AssertionError, match = 'pred_rewards'):
+        wm_no_reward.plan(states, actions, horizon = 2, pop_size = 8, generations = 2, fitness_fn = rollout_fitness)
+
+    # a world model without the continuation head must be rejected
+
+    wm_no_discount = make_wm()
+    wm_no_discount.world_models[0].to_discount_pred = None
+
+    with pytest.raises(AssertionError, match = 'pred_discounts'):
+        wm_no_discount.plan(states, actions, horizon = 2, pop_size = 8, generations = 2, fitness_fn = rollout_fitness)
+
+def test_rollout_fitness_termination_gating():
+    """the rollout-return fitness must hard-stop at a predicted termination - rewards after the
+    termination flag and the bootstrap value must not be incorporated"""
+
+    from train_montezuma import make_fitness
+
+    fitness_fn = make_fitness(mode = 'rollout', gamma = 0.99)
+
+    b, p, h = 2, 3, 8
+
+    rewards = torch.full((b, p, h), 10.0)
+    values = torch.full((b, p, h), 100.0)
+    discounts = torch.full((b, p, h), 0.99)
+
+    # no termination anywhere - fitness is the exact discounted sum of rewards + discounted bootstrap
+
+    no_done = fitness_fn(rewards, discounts, values)
+    expected = sum(10.0 * 0.99 ** t for t in range(h)) + 100.0 * 0.99 ** h
+    assert_close(no_done, torch.full((b, p), expected), atol = 1e-4, rtol = 1e-4)
+
+    # termination predicted at step 3 - rewards at steps 4..7 and the bootstrap must not contribute
+
+    discounts_done = torch.full((b, p, h), 0.99)
+    discounts_done[:, :, 3] = 0.1
+
+    done_early = fitness_fn(rewards, discounts_done, values)
+    expected_done = sum(10.0 * 0.99 ** t for t in range(4))
+    assert_close(done_early, torch.full((b, p), expected_done), atol = 1e-4, rtol = 1e-4)
+
+    # termination on the very first step - only the first reward counts, no bootstrap
+
+    discounts_first = torch.full((b, p, h), 0.99)
+    discounts_first[:, :, 0] = 0.1
+
+    done_first = fitness_fn(rewards, discounts_first, values)
+    assert_close(done_first, torch.full((b, p), 10.0), atol = 1e-4, rtol = 1e-4)
+
+    # termination on the final step - the last reward still counts, the bootstrap does not
+
+    discounts_last = torch.full((b, p, h), 0.99)
+    discounts_last[:, :, -1] = 0.1
+
+    done_last = fitness_fn(rewards, discounts_last, values)
+    expected_last = sum(10.0 * 0.99 ** t for t in range(h))
+    assert_close(done_last, torch.full((b, p), expected_last), atol = 1e-4, rtol = 1e-4)
+
 @param('transition_action_space', ('raw', 'local', 'global'))
 @param('search_space', ('raw', 'local_global', None))
 def test_plan_search_spaces(
@@ -702,9 +838,10 @@ def test_interact_with_environment_commit_k_steps():
     )
 
     assert experience.states.shape[1] == 4
-    # With commit_k_steps = 2 for 4 steps, plan should be called exactly 3 times (steps 0 and 2,
-    # plus a replan at step 1 when the first env terminates mid-plan and invalidates the queue)
-    assert plan_count == 3
+    # With commit_k_steps = 2 for 4 steps, plan is called once per commit boundary (steps 0 and
+    # 2); a dead env freezes and consumes the remaining committed plan, so there is no mid-commit
+    # replan on termination
+    assert plan_count == 2
 
 
 @param('complex_sensory', (False, True))

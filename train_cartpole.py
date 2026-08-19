@@ -23,9 +23,6 @@
 #   python train_cartpole.py
 #   python train_cartpole.py --transition_type mlp
 #
-# the prefix transition trains with an mtp lookahead of 3 (each prefix predicts the next 3 latents),
-# override with `--transition_lookahead 1` for the classic single-step-per-prefix setup
-#
 # overridable via fire, e.g.:
 #   python train_cartpole.py --num_envs 16 --num_episodes 30 --cpu true
 
@@ -68,19 +65,21 @@ def make_fitness():
 
 # training helpers
 
-def train_wm_epoch(wm, buffer, optimizer, device, batch_size, epochs_per_train, grad_accum_steps, train_window = 64, batches_per_epoch = 6):
+def train_wm_epoch(wm, buffer, optimizer, device, batch_size, epochs_per_train, grad_accum_steps, train_window = 64, batches_per_epoch = 6, train_reward_heads = True):
     # fixed-length window sampling - keeps training cost bounded regardless of episode length
 
     dl = buffer.dataloader(
         batch_size = batch_size,
         shuffle = True,
         n_steps = train_window,
-        sequence_fields = ('states', 'actions', 'returns'),
-        fieldname_map = {'seq_states': 'states', 'seq_actions': 'actions', 'seq_returns': 'returns'}
+        sequence_fields = ('states', 'actions', 'returns', 'rewards', 'dones'),
+        fieldname_map = {'seq_states': 'states', 'seq_actions': 'actions', 'seq_returns': 'returns', 'seq_rewards': 'rewards', 'seq_dones': 'dones'}
     )
     dl_iter = iter(dl)
     wm.train()
     loss_val = 0.0
+    reward_loss_val = 0.0
+    discount_loss_val = 0.0
     total_batches = epochs_per_train * batches_per_epoch
 
     for step in range(total_batches):
@@ -94,7 +93,12 @@ def train_wm_epoch(wm, buffer, optimizer, device, batch_size, epochs_per_train, 
         states, actions, returns = batch['states'], batch['actions'], batch['returns']
         lens = batch.get('n_step_lens', batch.get('episode_len', batch.get('episode_lens')))
 
-        loss, _ = wm(states, actions, lens = lens, returns = returns, behavior_clone = True)
+        wm_kwargs = dict(lens = lens, returns = returns, behavior_clone = True)
+
+        if train_reward_heads:
+            wm_kwargs.update(rewards = batch['rewards'], dones = batch['dones'])
+
+        loss, loss_breakdown = wm(states, actions, **wm_kwargs)
         (loss / grad_accum_steps).backward()
 
         if divisible_by(step + 1, grad_accum_steps) or (step + 1) == total_batches:
@@ -102,8 +106,10 @@ def train_wm_epoch(wm, buffer, optimizer, device, batch_size, epochs_per_train, 
             optimizer.zero_grad()
             wm.update()
             loss_val = loss.item()
+            reward_loss_val = loss_breakdown.reward_pred.item()
+            discount_loss_val = loss_breakdown.discount_pred.item()
 
-    return loss_val
+    return loss_val, reward_loss_val, discount_loss_val
 
 # main
 
@@ -142,7 +148,8 @@ def main(
     cpu = False,
     transition_type = 'prefix', # 'prefix' for fast-lewm action-prefix transformer, 'mlp' for classic one-step
     transition_lookahead = 3, # mtp lookahead for the prefix transition - each prefix predicts the next `lookahead` latents
-    plan_lookahead = None # plan-time lookahead (prefix transition) - steps predicted per re-anchored pass; fall back to fewer and redo the prediction until the horizon is covered; defaults to the full horizon in one parallel pass
+    plan_lookahead = None, # plan-time lookahead (prefix transition) - steps predicted per re-anchored pass; fall back to fewer and redo the prediction until the horizon is covered; defaults to the full horizon in one parallel pass
+    train_reward_heads = True # train the reward and continuation heads (requires rewards/dones in the buffer); False exercises the heads-free training path
 ):
     device = Accelerator(cpu = cpu).device
     print(f"using device: {device}", flush = True)
@@ -197,6 +204,8 @@ def main(
     buffer = None
     best_avg_reward = -float('inf')
     wm_loss_val = 0.0
+    wm_reward_loss_val = 0.0
+    wm_discount_loss_val = 0.0
     suffix = f"-{tag}" if tag else ""
     buffer_folder = f"./{env_name.lower().replace('-v1', '')}-memories{suffix}"
 
@@ -231,7 +240,7 @@ def main(
         )
 
         if divisible_by(episode, train_every_eps):
-            wm_loss_val = train_wm_epoch(wm, buffer, optimizer, device, batch_size, epochs_per_train, grad_accum_steps, train_window = train_window, batches_per_epoch = batches_per_epoch)
+            wm_loss_val, wm_reward_loss_val, wm_discount_loss_val = train_wm_epoch(wm, buffer, optimizer, device, batch_size, epochs_per_train, grad_accum_steps, train_window = train_window, batches_per_epoch = batches_per_epoch, train_reward_heads = train_reward_heads)
 
         # metrics and logging
 
@@ -249,7 +258,7 @@ def main(
             if num_seed_groups > 1:
                 gmeans = [float(np.mean(total_rewards[g * group_size:(g + 1) * group_size])) for g in range(num_seed_groups)]
                 group_info = " | groups: " + " ".join(f"{g:5.1f}" for g in gmeans)
-            print(f"episode {episode:4d} [WM planning]  | reward mean: {batch_mean:6.2f} max: {batch_max:6.2f} | avg{reward_avg_window}: {avg_reward:6.2f} | wm_loss: {wm_loss_val:.4f}{group_info}", flush = True)
+            print(f"episode {episode:4d} [WM planning]  | reward mean: {batch_mean:6.2f} max: {batch_max:6.2f} | avg{reward_avg_window}: {avg_reward:6.2f} | wm_loss: {wm_loss_val:.4f} | reward_loss: {wm_reward_loss_val:.4f} | discount_loss: {wm_discount_loss_val:.4f}{group_info}", flush = True)
 
         if use_wandb:
             wandb.log(dict(episode = episode, reward = batch_mean, avg_reward = avg_reward))

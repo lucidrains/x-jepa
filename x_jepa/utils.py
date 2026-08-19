@@ -93,6 +93,10 @@ def store_experience_in_replay_buffer(
             fields['actor_log_probs'] = 'float'
         if exists(experience.rewards):
             fields['rewards'] = 'float'
+        if exists(experience.base_reward):
+            fields['base_rewards'] = 'float'
+        if exists(experience.terminated):
+            fields['dones'] = 'int'
 
         if exists(returns) and is_tensor(returns):
             fields['returns'] = 'float'
@@ -124,6 +128,8 @@ def store_experience_in_replay_buffer(
         actions = actions,
         actor_log_probs = experience.actor_log_probs,
         rewards = experience.rewards,
+        base_rewards = experience.base_reward,
+        dones = experience.terminated,
         returns = returns if (exists(returns) and is_tensor(returns)) else None,
         state_latents = experience.state_latents
     )
