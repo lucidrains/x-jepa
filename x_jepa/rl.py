@@ -14,6 +14,8 @@ def coerce_experience(experience: Experience | dict) -> Experience:
     if isinstance(experience, Experience):
         return experience
 
+    # transition_risk_* are the current names; risk_* are deprecated aliases
+
     return Experience(
         states = experience['states'],
         actions = experience['actions'],
@@ -28,9 +30,10 @@ def coerce_experience(experience: Experience | dict) -> Experience:
         state_latents = experience.get('state_latents'),
         skill_ids = experience.get('skill_ids'),
         discount_factor = experience.get('discount_factor'),
-        risk_factor = experience.get('risk_factor'),
+        transition_risk_factor = experience.get('transition_risk_factor', experience.get('risk_factor')),
+        value_risk_factor = experience.get('value_risk_factor'),
         base_reward = experience.get('base_reward'),
-        risk_reward = experience.get('risk_reward'),
+        transition_risk_reward = experience.get('transition_risk_reward', experience.get('risk_reward')),
         skill_reward = experience.get('skill_reward')
     )
 
@@ -43,9 +46,12 @@ def get_actor_log_probs_and_entropy(
     skill_latent = None,
     skill_id = None,
     discount: float | Tensor | None = None,
-    risk: float | Tensor | None = None
+    transition_risk: float | Tensor | None = None,
+    value_risk: float | Tensor | None = None
 ):
-    batch, seq_len = actions.shape[:2]
+    # actions: (batch, seq_len)
+
+    seq_len = actions.shape[1]
     actor = world_model.actors[actor_module]
     state_tokens, sensory_hiddens = world_model.get_actor_state_tokens(
         actor_module, states, detach_base_state_encoder = detach_base_state_encoder
@@ -68,7 +74,8 @@ def get_actor_log_probs_and_entropy(
         world_model_hiddens = wm_hiddens,
         skill_latent = skill_latent,
         discount = discount,
-        risk = risk
+        transition_risk = transition_risk,
+        value_risk = value_risk
     )
 
     action_preds = action_preds[:, :seq_len]
@@ -85,14 +92,18 @@ def ppo_loss(
     clip_eps = 0.2,
     value_loss_weight = 0.5,
     entropy_loss_weight = 0.01,
+    value_risk_aversion = 0.0, # LCB penalty on the advantage: risk-averse actor prefers low value uncertainty
     masked_loss_average_mode = 'timestep',
     detach_base_state_encoder = False,
-    return_breakdown = False
+    return_breakdown = False,
+    transition_risk_factor: float | Tensor | None = None,
+    risk_factor: float | Tensor | None = None, # deprecated alias for transition_risk_factor
+    value_risk_factor: float | Tensor | None = None
 ):
     experience = coerce_experience(experience)
     device = next(world_model.parameters()).device
     states, actions = tree_map_tensor_to_device((experience.states, experience.actions), device)
-    batch, seq_len = actions.shape[:2]
+    seq_len = actions.shape[1]
 
     lens = maybe(tree_map_tensor_to_device)(experience.episode_len, device)
     mask = maybe(lens_to_mask)(lens, max_len = seq_len)
@@ -106,6 +117,9 @@ def ppo_loss(
     returns = returns.to(device)
     discounts = default(discounts, experience.discount_factor)
 
+    transition_risk_factor = default(transition_risk_factor, default(risk_factor, experience.transition_risk_factor))
+    value_risk_factor = default(value_risk_factor, experience.value_risk_factor)
+
     log_probs, entropy, state_tokens, state_latents = get_actor_log_probs_and_entropy(
         world_model,
         actor_module,
@@ -113,7 +127,8 @@ def ppo_loss(
         actions,
         detach_base_state_encoder = detach_base_state_encoder,
         discount = discounts,
-        risk = experience.risk_factor
+        transition_risk = transition_risk_factor,
+        value_risk = value_risk_factor
     )
 
     old_log_probs = default(experience.actor_log_probs, log_probs.detach()).to(device)
@@ -124,12 +139,17 @@ def ppo_loss(
     )
     val_state_latents = world_model.to_state_latent(val_state_tokens)
 
-    values = world_model.value_network(val_state_tokens, val_state_latents, discount = discounts, risk = experience.risk_factor)
+    values = world_model.value_network(val_state_tokens, val_state_latents, discount = discounts, transition_risk = transition_risk_factor, value_risk = value_risk_factor)
     values = values[:, :seq_len]
     returns = returns[:, :seq_len]
 
-    advantages = returns - values.detach()
+    value_mean, value_std = world_model.value_network.mean_and_uncertainty(values)
+
+    advantages = returns - value_mean.detach()
     advantages = z_score(advantages, mask = mask)
+
+    if value_risk_aversion > 0. and exists(value_std):
+        advantages = advantages - value_risk_aversion * z_score(value_std, mask = mask)
 
     ratios = (log_probs - old_log_probs.detach()).exp()
     surr1 = ratios * advantages
@@ -138,8 +158,8 @@ def ppo_loss(
     masked_loss = partial(masked_mean, mask = mask, average_mode = masked_loss_average_mode)
 
     policy_loss = -masked_loss(torch.min(surr1, surr2))
-    raw_value_loss = F.smooth_l1_loss(values, returns, reduction = 'none')
-    value_loss = 0.5 * masked_loss(raw_value_loss)
+    raw_value_loss = world_model.value_network.compute_loss(values, returns, mask = mask, average_mode = masked_loss_average_mode)
+    value_loss = 0.5 * raw_value_loss
     entropy_loss = masked_loss(entropy)
 
     total_loss = (
@@ -168,7 +188,7 @@ def tpo_loss(
     experience = coerce_experience(experience)
     device = next(world_model.parameters()).device
     states, actions = tree_map_tensor_to_device((experience.states, experience.actions), device)
-    batch, seq_len = actions.shape[:2]
+    seq_len = actions.shape[1]
 
     lens = maybe(tree_map_tensor_to_device)(experience.episode_len, device)
     mask = maybe(lens_to_mask)(lens, max_len = seq_len)
@@ -196,7 +216,8 @@ def tpo_loss(
         actions,
         detach_base_state_encoder = detach_base_state_encoder,
         discount = experience.discount_factor,
-        risk = experience.risk_factor
+        transition_risk = experience.transition_risk_factor,
+        value_risk = experience.value_risk_factor
     )
 
     log_scores_sum = masked_sum(log_probs, mask = mask, dim = 1)

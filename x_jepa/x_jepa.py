@@ -925,15 +925,14 @@ def calc_returns(
     mask = None,
     lens = None
 ):
-    assert rewards.ndim == 2, 'rewards in calc_returns must be 2 dimensional (b, n)'
+    # rewards: (batch, seq_len)
+
+    assert rewards.ndim == 2, 'rewards in calc_returns must be 2 dimensional (batch, seq_len)'
+    assert not (exists(mask) and exists(lens)), 'either mask or lens is given, but not both'
 
     seq_len = rewards.shape[1]
 
-    assert not (exists(mask) and exists(lens)), 'either mask or lens is given, but not both'
-
     mask = default(mask, maybe(lens_to_mask)(lens, seq_len))
-
-    scan = AssocScan(reverse = True, has_no_feature_dim = True)
 
     # pack to ensure at least 2 dimensions for assoc scan
 
@@ -945,6 +944,19 @@ def calc_returns(
 
     gates = discount_factor * (~is_done).float()
 
+    # probabilistic value heads bootstrap per-statistic (e.g. per ensemble head) -
+    # fold the statistic dim into the batch dim so the scalar scan stays valid
+
+    num_statistics = 1
+    if next_values.ndim == 2 and next_values.shape[-1] > 1:
+        num_statistics = next_values.shape[-1]
+        next_values = rearrange(next_values, 'b k -> (b k)')
+        gates = repeat(gates, 'b n -> (b k) n', k = num_statistics)
+        rewards = repeat(rewards, 'b n -> (b k) n', k = num_statistics)
+        mask = repeat(mask, 'b n -> (b k) n', k = num_statistics) if exists(mask) else mask
+
+    scan = AssocScan(reverse = True, has_no_feature_dim = True)
+
     if exists(mask):
         gates = torch.where(mask, gates, torch.ones_like(gates))
         rewards = torch.where(mask, rewards, torch.zeros_like(rewards))
@@ -954,183 +966,23 @@ def calc_returns(
     if exists(mask):
         returns = returns.masked_fill(~mask, 0.)
 
+    if num_statistics > 1:
+        returns = rearrange(returns, '(b k) n -> b n k', k = num_statistics)
+
     return returns
 
-class DiscountEmbedder(Module):
-    def __init__(
-        self,
-        dim,
-        eps = 1e-20
-    ):
-        super().__init__()
-        self.eps = eps
-        self.net = Sequential(
-            LinearNoBias(3, dim),
-            nn.SiLU(),
-            LinearNoBias(dim, dim)
-        )
-
-        self.register_buffer('zero', tensor(0.), persistent = False)
-
-    @property
-    def device(self):
-        return self.zero.device
-
-    def forward(
-        self,
-        discount
-    ):
-        discount = cast_tensor(discount).to(self.device)
-
-        cond = stack([
-            discount,
-            1. - discount,
-            -log(1. - discount, eps = self.eps)
-        ], dim = -1)
-
-        return self.net(cond)
-
-class RiskEmbedder(Module):
-    def __init__(
-        self,
-        dim,
-        num_bins = 16,
-        min_risk = -2.0,
-        max_risk = 1.0,
-        sigma = 0.2
-    ):
-        super().__init__()
-        self.sigma = sigma
-        self.register_buffer('bin_centers', torch.linspace(min_risk, max_risk, num_bins), persistent = False)
-
-        self.net = Sequential(
-            LinearNoBias(num_bins, dim),
-            nn.SiLU(),
-            LinearNoBias(dim, dim)
-        )
-
-    def forward(self, risk):
-        risk = rearrange(cast_tensor(risk), '... -> ... 1')
-
-        diff = risk - self.bin_centers
-        bin_weights = l1norm((-0.5 * (diff / self.sigma) ** 2).exp())
-
-        return self.net(bin_weights)
-
-class Value(Module):
-    def __init__(
-        self,
-        dim,
-        dim_state_latent,
-        discount_factor = 0.99,
-        risk_factor: float | Tensor | None = None,
-        ema_beta = 0.999,
-        discount_embedder: DiscountEmbedder | Module | None = None,
-        risk_embedder: RiskEmbedder | Module | None = None,
-        eps = 1e-20,
-    ):
-        super().__init__()
-        self.eps = eps
-
-        self.net = MLP(dim_state_latent + dim, *((dim * 2,) * 2), 1)
-        self.ema_net = EMA(self.net, beta = ema_beta)
-
-        # discount embedder
-
-        if exists(discount_embedder):
-            self.discount_embedder = discount_embedder
-        else:
-            self.discount_embedder = DiscountEmbedder(dim, eps = eps)
-
-        self.ema_discount_embedder = EMA(self.discount_embedder, beta = ema_beta)
-        self.discount_factor = discount_factor
-
-        # risk embedder
-
-        if exists(risk_embedder):
-            self.risk_embedder = risk_embedder
-        elif exists(risk_factor):
-            self.risk_embedder = RiskEmbedder(dim)
-        else:
-            self.risk_embedder = None
-
-        if exists(self.risk_embedder):
-            self.ema_risk_embedder = EMA(self.risk_embedder, beta = ema_beta)
-        else:
-            self.ema_risk_embedder = None
-
-        self.risk_factor = risk_factor
-
-    def embed_discount(self, discount, ema = False):
-        discount_embedder = self.ema_discount_embedder if ema else self.discount_embedder
-        return discount_embedder(discount)
-
-    def get_discount_embed(self, target_tensor, discount = None, ema = False):
-        discount = default(discount, self.discount_factor)
-
-        if not exists(discount):
-            return 0.
-
-        discount = cast_tensor(discount)
-
-        if discount.ndim == 1 and target_tensor.ndim == 3:
-            discount = rearrange(discount, 'b -> b 1')
-
-        discount = discount.broadcast_to(target_tensor.shape[:-1])
-        return self.embed_discount(discount, ema = ema)
-
-    def embed_risk(self, risk, ema = False):
-        if not exists(self.risk_embedder):
-            return 0.
-        risk_embedder = self.ema_risk_embedder if ema else self.risk_embedder
-        return risk_embedder(risk)
-
-    def get_risk_embed(self, target_tensor, risk = None, ema = False):
-        if not exists(self.risk_embedder):
-            return 0.
-
-        risk = default(risk, self.risk_factor)
-
-        if not exists(risk):
-            return 0.
-
-        risk = cast_tensor(risk)
-
-        if risk.ndim == 1 and target_tensor.ndim == 3:
-            risk = rearrange(risk, 'b -> b 1')
-
-        risk = risk.broadcast_to(target_tensor.shape[:-1])
-        return self.embed_risk(risk, ema = ema)
-
-    def forward_ema(self, state_tokens, state_latents, discount = None, risk = None, squeeze_out = True):
-        discount_embed = self.get_discount_embed(state_tokens, discount, ema = True)
-        risk_embed = self.get_risk_embed(state_tokens, risk, ema = True)
-        state_tokens = state_tokens + discount_embed + risk_embed
-        out = self.ema_net((state_tokens, state_latents))
-
-        if squeeze_out:
-            out = rearrange(out, '... 1 -> ...')
-
-        return out
-
-    def update(self):
-        self.ema_discount_embedder.update()
-        self.ema_net.update()
-
-        if exists(self.ema_risk_embedder):
-            self.ema_risk_embedder.update()
-
-    def forward(self, state_tokens, state_latents, discount = None, risk = None, squeeze_out = True):
-        discount_embed = self.get_discount_embed(state_tokens, discount, ema = False)
-        risk_embed = self.get_risk_embed(state_tokens, risk, ema = False)
-
-        state_tokens = state_tokens + discount_embed + risk_embed
-        out = self.net((state_tokens, state_latents))
-
-        if squeeze_out:
-            out = rearrange(out, '... 1 -> ...')
-
-        return out
+from x_jepa.value_networks import (
+    Value,
+    DiscountEmbedder,
+    TransitionRiskEmbedder,
+    ValueRiskEmbedder,
+    RiskEmbedder,
+    EnsembleValue,
+    DistributionalValue,
+    MeanVarianceValue,
+    FlowValue,
+    create_value_network
+)
 
 # classes
 
@@ -1157,9 +1009,11 @@ class Actor(Module):
         action_eps = 1e-5,
         discount_factor: float | Tensor | None = None,
         risk_factor: float | Tensor | None = None,
+        value_risk_factor: float | Tensor | None = None,
         dim: int | None = None,
         discount_embedder: DiscountEmbedder | Module | None = None,
         risk_embedder: RiskEmbedder | Module | None = None,
+        value_risk_embedder: ValueRiskEmbedder | Module | None = None,
         eps = 1e-20
     ):
         super().__init__()
@@ -1183,17 +1037,30 @@ class Actor(Module):
 
         self.discount_factor = discount_factor
 
-        # risk embedder
+        # risk embedders - the transition (aleatoric / dynamics) risk and the value
+        # network (epistemic / value-uncertainty) risk condition separately
 
         if exists(risk_embedder):
-            self.risk_embedder = risk_embedder
-        elif exists(risk_factor):
-            assert exists(dim), 'dim must be passed to actor if risk_factor is provided'
-            self.risk_embedder = RiskEmbedder(dim)
-        else:
-            self.risk_embedder = None
+            if hasattr(risk_embedder, 'transition_risk_embedder'):
+                # combined RiskEmbedder - both risks, each embedded separately
 
-        self.risk_factor = risk_factor
+                self.transition_risk_embedder = risk_embedder.transition_risk_embedder
+                self.value_risk_embedder = default(value_risk_embedder, risk_embedder.value_risk_embedder)
+            else:
+                # deprecated - a bare transition risk embedder passed as risk_embedder
+
+                self.transition_risk_embedder = risk_embedder
+                self.value_risk_embedder = default(value_risk_embedder, ValueRiskEmbedder(dim) if exists(value_risk_factor) else None)
+        else:
+            if exists(risk_factor):
+                assert exists(dim), 'dim must be passed to actor if transition_risk_factor is provided'
+                self.transition_risk_embedder = TransitionRiskEmbedder(dim)
+            else:
+                self.transition_risk_embedder = None
+            self.value_risk_embedder = default(value_risk_embedder, ValueRiskEmbedder(dim) if exists(value_risk_factor) else None)
+
+        self.transition_risk_factor = risk_factor
+        self.value_risk_factor = value_risk_factor
 
     def get_discount_embed(self, target_tensor, discount = None):
         if not exists(self.discount_embedder):
@@ -1212,22 +1079,44 @@ class Actor(Module):
         discount = discount.broadcast_to(target_tensor.shape[:-1])
         return self.discount_embedder(discount)
 
+    def get_transition_risk_embed(self, target_tensor, transition_risk = None):
+        if not exists(self.transition_risk_embedder):
+            return 0.
+
+        transition_risk = default(transition_risk, self.transition_risk_factor)
+
+        if not exists(transition_risk):
+            return 0.
+
+        transition_risk = cast_tensor(transition_risk)
+
+        if transition_risk.ndim == 1 and target_tensor.ndim == 3:
+            transition_risk = rearrange(transition_risk, 'b -> b 1')
+
+        transition_risk = transition_risk.broadcast_to(target_tensor.shape[:-1])
+        return self.transition_risk_embedder(transition_risk)
+
+    def get_value_risk_embed(self, target_tensor, value_risk = None):
+        if not exists(self.value_risk_embedder):
+            return 0.
+
+        value_risk = default(value_risk, self.value_risk_factor)
+
+        if not exists(value_risk):
+            return 0.
+
+        value_risk = cast_tensor(value_risk)
+
+        if value_risk.ndim == 1 and target_tensor.ndim == 3:
+            value_risk = rearrange(value_risk, 'b -> b 1')
+
+        value_risk = value_risk.broadcast_to(target_tensor.shape[:-1])
+        return self.value_risk_embedder(value_risk)
+
+    # deprecated alias - use get_transition_risk_embed
+
     def get_risk_embed(self, target_tensor, risk = None):
-        if not exists(self.risk_embedder):
-            return 0.
-
-        risk = default(risk, self.risk_factor)
-
-        if not exists(risk):
-            return 0.
-
-        risk = cast_tensor(risk)
-
-        if risk.ndim == 1 and target_tensor.ndim == 3:
-            risk = rearrange(risk, 'b -> b 1')
-
-        risk = risk.broadcast_to(target_tensor.shape[:-1])
-        return self.risk_embedder(risk)
+        return self.get_transition_risk_embed(target_tensor, risk)
 
     def compute_loss(self, action_preds, target_actions, mask = None, masked_loss_average_mode = 'timestep'):
         if self.continuous_actions:
@@ -1327,19 +1216,28 @@ class ReflexiveActor(Actor):
         hidden_dim = 256,
         action_eps = 1e-5,
         discount_factor: float | Tensor | None = 0.99,
-        risk_factor: float | Tensor | None = None,
+        transition_risk_factor: float | Tensor | None = None,
+        value_risk_factor: float | Tensor | None = None,
         discount_embedder: DiscountEmbedder | Module | None = None,
-        risk_embedder: RiskEmbedder | Module | None = None
+        transition_risk_embedder: TransitionRiskEmbedder | Module | None = None,
+        value_risk_embedder: ValueRiskEmbedder | Module | None = None,
+        risk_factor: float | Tensor | None = None, # deprecated aliases
+        risk_embedder: Module | None = None
     ):
+        transition_risk_factor = default(transition_risk_factor, risk_factor)
+        transition_risk_embedder = default(transition_risk_embedder, risk_embedder)
+
         super().__init__(
             continuous_actions = continuous_actions,
             dim_action = dim_action,
             action_eps = action_eps,
             discount_factor = discount_factor,
-            risk_factor = risk_factor,
+            risk_factor = transition_risk_factor,
+            value_risk_factor = value_risk_factor,
             dim = dim_state_latent,
             discount_embedder = discount_embedder,
-            risk_embedder = risk_embedder
+            risk_embedder = transition_risk_embedder,
+            value_risk_embedder = value_risk_embedder
         )
         dim_out = dim_action * 2 if continuous_actions else dim_action
         self.net = MLP(dim_state_latent, hidden_dim, dim_out)
@@ -1349,13 +1247,15 @@ class ReflexiveActor(Actor):
         state_latents,
         actor_cond = None,
         discount = None,
-        risk = None,
+        transition_risk = None,
+        value_risk = None,
         return_memories = False,
         **kwargs
     ):
         discount_embed = self.get_discount_embed(state_latents, discount)
-        risk_embed = self.get_risk_embed(state_latents, risk)
-        state_latents = state_latents + discount_embed + risk_embed
+        risk_embed = self.get_transition_risk_embed(state_latents, transition_risk)
+        value_risk_embed = self.get_value_risk_embed(state_latents, value_risk)
+        state_latents = state_latents + discount_embed + risk_embed + value_risk_embed
         state_latents = add_actor_conditioning(state_latents, actor_cond)
         pred = self.net(state_latents)
 
@@ -1379,19 +1279,28 @@ class TransformerActor(Actor):
         dropout_all_but_state_latents = 0.,
         action_eps = 1e-5,
         discount_factor: float | Tensor | None = 0.99,
-        risk_factor: float | Tensor | None = None,
+        transition_risk_factor: float | Tensor | None = None,
+        value_risk_factor: float | Tensor | None = None,
         discount_embedder: DiscountEmbedder | Module | None = None,
-        risk_embedder: RiskEmbedder | Module | None = None
+        transition_risk_embedder: TransitionRiskEmbedder | Module | None = None,
+        value_risk_embedder: ValueRiskEmbedder | Module | None = None,
+        risk_factor: float | Tensor | None = None, # deprecated aliases
+        risk_embedder: Module | None = None
     ):
+        transition_risk_factor = default(transition_risk_factor, risk_factor)
+        transition_risk_embedder = default(transition_risk_embedder, risk_embedder)
+
         super().__init__(
             continuous_actions = continuous_actions,
             dim_action = dim_action,
             action_eps = action_eps,
             discount_factor = discount_factor,
-            risk_factor = risk_factor,
+            risk_factor = transition_risk_factor,
+            value_risk_factor = value_risk_factor,
             dim = dim,
             discount_embedder = discount_embedder,
-            risk_embedder = risk_embedder
+            risk_embedder = transition_risk_embedder,
+            value_risk_embedder = value_risk_embedder
         )
 
         self.model = model
@@ -1426,7 +1335,8 @@ class TransformerActor(Actor):
         return_memories = False,
         actor_cond = None,
         discount = None,
-        risk = None,
+        transition_risk = None,
+        value_risk = None,
         **kwargs
     ):
         batch, seq_len = state_latents.shape[:2]
@@ -1446,8 +1356,9 @@ class TransformerActor(Actor):
 
         state_tokens = default_zeros(state_tokens, self.dim)
         discount_embed = self.get_discount_embed(state_tokens, discount)
-        risk_embed = self.get_risk_embed(state_tokens, risk)
-        state_tokens = state_tokens + discount_embed + risk_embed
+        transition_risk_embed = self.get_transition_risk_embed(state_tokens, transition_risk)
+        value_risk_embed = self.get_value_risk_embed(state_tokens, value_risk)
+        state_tokens = state_tokens + discount_embed + transition_risk_embed + value_risk_embed
         state_tokens = add_actor_conditioning(state_tokens, actor_cond)
 
         # project
@@ -1996,7 +1907,15 @@ class Agent(Module):
         value_loss_weight = 1.,
         masked_loss_average_mode = 'timestep',
         discount_factor = 0.99,
-        risk_factor: float | None = None,
+        transition_risk_factor: float | None = None,
+        risk_factor: float | None = None, # deprecated alias for transition_risk_factor
+        value_risk_factor: float | None = None,
+        value_network_type = 'value', # 'value' | 'ensemble' | 'distributional' | 'mean_variance' | 'flow'
+        num_value_heads = 5,
+        num_value_quantiles = 32,
+        value_flow_steps = 8,
+        value_flow_num_samples = 16,
+        value_bootstrap_frac = 0.8, # ensemble heads each see a bernoulli-subset of the batch (Osband et al. 2016)
         pass_sensory_hiddens_to_world_model = False,
         frac_gradients = 0.,
         reg_next_state_weight = 0.,
@@ -2189,15 +2108,22 @@ class Agent(Module):
 
         self.world_models = ModuleList(world_models)
 
-        # discount & risk embedders
+        # discount & risk embedders - the transition (aleatoric / dynamics) risk and the
+        # value (epistemic / value-uncertainty) risk each condition through their own
+        # embedder, so both can be taken into account separately with different values
 
-        assert not exists(risk_factor) or probabilistic_state_transition
+        transition_risk_factor = default(transition_risk_factor, risk_factor)
+
+        assert not exists(transition_risk_factor) or probabilistic_state_transition
 
         self.discount_factor = discount_factor
-        self.risk_factor = risk_factor
+        self.transition_risk_factor = transition_risk_factor
+        self.risk_factor = transition_risk_factor # deprecated alias
+        self.value_risk_factor = value_risk_factor
 
         discount_embedder = DiscountEmbedder(dim) if exists(discount_factor) else None
-        risk_embedder = RiskEmbedder(dim) if exists(risk_factor) else None
+        transition_risk_embedder = TransitionRiskEmbedder(dim) if exists(transition_risk_factor) else None
+        value_risk_embedder = ValueRiskEmbedder(dim) if exists(value_risk_factor) else None
 
         # actors
 
@@ -2210,9 +2136,11 @@ class Agent(Module):
                 continuous_actions = continuous_actions,
                 action_eps = action_eps,
                 discount_factor = discount_factor,
-                risk_factor = risk_factor,
+                transition_risk_factor = transition_risk_factor,
+                value_risk_factor = value_risk_factor,
                 discount_embedder = discount_embedder,
-                risk_embedder = risk_embedder
+                transition_risk_embedder = transition_risk_embedder,
+                value_risk_embedder = value_risk_embedder
             )
 
         if add_transformer_actor:
@@ -2233,9 +2161,11 @@ class Agent(Module):
                 dropout_all_but_state_latents = actor_dropout_all_but_state_latents,
                 action_eps = action_eps,
                 discount_factor = discount_factor,
-                risk_factor = risk_factor,
+                transition_risk_factor = transition_risk_factor,
+                value_risk_factor = value_risk_factor,
                 discount_embedder = discount_embedder,
-                risk_embedder = risk_embedder
+                transition_risk_embedder = transition_risk_embedder,
+                value_risk_embedder = value_risk_embedder
             )
 
         self.actor_residual_state_encoder = actor_residual_state_encoder
@@ -2258,15 +2188,24 @@ class Agent(Module):
 
         # value head
 
-        self.value_network = Value(
+        self.value_network = create_value_network(
+            value_network_type,
             dim = dim,
             dim_state_latent = dim_state_latent,
             discount_factor = discount_factor,
-            risk_factor = risk_factor,
+            transition_risk_factor = transition_risk_factor,
+            value_risk_factor = value_risk_factor,
             ema_beta = ema_beta,
             discount_embedder = discount_embedder,
-            risk_embedder = risk_embedder
+            transition_risk_embedder = transition_risk_embedder,
+            value_risk_embedder = value_risk_embedder,
+            num_heads = num_value_heads,
+            num_quantiles = num_value_quantiles,
+            num_steps = value_flow_steps,
+            num_samples = value_flow_num_samples,
+            bootstrap_frac = value_bootstrap_frac
         )
+        self.value_network_type = value_network_type
         self.value_state_encoder = copy.deepcopy(self.state_encoder)
         self.frac_gradient = FracGradient(frac_gradients)
 
@@ -2639,14 +2578,17 @@ class Agent(Module):
         return_pred_state_latents = False,
         return_pred_states = False,
         skill_id: int | Tensor | None = None,
-        risk_factor: float | Tensor | None = None,
+        transition_risk_factor: float | Tensor | None = None,
+        risk_factor: float | Tensor | None = None, # deprecated alias for transition_risk_factor
+        value_risk_factor: float | Tensor | None = None,
         discount_factor: float | Tensor | None = None,
         plan_lookahead: int | None = None # prefix transition only - steps to predict per re-anchored pass, defaults to the full horizon in one parallel pass; fall back to fewer and redo the prediction until the horizon is covered
     ):
         batch, device = first_tensor(states).shape[0], self.device
         state_len, action_len = first_tensor(states).shape[1], actions.shape[1]
 
-        risk_factor = default(risk_factor, self.risk_factor)
+        transition_risk_factor = default(transition_risk_factor, default(risk_factor, self.transition_risk_factor))
+        value_risk_factor = default(value_risk_factor, self.value_risk_factor)
         discount_factor = default(discount_factor, self.discount_factor)
 
         # handle skill conditioning for planning
@@ -2865,7 +2807,8 @@ class Agent(Module):
                     temperature = actor_temperature,
                     memories = seed_actor_memory,
                     return_memories = True,
-                    risk = risk_factor
+                    transition_risk = transition_risk_factor,
+                    value_risk = value_risk_factor
                 )
 
                 if exists(skill_actor_cond):
@@ -3022,7 +2965,7 @@ class Agent(Module):
 
                     chunk_prev_state_latents = cat((step_anchor, chunk_pred_states[:, :, :-1]), dim = -2)
                     chunk_encoded_states = world_model.to_next_encoded_state_pred((chunk_prev_state_latents, chunk_step_actions_cond))
-                    chunk_values = self.value_network(chunk_encoded_states, chunk_pred_states, discount = discount_factor, risk = risk_factor)
+                    chunk_values = self.value_network(chunk_encoded_states, chunk_pred_states, discount = discount_factor, transition_risk = transition_risk_factor, value_risk = value_risk_factor)
 
                     chunk_rewards, chunk_discounts = rollout_heads(chunk_prev_state_latents, chunk_step_actions_cond)
 
@@ -3083,7 +3026,7 @@ class Agent(Module):
 
                     pred_next_encoded_states.append(pred_next_encoded_state)
 
-                    step_pred_value = self.value_network(pred_next_encoded_state, step_state_latents, discount = discount_factor, risk = risk_factor)
+                    step_pred_value = self.value_network(pred_next_encoded_state, step_state_latents, discount = discount_factor, transition_risk = transition_risk_factor, value_risk = value_risk_factor)
                     pred_values.append(step_pred_value)
 
                 pred_state_latents = rearrange(pred_state_latents, 'h b p d -> b p h d')
@@ -3306,11 +3249,14 @@ class Agent(Module):
         horizon = 8,
         skill_id: int | Tensor | None = None,
         diversity_skill_loss_weight = 0.1,
-        risk_factor: float | Tensor | None = None,
+        transition_risk_factor: float | Tensor | None = None,
+        risk_factor: float | Tensor | None = None, # deprecated alias for transition_risk_factor
+        value_risk_factor: float | Tensor | None = None,
         risk_entropy_bonus_weight: float = 1.0,
         **plan_kwargs
     ):
-        risk_factor = default(risk_factor, self.risk_factor)
+        transition_risk_factor = default(transition_risk_factor, default(risk_factor, self.transition_risk_factor))
+        value_risk_factor = default(value_risk_factor, self.value_risk_factor)
 
         world_model = self.get_world_model(world_model_index)
         temporal_compression = world_model.temporal_compression
@@ -3405,7 +3351,8 @@ class Agent(Module):
                     sensory_layer_hiddens = ema_encoded_sensory_states,
                     temperature = actor_temperature,
                     return_log_prob = True,
-                    risk = risk_factor
+                    transition_risk = transition_risk_factor,
+                    value_risk = value_risk_factor
                 )
                 if exists(skill_actor_cond):
                     actor_kwargs.update(actor_cond = skill_actor_cond)
@@ -3430,7 +3377,8 @@ class Agent(Module):
                         return_pred_state_latents = True,
                         world_model_index = world_model_index,
                         skill_id = skill_id,
-                        risk_factor = risk_factor,
+                        transition_risk_factor = transition_risk_factor,
+                        value_risk_factor = value_risk_factor,
                         **plan_kwargs
                     )
 
@@ -3513,10 +3461,11 @@ class Agent(Module):
 
         base_reward = rewards
 
-        # risk transition reward adjustment - https://arxiv.org/abs/2102.05371
+        # transition risk reward adjustment (aleatoric risk - exploration bonus for
+        # stochastic transitions) - https://arxiv.org/abs/2102.05371
 
-        risk_reward = None
-        if exists(risk_factor) and world_model.probabilistic_state_transition:
+        transition_risk_reward = None
+        if exists(transition_risk_factor) and world_model.probabilistic_state_transition:
             with torch.no_grad():
                 state_latents = self.to_state_latent(self.encode_states(self.ema_state_encoder, states)[0])
                 action_cond = actions if self.is_transition_action_space_raw else self.to_action_latent(actions)
@@ -3545,15 +3494,15 @@ class Agent(Module):
                 distr = world_model.state_transition_beta_distr(transition_logits, return_distr = True)
 
                 transition_entropy = reduce(distr.entropy().exp(), 'b n ... d -> b n', 'sum')
-                risk_reward = cast_tensor(risk_factor) * transition_entropy * risk_entropy_bonus_weight
+                transition_risk_reward = cast_tensor(transition_risk_factor) * transition_entropy * risk_entropy_bonus_weight
 
                 if is_chunked:
                     # spread each compressed-step risk over its `temporal_compression` raw steps, zero for the tail
 
-                    risk_reward = risk_reward.repeat_interleave(temporal_compression, dim = 1)
-                    risk_reward = F.pad(risk_reward, (0, states.shape[1] - stop_offset))
+                    transition_risk_reward = transition_risk_reward.repeat_interleave(temporal_compression, dim = 1)
+                    transition_risk_reward = F.pad(transition_risk_reward, (0, states.shape[1] - stop_offset))
 
-                rewards = rewards + risk_reward
+                rewards = rewards + transition_risk_reward
 
         with torch.no_grad():
             state = tree_map_tensor_to_device(state, self.device)
@@ -3637,9 +3586,10 @@ class Agent(Module):
             state_latents = all_ema_state_latents,
             skill_ids = skill_ids_tensor,
             discount_factor = self.discount_factor,
-            risk_factor = risk_factor,
+            transition_risk_factor = transition_risk_factor,
+            value_risk_factor = value_risk_factor,
             base_reward = base_reward,
-            risk_reward = risk_reward,
+            transition_risk_reward = transition_risk_reward,
             skill_reward = skill_reward
         )
 
@@ -3978,15 +3928,17 @@ class Agent(Module):
                 returns_tensor = returns
 
         val_state_tokens, _ = self.get_value_state_tokens(states, base_state_tokens = state_tokens)
-        val_state_latents = self.to_state_latent(val_state_tokens)
-        pred_values = self.value_network(val_state_tokens, self.frac_gradient(val_state_latents), discounts)
+        val_state_latents = self.frac_gradient(self.to_state_latent(val_state_tokens))
+        pred_values = self.value_network(val_state_tokens, val_state_latents, discounts)
 
         if exists(returns_tensor):
-            assert pred_values.shape == returns_tensor.shape, f'predicted values shape {pred_values.shape} must match returns shape {returns_tensor.shape}'
-
-            raw_value_loss = F.smooth_l1_loss(pred_values, returns_tensor, reduction = 'none')
-
-            value_loss = masked_mean(raw_value_loss, mask, average_mode = masked_loss_average_mode)
+            value_loss = self.value_network.compute_loss(
+                pred_values,
+                returns_tensor,
+                cond = (val_state_tokens, val_state_latents),
+                mask = mask,
+                average_mode = masked_loss_average_mode
+            )
 
 
 

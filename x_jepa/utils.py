@@ -22,9 +22,10 @@ class Experience(NamedTuple):
     state_latents: Tensor | None = None
     skill_ids: Tensor | None = None
     discount_factor: float | Tensor | None = None
-    risk_factor: float | Tensor | None = None
+    transition_risk_factor: float | Tensor | None = None
+    value_risk_factor: float | Tensor | None = None
     base_reward: Tensor | None = None
-    risk_reward: Tensor | None = None
+    transition_risk_reward: Tensor | None = None
     skill_reward: Tensor | None = None
 
 # fn inspection helpers
@@ -99,7 +100,7 @@ def store_experience_in_replay_buffer(
             fields['dones'] = 'int'
 
         if exists(returns) and is_tensor(returns):
-            fields['returns'] = 'float'
+            fields['returns'] = tensor_to_field_spec(returns)
         if exists(experience.state_latents):
             fields['state_latents'] = tensor_to_field_spec(experience.state_latents)
 

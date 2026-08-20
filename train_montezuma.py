@@ -40,7 +40,7 @@ from x_mlps_pytorch import MLP
 from x_jepa import Agent
 from x_jepa.x_jepa import Transformer, calc_returns
 from x_jepa.intrinsic import CoinFlipNetwork
-from x_jepa.utils import store_experience_in_replay_buffer, divisible_by
+from x_jepa.utils import store_experience_in_replay_buffer, divisible_by, exists
 
 # envs
 
@@ -162,27 +162,58 @@ def count_new_unique(states, episode_lens, frame_size, unique_seen):
         unique_seen.update(hashes)
     return unique, len(unique_seen)
 
-# planning fitness - two ways:
-#   'value' (old baseline): sum of per-step bootstrap values
+# planning fitness - four ways:
+#   'value' (old baseline): sum of per-step bootstrap values (risk-neutral mean over
+#     value statistics for probabilistic value heads)
+#   'value_risk': LCB sum of per-step (mean - risk_aversion * std) over the value
+#     statistics - risk-averse planning prefers low-uncertainty values
 #   'rollout' (stephen chung way): discounted rollout return with hard termination gating -
 #     rewards after a predicted termination and the bootstrap both drop out; the continuation
 #     head predicts per-step continuation, < 0.5 counts as an episode end
+#   'rollout_risk': rollout return (risk-neutral mean over heads) minus risk_aversion times
+#     the value-head std of the final-state bootstrap - goal-reaching via the dense reward
+#     head, risk-aversion via value uncertainty
 
-def make_fitness(mode = 'rollout', gamma = 0.99):
+def _value_mean_std(pred_values):
+    if pred_values.ndim == 4:
+        mean = pred_values.mean(dim = -1)
+        std = pred_values.std(dim = -1)
+    else:
+        mean, std = pred_values, None
+    return mean, std
+
+def make_fitness(mode = 'rollout', gamma = 0.99, risk_aversion = 0.0):
     if mode == 'value':
-        return lambda pred_values: reduce(pred_values, 'b p h -> b p', 'sum')
+        def value_fitness(pred_values):
+            mean, _ = _value_mean_std(pred_values)
+            return reduce(mean, 'b p h -> b p', 'sum')
+        return value_fitness
 
-    assert mode == 'rollout', f'unknown fitness mode: {mode}'
+    if mode == 'value_risk':
+        def value_risk_fitness(pred_values):
+            mean, std = _value_mean_std(pred_values)
+            score = mean if not exists(std) else mean - risk_aversion * std
+            return reduce(score, 'b p h -> b p', 'sum')
+        return value_risk_fitness
 
-    def fitness_fn(pred_rewards, pred_discounts, pred_values):
+    assert mode in ('rollout', 'rollout_risk'), f'unknown fitness mode: {mode}'
+
+    def rollout_fitness(pred_rewards, pred_discounts, pred_values):
         survived = torch.cumprod((pred_discounts >= 0.5).float(), dim = -1)
         alive = torch.cat((torch.ones_like(survived[..., :1]), survived[..., :-1]), dim = -1)
         horizon = pred_rewards.shape[-1]
         discounts = gamma ** torch.arange(horizon, device = pred_rewards.device)
         rollout_return = einsum(pred_rewards * alive, discounts, 'b p h, h -> b p')
-        bootstrap = pred_values[:, :, -1] * (gamma ** horizon) * survived[:, :, -1]
+        bootstrap_values, bootstrap_std = _value_mean_std(pred_values)
+        bootstrap = bootstrap_values[:, :, -1] * (gamma ** horizon) * survived[:, :, -1]
+
+        if mode == 'rollout_risk' and exists(bootstrap_std):
+            bootstrap_risk = bootstrap_std[:, :, -1] * (gamma ** horizon) * survived[:, :, -1]
+            bootstrap = bootstrap - risk_aversion * bootstrap_risk
+
         return rollout_return + bootstrap
-    return fitness_fn
+
+    return rollout_fitness
 
 # novelty bonus (Lobel et al. 2023) - coin-flip pseudocounts B(s) ~ 1/sqrt(N(s)), or knn distance
 # to the nearest previously seen latent
@@ -290,7 +321,8 @@ def main(
     gamma = 0.99,
     use_intrinsic = True,
     novelty = 'coinflip',
-    fitness_mode = 'rollout', # 'rollout' = reward + continuation heads with termination gating, 'value' = sum of predicted values
+    fitness_mode = 'rollout', # 'rollout' = reward + continuation heads with termination gating, 'value' = sum of predicted values, 'value_risk' = LCB over probabilistic values
+    risk_aversion = 0.0, # LCB penalty for 'value_risk' fitness - higher = more risk-averse planning
     intrinsic_reward_scale = 1.0, # novelty bonus shaping for the value critic returns
     existence_penalty = -0.01, # per-step penalty, gives the reward head a stationary signal
     death_penalty = -6.0, # terminal penalty, makes dying states bad for the fitness
@@ -353,7 +385,7 @@ def main(
     if use_intrinsic:
         novelty_bonus, novelty_update = make_novelty(novelty, dim, device)
 
-    fitness_fn = make_fitness(fitness_mode, gamma)
+    fitness_fn = make_fitness(fitness_mode, gamma, risk_aversion)
 
     buffer = None
     wm_loss_val = 0.0

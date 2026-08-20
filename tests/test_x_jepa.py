@@ -2436,7 +2436,7 @@ def test_risk_conditioning_e2e_rollout_and_experience():
         model = model,
         dim_action = 2,
         add_reflexive_actor = True,
-        risk_factor = 0.0,
+        transition_risk_factor = 0.0,
         probabilistic_state_transition = True
     )
 
@@ -2447,7 +2447,7 @@ def test_risk_conditioning_e2e_rollout_and_experience():
         env_optimistic,
         max_steps = 4,
         actor_module = 'reflexive',
-        risk_factor = 1.0,
+        transition_risk_factor = 1.0,
         risk_entropy_bonus_weight = 1.0
     )
 
@@ -2455,17 +2455,243 @@ def test_risk_conditioning_e2e_rollout_and_experience():
         env_pessimistic,
         max_steps = 4,
         actor_module = 'reflexive',
-        risk_factor = -2.0,
+        transition_risk_factor = -2.0,
         risk_entropy_bonus_weight = 1.0
     )
 
     assert exists(exp_optimistic.base_reward)
-    assert exists(exp_optimistic.risk_reward)
+    assert exists(exp_optimistic.transition_risk_reward)
 
     loss_opt, _ = ppo_loss(agent, exp_optimistic, actor_module = 'reflexive', return_breakdown = True)
     loss_pess, _ = ppo_loss(agent, exp_pessimistic, actor_module = 'reflexive', return_breakdown = True)
 
     (loss_opt + loss_pess).backward()
+
+def test_risk_embedder_takes_transition_and_value_risk_separately():
+    from x_jepa.value_networks import (
+        TransitionRiskEmbedder, ValueRiskEmbedder, RiskEmbedder, EnsembleValue
+    )
+
+    dim = 32
+    batch, seq_len = 2, 4
+
+    # separate bin ranges - transition risk is log-odds-ish (can be negative), value
+    # risk is an uncertainty std (>= 0), so the two channels scale differently
+
+    transition_embedder = TransitionRiskEmbedder(dim)
+    value_embedder = ValueRiskEmbedder(dim)
+
+    assert transition_embedder.bin_centers.min() < 0.
+    assert value_embedder.bin_centers.min() >= 0.
+
+    risk_embedder = RiskEmbedder(dim)
+
+    transition_risk = torch.tensor([1.0, -1.0])
+    value_risk = torch.tensor([0.3, 1.5])
+
+    transition_embed = risk_embedder.embed_transition_risk(transition_risk)
+    value_embed = risk_embedder.embed_value_risk(value_risk)
+
+    assert transition_embed.shape == (2, dim)
+    assert value_embed.shape == (2, dim)
+
+    combined = risk_embedder(transition_risk, value_risk)
+
+    # both risks are taken into account, each through its own channel - the combined
+    # embedding is exactly the sum of the separate transition and value embeddings
+
+    assert_close(combined, transition_embed + value_embed, atol = 1e-6, rtol = 1e-6)
+
+    # each risk alone still conditions the embedding
+
+    assert_close(risk_embedder(transition_risk, None), transition_embed, atol = 1e-6, rtol = 1e-6)
+    assert_close(risk_embedder(None, value_risk), value_embed, atol = 1e-6, rtol = 1e-6)
+
+    # changing only the transition risk changes the embedding
+
+    different_transition = risk_embedder(transition_risk * 0.5, value_risk)
+    assert not torch.allclose(combined, different_transition, atol = 1e-6)
+
+    # changing only the value risk changes the embedding
+
+    different_value = risk_embedder(transition_risk, value_risk * 0.5)
+    assert not torch.allclose(combined, different_value, atol = 1e-6)
+
+    # different values for both risks produce distinct conditioning
+
+    embeds = [
+        risk_embedder(transition_risk, value_risk),
+        risk_embedder(transition_risk, value_risk * 0.5),
+        risk_embedder(transition_risk * 0.5, value_risk),
+        risk_embedder(transition_risk * 0.5, value_risk * 0.5)
+    ]
+
+    for i in range(len(embeds)):
+        for j in range(i + 1, len(embeds)):
+            assert not torch.allclose(embeds[i], embeds[j], atol = 1e-6), f'embedding pair ({i}, {j}) must differ'
+
+    # gradients flow into both embedders independently
+
+    combined.sum().backward()
+    assert exists(risk_embedder.transition_risk_embedder.net[0].weight.grad)
+    assert exists(risk_embedder.value_risk_embedder.net[0].weight.grad)
+    assert risk_embedder.transition_risk_embedder.net[0].weight.grad.abs().sum() > 0.
+    assert risk_embedder.value_risk_embedder.net[0].weight.grad.abs().sum() > 0.
+
+    # a value network built with the combined embedder conditions on both risks, keeps
+    # separate EMA copies, and responds to different values of either risk
+
+    tokens = torch.randn(batch, seq_len, dim)
+    latents = torch.randn(batch, seq_len, dim)
+
+    value_net = EnsembleValue(
+        dim = dim,
+        dim_state_latent = dim,
+        num_heads = 3,
+        transition_risk_factor = 0.0,
+        value_risk_factor = 0.0,
+        risk_embedder = risk_embedder
+    )
+
+    assert value_net.transition_risk_embedder is risk_embedder.transition_risk_embedder
+    assert value_net.value_risk_embedder is risk_embedder.value_risk_embedder
+
+    value_base = value_net(tokens, latents, transition_risk = 1.0, value_risk = 0.2)
+    value_value_risk_swapped = value_net(tokens, latents, transition_risk = 1.0, value_risk = 1.4)
+    value_transition_risk_swapped = value_net(tokens, latents, transition_risk = 0.5, value_risk = 0.2)
+
+    assert value_base.shape == (batch, seq_len, 3)
+
+    # different value risk, same transition risk
+    assert not torch.allclose(value_base, value_value_risk_swapped)
+
+    # same value risk, different transition risk
+    assert not torch.allclose(value_base, value_transition_risk_swapped)
+
+    # runtime defaults fall back to the configured factors
+
+    assert_close(value_net(tokens, latents), value_net(tokens, latents))
+
+    value_net.update()
+    assert exists(value_net.ema_value_risk_embedder)
+
+    value_ema = value_net.forward_ema(tokens, latents, transition_risk = 1.0, value_risk = 0.2)
+    assert value_ema.shape == (batch, seq_len, 3)
+
+def test_risk_conditioning_e2e_both_risks_separate_values():
+    from x_jepa.rl import ppo_loss
+    from x_jepa.value_networks import TransitionRiskEmbedder, ValueRiskEmbedder
+
+    class DummyVectorEnv:
+        def __init__(self, batch = 2, state_dim = 3):
+            self.batch = batch
+            self.state_dim = state_dim
+            self.is_vector_env = True
+            self.num_envs = batch
+
+        def reset(self):
+            return torch.randn(self.batch, self.state_dim), {}
+
+        def step(self, action):
+            state = torch.randn(self.batch, self.state_dim)
+            reward = torch.ones(self.batch)
+            terminated = torch.zeros(self.batch, dtype = torch.bool)
+            truncated = torch.zeros(self.batch, dtype = torch.bool)
+            return state, reward, terminated, truncated, {}
+
+    dim = 32
+    state_encoder = nn.Linear(3, dim)
+    action_encoder = nn.Linear(2, dim)
+    model = Transformer(dim = dim, depth = 2, dim_head = 16, heads = 2)
+
+    agent = Agent(
+        state_encoder = state_encoder,
+        action_encoder = action_encoder,
+        model = model,
+        dim_action = 2,
+        add_reflexive_actor = True,
+        transition_risk_factor = 0.0,
+        value_risk_factor = 0.0,
+        probabilistic_state_transition = True
+    )
+
+    # both embedders are constructed and are separate modules
+
+    actor = agent.actors['reflexive']
+    assert isinstance(actor.transition_risk_embedder, TransitionRiskEmbedder)
+    assert isinstance(actor.value_risk_embedder, ValueRiskEmbedder)
+    assert actor.transition_risk_embedder is not actor.value_risk_embedder
+
+    value_net = agent.value_network
+    assert isinstance(value_net.transition_risk_embedder, TransitionRiskEmbedder)
+    assert isinstance(value_net.value_risk_embedder, ValueRiskEmbedder)
+    assert value_net.transition_risk_embedder is not value_net.value_risk_embedder
+
+    # the reflexive actor responds to each risk separately - different values for either
+    # risk change the action predictions
+
+    state_latents = torch.randn(2, 4, dim)
+
+    pred_base = actor.get_action_preds(state_latents, transition_risk = 1.0, value_risk = 0.2)
+    pred_value_risk_swapped = actor.get_action_preds(state_latents, transition_risk = 1.0, value_risk = 1.5)
+    pred_transition_risk_swapped = actor.get_action_preds(state_latents, transition_risk = -2.0, value_risk = 0.2)
+
+    assert pred_base.shape == (2, 4, 4) # beta mean + concentration
+    assert not torch.allclose(pred_base, pred_value_risk_swapped)
+    assert not torch.allclose(pred_base, pred_transition_risk_swapped)
+
+    # the value network responds to each risk separately
+
+    tokens = torch.randn(2, 4, dim)
+    latents = torch.randn(2, 4, dim)
+
+    value_base = value_net(tokens, latents, transition_risk = 1.0, value_risk = 0.2)
+    value_value_risk_swapped = value_net(tokens, latents, transition_risk = 1.0, value_risk = 1.5)
+    value_transition_risk_swapped = value_net(tokens, latents, transition_risk = -2.0, value_risk = 0.2)
+
+    assert not torch.allclose(value_base, value_value_risk_swapped)
+    assert not torch.allclose(value_base, value_transition_risk_swapped)
+
+    # rollout with different values for BOTH risks at once - both are recorded and both
+    # affect the ppo loss
+
+    exp_pair_a = agent.interact_with_environment(
+        DummyVectorEnv(),
+        max_steps = 4,
+        actor_module = 'reflexive',
+        transition_risk_factor = 1.0,
+        value_risk_factor = 0.2,
+        risk_entropy_bonus_weight = 1.0
+    )
+
+    exp_pair_b = agent.interact_with_environment(
+        DummyVectorEnv(),
+        max_steps = 4,
+        actor_module = 'reflexive',
+        transition_risk_factor = -2.0,
+        value_risk_factor = 1.5,
+        risk_entropy_bonus_weight = 1.0
+    )
+
+    assert exp_pair_a.transition_risk_factor == 1.0
+    assert exp_pair_a.value_risk_factor == 0.2
+    assert exp_pair_b.transition_risk_factor == -2.0
+    assert exp_pair_b.value_risk_factor == 1.5
+    assert exists(exp_pair_a.transition_risk_reward)
+    assert exists(exp_pair_b.transition_risk_reward)
+
+    loss_pair_a, _ = ppo_loss(agent, exp_pair_a, actor_module = 'reflexive', return_breakdown = True)
+    loss_pair_b, _ = ppo_loss(agent, exp_pair_b, actor_module = 'reflexive', return_breakdown = True)
+
+    # value risk flows through ppo's value-network conditioning - overriding the factor
+    # with a different value changes the loss
+
+    loss_pair_a_override = ppo_loss(agent, exp_pair_a, actor_module = 'reflexive', value_risk_factor = 1.5)
+
+    (loss_pair_a + loss_pair_b + loss_pair_a_override).backward()
+
+    assert not torch.allclose(loss_pair_a, loss_pair_b)
+    assert not torch.allclose(loss_pair_a, loss_pair_a_override)
 
 def test_plan_with_seed_action():
     dim = 32
@@ -2617,3 +2843,188 @@ def test_coin_flip_network_novelty():
 
     assert bonus_a < 0.2, f'bonus for frequent state should drop, got {bonus_a:.4f}'
     assert bonus_b > 0.5, f'bonus for novel state should stay high, got {bonus_b:.4f}'
+
+# probabilistic value networks
+
+def test_value_networks_shapes_and_uncertainty():
+    from x_jepa.value_networks import (
+        Value, EnsembleValue, DistributionalValue, MeanVarianceValue,
+        create_value_network, TransitionRiskEmbedder
+    )
+
+    dim, dim_state_latent = 16, 16
+    batch, seq_len = 2, 8
+
+    tokens = torch.randn(batch, seq_len, dim)
+    latents = torch.randn(batch, seq_len, dim_state_latent)
+
+    value = Value(dim = dim, dim_state_latent = dim_state_latent)
+    out = value(tokens, latents)
+    assert out.shape == (batch, seq_len)
+
+    ensemble = EnsembleValue(dim = dim, dim_state_latent = dim_state_latent, num_heads = 5)
+    out = ensemble(tokens, latents)
+    assert out.shape == (batch, seq_len, 5)
+
+    mean, std = ensemble.mean_and_uncertainty(out)
+    assert mean.shape == (batch, seq_len)
+    assert std.shape == (batch, seq_len)
+    assert ensemble.uncertainty(out).shape == (batch, seq_len)
+
+    # ema bootstrap returns per head
+    ema_out = ensemble.forward_ema(tokens, latents)
+    assert ema_out.shape == (batch, seq_len, 5)
+
+    distributional = DistributionalValue(dim = dim, dim_state_latent = dim_state_latent, num_quantiles = 16)
+    out = distributional(tokens, latents)
+    assert out.shape == (batch, seq_len, 16)
+    assert distributional.value_at_risk(out, alpha = 0.2).shape == (batch, seq_len)
+
+    mean_variance = MeanVarianceValue(dim = dim, dim_state_latent = dim_state_latent)
+    out = mean_variance(tokens, latents)
+    assert out.shape == (batch, seq_len, 2)
+
+    mean, std = mean_variance.mean_and_uncertainty(out)
+    assert mean.shape == (batch, seq_len)
+    assert std.shape == (batch, seq_len)
+    assert (std > 0).all()
+
+    # factory dispatch
+    for vtype, expected in [
+        ('value', Value),
+        ('ensemble', EnsembleValue),
+        ('distributional', DistributionalValue),
+        ('mean_variance', MeanVarianceValue)
+    ]:
+        assert isinstance(create_value_network(vtype, dim = dim, dim_state_latent = dim_state_latent), expected)
+
+def test_value_network_losses():
+    from x_jepa.value_networks import EnsembleValue, DistributionalValue, MeanVarianceValue
+
+    dim, dim_state_latent = 16, 16
+    batch, seq_len = 2, 8
+
+    tokens = torch.randn(batch, seq_len, dim)
+    latents = torch.randn(batch, seq_len, dim_state_latent)
+    returns = torch.randn(batch, seq_len)
+
+    ensemble = EnsembleValue(dim = dim, dim_state_latent = dim_state_latent, num_heads = 5)
+    pred = ensemble(tokens, latents)
+    loss = ensemble.compute_loss(pred, returns)
+    assert loss.ndim == 0
+    assert loss.item() > 0.
+
+    # per-head returns targets
+    per_head_returns = returns.unsqueeze(-1).expand(pred.shape)
+    loss_per_head = ensemble.compute_loss(pred, per_head_returns)
+    assert loss_per_head.ndim == 0
+
+    # bootstrap masks produce a valid loss in training mode
+    ensemble.train()
+    pred_masked = ensemble(tokens, latents)
+    loss_masked = ensemble.compute_loss(pred_masked, returns)
+    assert loss_masked.ndim == 0
+    assert not torch.isnan(loss_masked)
+    ensemble.eval()
+
+    distributional = DistributionalValue(dim = dim, dim_state_latent = dim_state_latent, num_quantiles = 16)
+    pred = distributional(tokens, latents)
+    loss = distributional.compute_loss(pred, returns)
+    assert loss.ndim == 0
+    assert loss.item() > 0.
+
+    mean_variance = MeanVarianceValue(dim = dim, dim_state_latent = dim_state_latent)
+    pred = mean_variance(tokens, latents)
+    loss = mean_variance.compute_loss(pred, returns)
+    assert loss.ndim == 0
+    assert not torch.isnan(loss)
+
+    # mean-variance nll prefers a low variance when returns are easy to predict
+    torch.manual_seed(0)
+    easy_returns = torch.zeros(batch, seq_len)
+    optimizer = torch.optim.Adam(mean_variance.parameters(), lr = 1e-2)
+    for _ in range(200):
+        optimizer.zero_grad()
+        pred = mean_variance(tokens, latents)
+        loss = mean_variance.compute_loss(pred, easy_returns)
+        loss.backward()
+        optimizer.step()
+
+    pred = mean_variance(tokens, latents)
+    _, std = mean_variance.mean_and_uncertainty(pred)
+    assert std.mean().item() < 1.0, f'predicted std should shrink when returns are deterministic, got {std.mean().item():.4f}'
+
+def test_calc_returns_per_statistic_bootstrap():
+    from x_jepa.x_jepa import calc_returns
+
+    batch, seq_len, num_stats = 2, 5, 4
+
+    rewards = torch.randn(batch, seq_len)
+    is_done = torch.zeros(batch, seq_len, dtype = torch.bool)
+    next_values = torch.randn(batch, num_stats)
+    discount = 0.9
+
+    returns = calc_returns(rewards, is_done, next_values, discount)
+    assert returns.shape == (batch, seq_len, num_stats)
+
+    # scalar path unchanged
+    returns_scalar = calc_returns(rewards, is_done, torch.randn(batch), discount)
+    assert returns_scalar.shape == (batch, seq_len)
+
+    # per-statistic returns must be the discounted-sum with the per-stat bootstrap
+    expected_last = rewards[:, -1:] + discount * next_values
+    assert torch.allclose(returns[:, -1], expected_last, atol = 1e-5)
+
+    # with mask, padded entries are zeroed
+    mask = torch.zeros(batch, seq_len, dtype = torch.bool)
+    mask[:, :2] = True
+    returns_masked = calc_returns(rewards, is_done, next_values, discount, mask = mask)
+    assert returns_masked.shape == (batch, seq_len, num_stats)
+    assert (returns_masked[:, 3:] == 0).all()
+
+def test_flow_value_network():
+    from x_jepa.value_networks import FlowValue
+
+    torch.manual_seed(0)
+
+    dim, dim_state_latent = 16, 16
+    batch, seq_len = 2, 8
+
+    flow_value = FlowValue(dim = dim, dim_state_latent = dim_state_latent, num_steps = 4, num_samples = 8)
+
+    tokens = torch.randn(batch, seq_len, dim)
+    latents = torch.randn(batch, seq_len, dim_state_latent)
+    returns = torch.randn(batch, seq_len)
+
+    pred = flow_value(tokens, latents)
+    assert pred.shape == (batch, seq_len, 8)
+
+    mean, std = flow_value.mean_and_uncertainty(pred)
+    assert mean.shape == (batch, seq_len)
+    assert std.shape == (batch, seq_len)
+
+    loss = flow_value.compute_loss(pred, returns, cond = (tokens, latents))
+    assert loss.ndim == 0
+    assert not torch.isnan(loss)
+    assert loss.item() > 0.
+
+    # after overfitting the flow on a fixed (state, return) pair, sampling that state
+    # must produce return samples centered on the target
+    torch.manual_seed(1)
+    state_tokens = torch.randn(2, 4, dim)
+    state_latents = torch.randn(2, 4, dim_state_latent)
+    target = torch.full((2, 4), 2.5)
+
+    optimizer = torch.optim.Adam(flow_value.parameters(), lr = 1e-2)
+    for _ in range(150):
+        optimizer.zero_grad()
+        loss = flow_value.compute_loss(None, target, cond = (state_tokens, state_latents))
+        loss.backward()
+        optimizer.step()
+
+    flow_value.eval()
+    with torch.no_grad():
+        samples = flow_value(state_tokens, state_latents)
+
+    mean = samples.mean(dim = -1)
+    assert (mean - target).abs().mean().item() < 0.6, f'flow mean should track the target return, got {(mean - target).abs().mean().item():.3f}'
