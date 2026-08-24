@@ -1118,7 +1118,7 @@ class Actor(Module):
     def get_risk_embed(self, target_tensor, risk = None):
         return self.get_transition_risk_embed(target_tensor, risk)
 
-    def compute_loss(self, action_preds, target_actions, mask = None, masked_loss_average_mode = 'timestep'):
+    def compute_loss(self, action_preds, target_actions, mask = None, masked_loss_average_mode = 'timestep', per_batch = False):
         if self.continuous_actions:
             raw_loss = self.action_distr.compute_raw_loss(action_preds, target_actions)
         else:
@@ -1127,6 +1127,11 @@ class Actor(Module):
                 target_actions.long(),
                 reduction = 'none'
             )
+
+        if per_batch:
+            # each trajectory's own loss, for the caller to reduce selectively
+
+            return masked_mean(raw_loss, mask, dim = slice(1, None), average_mode = 'timestep')
 
         return masked_mean(raw_loss, mask, average_mode = masked_loss_average_mode)
 
@@ -1199,13 +1204,13 @@ class Actor(Module):
         out = cast_tuple(out)
         return (*out, next_memories)
 
-    def forward(self, target_actions = None, mask = None, masked_loss_average_mode = 'timestep', **kwargs):
+    def forward(self, target_actions = None, mask = None, masked_loss_average_mode = 'timestep', per_batch = False, **kwargs):
         preds = self.get_action_preds(**kwargs)
 
         if not exists(target_actions):
             return preds
 
-        return self.compute_loss(preds, target_actions, mask = mask, masked_loss_average_mode = masked_loss_average_mode)
+        return self.compute_loss(preds, target_actions, mask = mask, masked_loss_average_mode = masked_loss_average_mode, per_batch = per_batch)
 
 class ReflexiveActor(Actor):
     def __init__(
@@ -3610,6 +3615,7 @@ class Agent(Module):
         rewards = None,
         dones = None,
         behavior_clone: bool | str | tuple[str, ...] | list[str] = True,
+        behavior_clone_weight: Tensor | None = None, # Float['batch'] - per-trajectory weight on the behavior-clone loss, generalizing a mask (0./1. weights recover masking); when given, the actor loss is returned per-batch (b,) and excluded from the total loss, so the caller owns the weighted reduction
         return_loss = True,
         memories = None,
         return_memories = False,
@@ -3626,6 +3632,9 @@ class Agent(Module):
             mask = lens_to_mask(lens, max_len = state_len)
 
         masked_loss_average_mode = default(masked_loss_average_mode, self.masked_loss_average_mode)
+
+        if exists(behavior_clone_weight):
+            behavior_clone_weight = behavior_clone_weight.to(device)
 
         world_model = self.get_world_model(world_model_index)
         temporal_compression = world_model.temporal_compression
@@ -3864,9 +3873,12 @@ class Agent(Module):
             action_recon_loss = masked_mean(raw_action_loss, valid_action_mask, average_mode = masked_loss_average_mode)
 
         # behavior clone
+        # with a per-batch weight, the weighted per-batch loss stays for the caller and the aggregate stays zero
 
         actor_bc_loss = self.zero
         actor_losses = dict()
+
+        has_bc_weight = exists(behavior_clone_weight)
 
         bc_seq_len = state_tokens.shape[1] - 1
 
@@ -3898,6 +3910,7 @@ class Agent(Module):
                     target_actions = orig_actions[:, :bc_seq_len],
                     mask = valid_input_mask,
                     masked_loss_average_mode = masked_loss_average_mode,
+                    per_batch = has_bc_weight,
                     state_latents = actor_state_latents,
                     state_tokens = actor_state_tokens,
                     action_cond = tree_map_detach(action_cond),
@@ -3912,8 +3925,13 @@ class Agent(Module):
                     actor_bc_loss_for_name, next_actor_memory = actor_bc_loss_for_name
                     next_model_memories[name] = next_actor_memory
 
+                if has_bc_weight:
+                    actor_bc_loss_for_name = actor_bc_loss_for_name * behavior_clone_weight
+
                 actor_losses[name] = actor_bc_loss_for_name
-                actor_bc_loss = actor_bc_loss + actor_bc_loss_for_name * loss_weight
+
+                if not has_bc_weight:
+                    actor_bc_loss = actor_bc_loss + actor_bc_loss_for_name * loss_weight
 
         # value head
 

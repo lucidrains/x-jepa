@@ -348,6 +348,74 @@ def test_behavior_cloning(
     assert loss.ndim == 0
     loss.backward()
 
+def test_weighted_behavior_cloning():
+    """per-trajectory Float['batch'] weight on the behavior-clone loss, generalizing a mask -
+    a 0./1. weight recovers masking; the weighted actor loss is returned per-batch (b,) for the
+    caller to reduce, and is excluded from the total loss"""
+
+    dim = 32
+    dim_action = 2
+    horizon = 4
+    batch = 4
+
+    model = Transformer(dim = dim, depth = 2, dim_head = 16, heads = 2, causal = True)
+
+    agent = Agent(
+        state_encoder = nn.Linear(3, dim),
+        action_encoder = nn.Linear(dim_action, dim),
+        model = model,
+        dim_action = dim_action,
+        add_reflexive_actor = True,
+        continuous_actions = True
+    )
+
+    states = torch.randn(batch, horizon + 1, 3)
+    actions = torch.randn(batch, horizon, dim_action)
+    rewards = torch.randn(batch, horizon)
+
+    loss_all, lb_all = agent(states, actions, rewards = rewards)
+    loss_ones, lb_ones = agent(states, actions, rewards = rewards, behavior_clone_weight = torch.ones(batch))
+
+    assert lb_ones.actor == 0.
+    assert lb_ones.actor_losses['reflexive'].shape == (batch,)
+
+    # the per-batch actor loss is excluded from the total loss, equals the ungated one
+
+    assert_close(loss_ones, loss_all - lb_all.actor, atol = 1e-5, rtol = 1e-5)
+    assert_close(lb_all.actor, lb_ones.actor_losses['reflexive'].mean(), atol = 1e-4, rtol = 1e-4)
+
+    # 0./1. weights recover masking - only the weighted-in trajectories are behavior cloned
+
+    cumulative_rewards = torch.linspace(0., 1., batch)
+    bc_mask = cumulative_rewards >= cumulative_rewards.quantile(0.75)
+    bc_mask_float = bc_mask.float()
+
+    loss_partial, lb_partial = agent(states, actions, rewards = rewards, behavior_clone_weight = bc_mask_float)
+
+    assert (lb_partial.actor_losses['reflexive'][~bc_mask] == 0.).all()
+    assert (lb_partial.actor_losses['reflexive'][bc_mask] > 0.).all()
+    assert_close(lb_partial.actor_losses['reflexive'][bc_mask], lb_ones.actor_losses['reflexive'][bc_mask], atol = 1e-7, rtol = 1e-7)
+
+    # continuous weights scale the per-batch loss exactly
+
+    bc_weight = torch.rand(batch)
+
+    _, lb_weighted = agent(states, actions, rewards = rewards, behavior_clone_weight = bc_weight)
+
+    assert_close(lb_weighted.actor_losses['reflexive'], lb_ones.actor_losses['reflexive'] * bc_weight, atol = 1e-7, rtol = 1e-7)
+
+    # zero-weighted trajectories are excluded from backward - backprop only through the weighted-in
+
+    actor_param = next(agent.actors['reflexive'].parameters())
+
+    agent.zero_grad()
+    loss_partial.backward()
+    assert not exists(actor_param.grad)
+
+    agent.zero_grad()
+    lb_weighted.actor_losses['reflexive'].sum().backward()
+    assert exists(actor_param.grad)
+
 def test_prefix_transition_mtp():
     # fast-lewm prefix transition with mtp lookahead, end-to-end: each prefix predicts the next
     # `lookahead` state latents during training, planning still consumes the immediate next latent,
