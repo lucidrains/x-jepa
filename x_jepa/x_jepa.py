@@ -1468,9 +1468,10 @@ def compressed_lane_bounds(
     state_len,
     temporal_compression
 ):
-    # number of compressed steps and the raw timestep offset they cover
+    # number of compressed steps and the raw timestep offset they cover -
+    # k complete chunks need states at 0, tc, ..., k * tc, so k = (state_len - 1) // tc
 
-    compressed_len = (state_len - temporal_compression) // temporal_compression
+    compressed_len = (state_len - 1) // temporal_compression
     return compressed_len, temporal_compression * compressed_len
 
 def extract_temporal_compressed_lanes(

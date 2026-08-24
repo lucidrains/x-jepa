@@ -11,7 +11,7 @@ from einops.layers.torch import Rearrange
 
 from x_mlps_pytorch import MLP
 
-from x_jepa.x_jepa import Agent, WorldModel, Transformer, Actor, exists, AgentRolloutWrapper, TTTMetaLearningLoss, PrefixStateTransition
+from x_jepa.x_jepa import Agent, WorldModel, Transformer, Actor, exists, AgentRolloutWrapper, TTTMetaLearningLoss, PrefixStateTransition, compressed_lane_bounds
 from x_jepa.min_gru import minGRUBlocks
 from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
 from x_jepa.goals import GoalGenerator, MetricResidualNetwork
@@ -2128,6 +2128,13 @@ def test_world_model_temporal_compression(temporal_compression):
     )
 
     assert planned_actions.shape == (2, horizon, dim_action)
+
+@param('temporal_compression', (2, 4))
+def test_compressed_lane_bounds_keep_final_chunk(temporal_compression):
+    num_chunks = 4
+    seq_len = num_chunks * temporal_compression + 1
+    compressed_len, stop_offset = compressed_lane_bounds(seq_len, temporal_compression)
+    assert (compressed_len, stop_offset) == (num_chunks, num_chunks * temporal_compression)
 
 @param('is_vectorized_env', (False, True))
 @param('diversity_skill_loss_weight', (0., 0.1))
