@@ -1169,6 +1169,50 @@ def test_reflexive_actor_and_planning():
 
     assert planned_actions.shape == (2, 3, dim_action)
 
+@param('temporal_compression', (1, 2))
+def test_q_filtered_actor_seeding(temporal_compression):
+    dim = 128
+    dim_action = 4
+
+    world_model = Agent(
+        model = Transformer(dim = dim, depth = 2, causal = True),
+        dim_action = dim_action,
+        state_encoder = nn.Linear(64, dim),
+        action_encoder = nn.Linear(dim_action, dim),
+        action_decoder = nn.Linear(dim, dim_action),
+        transition_action_space = 'local',
+        continuous_actions = True,
+        add_reflexive_actor = True,
+        actor_loss_weights = 1.,
+        temporal_compression = temporal_compression
+    )
+
+    world_model.eval()
+
+    states = torch.randn(2, 5, 64)
+    horizon = 2 * temporal_compression
+
+    def fitness_fn(pred_state_latents):
+        return torch.randn(pred_state_latents.shape[:2])
+
+    plan_kwargs = dict(
+        states = states[:, :1],
+        actions = torch.empty(2, 0, dim_action),
+        fitness_fn = fitness_fn,
+        horizon = horizon,
+        pop_size = 4,
+        generations = 1,
+        seed_with_actor = 'reflexive',
+        actor_temperature = 0.5
+    )
+
+    plain_actions = world_model.plan(**plan_kwargs)
+    filtered_actions = world_model.plan(**plan_kwargs, value_filter_samples = 8)
+
+    assert plain_actions.shape == (2, horizon, dim_action)
+    assert filtered_actions.shape == (2, horizon, dim_action)
+    assert not torch.allclose(plain_actions, filtered_actions)
+
 def test_transformer_actor_sequential_vs_parallel():
     dim = 128
     dim_action = 4
@@ -3103,3 +3147,151 @@ def test_flow_value_network():
 
     mean = samples.mean(dim = -1)
     assert (mean - target).abs().mean().item() < 0.6, f'flow mean should track the target return, got {(mean - target).abs().mean().item():.3f}'
+
+# Q-filtered actor seeding e2e - Giridhar et al. https://arxiv.org/abs/2608.21204
+
+@param('temporal_compression', (1, 2))
+@param('use_lens', (False, True))
+def test_q_learning_loss(temporal_compression, use_lens):
+    # the Q critic trains alone: the HL-Gauss SARSA loss over all valid steps is scalar and
+    # finite, gradients reach the Q head but not the encoders or world model, and lens
+    # mask out the padded tails of variable-length episodes
+
+    dim = 64
+    dim_action = 2
+
+    agent = Agent(
+        model = Transformer(dim = dim, depth = 2, causal = True),
+        dim_action = dim_action,
+        state_encoder = nn.Linear(2, dim),
+        action_encoder = nn.Linear(dim_action, dim),
+        action_decoder = nn.Linear(dim, dim_action),
+        transition_action_space = 'local',
+        continuous_actions = True,
+        temporal_compression = temporal_compression
+    )
+
+    batch, seq_len = 4, 4 * temporal_compression + 1
+    states = torch.randn(batch, seq_len, 2)
+    actions = torch.randn(batch, seq_len - 1, dim_action).tanh()
+    returns = torch.randn(batch, seq_len)
+
+    lens = None
+    if use_lens:
+        lens = torch.tensor([seq_len, seq_len, 2, 1], dtype = torch.long)
+
+    loss = agent.q_learning_loss(states, actions, returns, lens = lens)
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
+    loss.backward()
+
+    q_param = next(agent.world_model.to_q_pred.parameters())
+    assert exists(q_param.grad) and q_param.grad.abs().sum() > 0.
+
+    for p in agent.state_encoder.parameters():
+        assert not exists(p.grad), 'q learning must not touch the state encoder'
+    for p in agent.world_model.model.parameters():
+        assert not exists(p.grad), 'q learning must not touch the world model'
+
+@param('temporal_compression', (1, 2))
+def test_q_filtered_seeding(temporal_compression):
+    dim = 64
+    gamma = 0.99
+    goal = torch.tensor([1.0, 1.0])
+
+    def step_env(state, action):
+        next_state = (state + 0.25 * action).clamp(-1.0, 1.0)
+        return next_state, -(next_state - goal).norm(dim = -1)
+
+    def collect(n, policy):
+        episodes = []
+        for _ in range(n):
+            state = torch.rand(2) * 2.0 - 1.0
+            states, actions, rewards = [state], [], []
+            for _ in range(16):
+                action = policy(state)
+                state, reward = step_env(state, action)
+                actions.append(action); rewards.append(reward); states.append(state)
+            episodes.append((torch.stack(states), torch.stack(actions), torch.stack(rewards)))
+        return episodes
+
+    def make_batches(episodes):
+        states, actions, rewards = zip(*episodes)
+        states = torch.stack(list(states)); actions = torch.stack(list(actions))
+        rewards = [torch.cat((r, torch.zeros(1))) for r in rewards]
+        dones = [torch.zeros(len(r) + 1, dtype = torch.bool) for r in rewards]
+        returns = []
+        for r in rewards:
+            ret = torch.zeros_like(r); acc = 0.0
+            for t in range(len(r) - 1, -1, -1):
+                acc = r[t] + gamma * acc; ret[t] = acc
+            returns.append(ret)
+        return states, actions, torch.stack(rewards), torch.stack(dones), torch.stack(returns)
+
+    def build(c):
+        return Agent(
+            model = Transformer(dim = dim, depth = 2, causal = True),
+            dim_action = 2,
+            state_encoder = nn.Linear(2, dim),
+            action_encoder = nn.Linear(2, dim),
+            action_decoder = nn.Linear(dim, 2),
+            transition_action_space = 'local',
+            continuous_actions = True,
+            add_reflexive_actor = True,
+            actor_loss_weights = 1.,
+            discount_factor = gamma,
+            temporal_compression = c
+        )
+
+    def train_wm(agent, states, actions, rewards, dones, returns):
+        optimizer = torch.optim.Adam(agent.parameters(), lr = 1e-3)
+        agent.train()
+        lens = torch.full((32,), states.shape[1], dtype = torch.long)
+        for step in range(400):
+            idx = torch.randint(0, states.shape[0], (32,))
+            loss, _ = agent(states[idx], actions[idx], lens = lens, returns = returns[idx], rewards = rewards[idx], dones = dones[idx], behavior_clone = False)
+            loss.backward(); optimizer.step(); optimizer.zero_grad(); agent.update()
+        agent.eval()
+
+    def execute(agent, test_states, **plan_kwargs):
+        torch.manual_seed(0)
+        batch = test_states.shape[0]
+        planned_actions = agent.plan(
+            states = test_states[:, None, :],
+            actions = torch.empty(batch, 0, 2),
+            goal_state = goal[None],
+            horizon = 8,
+            seed_with_actor = 'reflexive',
+            actor_temperature = 1.0,
+            **plan_kwargs
+        )
+        state = test_states.clone()
+        cumulative = torch.zeros(batch)
+        for t in range(planned_actions.shape[1]):
+            state, reward = step_env(state, planned_actions[:, t])
+            cumulative = cumulative + reward
+        return cumulative
+
+    torch.manual_seed(0)
+    good_episodes = collect(96, lambda s: ((goal - s) * 2.0 + 0.05 * torch.randn_like(s)).clamp(-1.0, 1.0))
+    failure_episodes = collect(48, lambda s: torch.rand_like(s) * 2.0 - 1.0)
+    g_states, g_actions, g_rewards, g_dones, g_returns = make_batches(good_episodes)
+    m_states, m_actions, _, _, m_returns = make_batches(good_episodes + failure_episodes)
+
+    agent = build(temporal_compression)
+    train_wm(agent, g_states, g_actions, g_rewards, g_dones, g_returns)
+
+    # the framework trains the Q critic end-to-end - SARSA TD bootstrap off the EMA head,
+    # HL-Gauss loss, internal optimizer and EMA target updates
+    agent.train_q(m_states, m_actions, m_returns, steps = 2000, batch_size = 256, lr = 1e-3, discount = gamma)
+
+    torch.manual_seed(11)
+    test_states = torch.rand(24, 2) * 2.0 - 1.0
+
+    plain = execute(agent, test_states, pop_size = 1, generations = 1)
+    filtered = execute(agent, test_states, pop_size = 1, generations = 1, value_filter_samples = 16)
+
+    plain_mean, filtered_mean = plain.mean().item(), filtered.mean().item()
+
+    assert filtered_mean > plain_mean + 0.3, \
+        f'Q-filtered seeding should beat plain actor seeding: plain {plain_mean:+.3f} vs Q {filtered_mean:+.3f}'

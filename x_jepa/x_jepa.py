@@ -27,6 +27,7 @@ from ema_pytorch import EMA
 from assoc_scan import AssocScan
 
 from x_mlps_pytorch import MLP
+from hl_gauss_pytorch import HLGaussLoss
 
 from torch_einops_utils import (
     pad_right_at_dim_to,
@@ -54,6 +55,7 @@ from x_jepa.min_gru import minGRUBlocks
 from x_jepa.goals import GoalGenerator
 from x_jepa.flow_matching import FlowMatching
 from x_jepa.intrinsic import SkillLatents, SkillDiscriminator
+from x_jepa.rl import coerce_experience
 
 # constants
 
@@ -1547,7 +1549,13 @@ class WorldModel(Module):
         state_transition_heads = 4,
         state_transition_dim_head = 16,
         transition_lookahead = 1,
-        temporal_compression = 1
+        temporal_compression = 1,
+        q_num_bins = 128,
+        q_min_value = -100.,
+        q_max_value = 100.,
+        q_use_symlog = True,
+        q_frac_gradients = 0., # fraction of the Q head gradient flowing into the world model, like the value head
+        to_q_pred: Module | None = None # custom Q head MLP over (state latent, action cond)
     ):
         super().__init__()
 
@@ -1606,6 +1614,14 @@ class WorldModel(Module):
         self.to_reward_pred = MLP(dim_state_latent + dim_transition_action_input, *((dim_model * 2,) * 2), 1)
         self.to_discount_pred = MLP(dim_state_latent + dim_transition_action_input, *((dim_model * 2,) * 2), 1)
 
+        # Q head - HL-Gauss critic over (state latent, action cond) for Q-filtered seeding
+        # Giridhar et al. https://arxiv.org/abs/2608.21204
+
+        self.to_q_pred = default(to_q_pred, MLP(dim_state_latent + dim_transition_action_input, *((dim_model * 2,) * 2), q_num_bins))
+        self.ema_to_q_pred = EMA(self.to_q_pred, beta = ema_beta)
+        self.q_frac_gradient = FracGradient(q_frac_gradients)
+        self.q_hl_gauss = HLGaussLoss(min_value = q_min_value, max_value = q_max_value, num_bins = q_num_bins, use_symlog = q_use_symlog)
+
         # probabilistic readouts
 
         self.probabilistic_state_transition = probabilistic_state_transition
@@ -1637,6 +1653,18 @@ class WorldModel(Module):
         self.ema_model.update()
         self.ema_state_transition.update()
         self.ema_state_transition_for_planning.update()
+        self.ema_to_q_pred.update()
+
+    def q_value(self, state_latents, action_cond):
+        # EMA read - scalar Q expectation over the HL-Gauss bins
+        logits = self.ema_to_q_pred((state_latents, action_cond))
+        return self.q_hl_gauss(logits)
+
+    def q_logits(self, state_latents, action_cond):
+        return self.to_q_pred((self.q_frac_gradient(state_latents), action_cond))
+
+    def q_loss(self, logits, returns, mask = None, reduction = None):
+        return self.q_hl_gauss(logits, returns, mask = mask, reduction = reduction)
 
     def _compute_transition_loss(
         self,
@@ -1957,6 +1985,8 @@ class Agent(Module):
         quasimetric_distance_network = None,
         quasimetric_distance_loss_weight = 1.,
         temporal_compression: int | Sequence[int] = 1,
+        q_frac_gradients = 0., # fraction of the Q head gradient flowing into the world model, like the value head
+        to_q_pred: Module | None = None, # custom Q head MLP over (state latent, action cond)
         use_diayn = False,
         num_skills = 8,
         dim_skill = 32,
@@ -2108,7 +2138,9 @@ class Agent(Module):
                     state_transition_heads = state_transition_heads,
                     state_transition_dim_head = state_transition_dim_head,
                     transition_lookahead = transition_lookahead,
-                    temporal_compression = temporal_compressions[idx if idx < len(temporal_compressions) else 0]
+                    temporal_compression = temporal_compressions[idx if idx < len(temporal_compressions) else 0],
+                    q_frac_gradients = q_frac_gradients,
+                    to_q_pred = copy.deepcopy(to_q_pred) if (exists(to_q_pred) and idx > 0) else to_q_pred
                 ) for idx in range(num_world_models)
             ]
 
@@ -2550,6 +2582,211 @@ class Agent(Module):
             self.value_network.update()
 
     @torch.no_grad()
+    def q_latents(
+        self,
+        states: States,
+        actions,
+        world_model_index: int = 0
+    ):
+        # Q critic inputs over the transition lane - (state latents, per-chunk action conds) in
+        # the exact representation the planner's Q-filter scores (state lane: online encoders +
+        # EMA transformer; conds: mean-pooled chunk actions encoded into the transition space,
+        # raw actions for raw transition space)
+
+        assert self.continuous_actions, 'the Q critic operates in continuous action space'
+
+        world_model = self.get_world_model(world_model_index)
+        c = world_model.temporal_compression
+
+        state_len = first_tensor(states).shape[1]
+        assert actions.shape[1] >= state_len - 1, 'actions must cover the state lane for q_latents'
+
+        states_prompt = slice_state_seq(states, start = 0, step = c)
+        actions_prompt = pad_right_at_dim_to(pool_actions(actions, temporal_compression = c), first_tensor(states_prompt).shape[1], dim = 1)
+
+        state_tokens, _, _ = self.encode_states(self.state_encoder, states_prompt)
+        action_tokens = self.encode_actions(actions_prompt)
+
+        rnn_state_tokens, _ = self.state_linear_rnn(state_tokens, return_memories = True)
+        rnn_action_tokens, _ = self.action_linear_rnn(action_tokens, return_memories = True)
+
+        tokens = rearrange([rnn_state_tokens, rnn_action_tokens], 'sa b n d -> b (n sa) d')
+
+        embeds = world_model.ema_model(tokens)
+        state_embeds = rearrange(embeds, 'b (n sa) d -> sa b n d', sa = 2)[0]
+        latents = self.to_state_latent(state_embeds) # (b, n, d)
+
+        num_chunks = latents.shape[1] - 1
+        pooled = reduce(actions.narrow(1, 0, num_chunks * c), 'b (t c) d -> b t d', 'mean', c = c)
+
+        if self.is_transition_action_space_raw:
+            conds = pooled
+        else:
+            encoded = self.encode_actions(pooled)
+
+            if self.transition_action_space == 'global':
+                encoded, _ = self.action_linear_rnn(encoded, return_memories = True)
+
+            conds = self.to_action_latent(encoded)
+
+        return latents, conds
+
+    def _q_td_loss(
+        self,
+        world_model,
+        latents,
+        conds,
+        returns,
+        idx,
+        t,
+        chunk_discount,
+        bootstrap_mask
+    ):
+        # SARSA bootstrap off the EMA Q head (no max over actions - Q is fit to the data policy,
+        # the same policy whose candidate actions it filters at plan time) with HL-Gauss targets;
+        # the chunk reward is recovered from the return ladder: G[t*c] - gamma^c * G[(t+1)*c]
+
+        c = world_model.temporal_compression
+        num_chunks = latents.shape[1] - 1
+
+        s_lat = latents[idx, t]
+        a_cond = conds[idx, t]
+
+        t_next_raw = ((t + 1) * c).clamp(max = returns.shape[1] - 1)
+        r_sum = returns[idx, t * c] - chunk_discount * returns[idx, t_next_raw]
+
+        with torch.no_grad():
+            target = r_sum.clone()
+
+            if bootstrap_mask.any():
+                t_next = (t[bootstrap_mask] + 1).clamp(max = num_chunks - 1)
+                target[bootstrap_mask] = target[bootstrap_mask] + chunk_discount * world_model.q_value(
+                    latents[idx[bootstrap_mask], t_next],
+                    conds[idx[bootstrap_mask], t_next]
+                )
+
+        logits = world_model.q_logits(s_lat, a_cond)
+        return world_model.q_loss(logits, target, reduction = 'none')
+
+    def q_learning_loss(
+        self,
+        states: States,
+        actions,
+        returns,
+        lens = None,
+        discount = None,
+        world_model_index: int = 0
+    ):
+        # HL-Gauss SARSA TD loss for the Q head over all valid (state, action) steps of the batch -
+        # the low-level primitive; returns a scalar, ready for backward with a user-owned optimizer
+
+        world_model = self.get_world_model(world_model_index)
+        c = world_model.temporal_compression
+        discount = default(discount, self.discount_factor)
+        chunk_discount = discount ** c
+
+        with torch.no_grad():
+            latents, conds = self.q_latents(states, actions, world_model_index = world_model_index)
+
+        num_chunks = latents.shape[1] - 1
+        batch = latents.shape[0]
+        assert num_chunks > 0, 'q learning requires sequences with at least two steps'
+
+        device = self.device
+        t = torch.arange(num_chunks, device = device).expand(batch, num_chunks)
+        idx = torch.arange(batch, device = device)[:, None].expand(batch, num_chunks)
+
+        if exists(lens):
+            lens = tree_map_tensor_to_device(lens, device)
+            lens_chunks = ((lens[:, None] - 1) // c).clamp(max = num_chunks)
+        else:
+            lens_chunks = torch.full((batch, 1), num_chunks, dtype = torch.long, device = device)
+
+        valid_mask = t < lens_chunks
+        bootstrap_mask = (t + 1) < lens_chunks
+
+        loss = self._q_td_loss(world_model, latents, conds, returns, idx, t, chunk_discount, bootstrap_mask)
+        return masked_mean(loss, mask = valid_mask)
+
+    def train_q(
+        self,
+        states: States | Experience | dict | tuple,
+        actions = None,
+        returns = None,
+        lens = None,
+        *,
+        steps = 1000,
+        batch_size = 256,
+        lr = 1e-3,
+        discount = None,
+        world_model_index: int = 0
+    ):
+        # end-to-end Q critic training - the framework owns the optimizer and EMA target updates;
+        # latents are computed once over the whole experience, then each step samples a batch of
+        # (episode, step) pairs (per-episode valid steps, so variable-length episodes work);
+        # returns the mean loss of the final step. accepts (states, actions, returns) tensors,
+        # an Experience / buffer dict (episode_len is used as lens), or a tuple of the three
+
+        if isinstance(states, (Experience, dict)):
+            experience = coerce_experience(states)
+            states, actions, returns = experience.states, experience.actions, experience.returns
+            if isinstance(returns, (tuple, list)):
+                returns = returns[1]
+            lens = default(lens, experience.episode_len)
+        elif isinstance(states, (tuple, list)):
+            assert not exists(actions) and not exists(returns), 'pass either a (states, actions, returns) tuple or three tensors, not both'
+            states, actions, returns = states
+
+        assert exists(actions) and exists(returns), 'states, actions and returns must all be provided to train the Q critic'
+
+        device = self.device
+        states, actions, returns = tree_map_tensor_to_device((states, actions, returns), device)
+        lens = maybe(tree_map_tensor_to_device)(lens, device)
+
+        world_model = self.get_world_model(world_model_index)
+        c = world_model.temporal_compression
+        discount = default(discount, self.discount_factor)
+        chunk_discount = discount ** c
+
+        with torch.no_grad():
+            latents, conds = self.q_latents(states, actions, world_model_index = world_model_index)
+
+        num_chunks = latents.shape[1] - 1
+        num_episodes = latents.shape[0]
+        assert num_chunks > 0, 'q training requires sequences with at least two steps'
+        assert returns.shape[1] >= num_chunks * c + 1, 'returns must cover the full raw lane of the states'
+
+        if exists(lens):
+            lens_chunks = ((lens - 1) // c).clamp(max = num_chunks)
+        else:
+            lens_chunks = torch.full((num_episodes,), num_chunks, dtype = torch.long, device = device)
+
+        if not exists(self.q_optimizer):
+            self.q_optimizer = Adam(world_model.to_q_pred.parameters(), lr = lr)
+        else:
+            self.q_optimizer.param_groups[0]['lr'] = lr
+
+        final_loss = None
+
+        for _ in range(steps):
+            idx = torch.randint(0, num_episodes, (batch_size,), device = device)
+            lens_chunks_idx = lens_chunks[idx]
+            sample_span = lens_chunks_idx.clamp(min = 1).to(torch.float32)
+            t = torch.floor(torch.rand(batch_size, device = device) * sample_span).long()
+            bootstrap_mask = (t + 1) < lens_chunks_idx
+
+            loss = self._q_td_loss(world_model, latents, conds, returns, idx, t, chunk_discount, bootstrap_mask).mean()
+
+            self.q_optimizer.zero_grad()
+            loss.backward()
+            self.q_optimizer.step()
+            world_model.ema_to_q_pred.update()
+
+            final_loss = loss
+
+        return final_loss.detach().item()
+
+    @torch.no_grad()
     @temp_eval
     def plan(
         self,
@@ -2576,6 +2813,7 @@ class Agent(Module):
         latent_action_model_steps = 10,
         latent_action_model_chunk_size = None,
         actor_temperature = 1.,
+        value_filter_samples: int | None = None,       # seed actor with best-of-N actions by Q(s, a) - Q-Planning (Giridhar et al. 2026, arXiv 2608.21204); only used with seed_with_actor
         clamp_state_latent_to_range = True,
         return_action_latent = False,
         search_space: Literal['raw', 'local_global'] | None = None,
@@ -2796,6 +3034,13 @@ class Agent(Module):
         if exists(seed_with_actor) and self.has_actors and seed_with_actor in self.actors:
             seed_actor = self.actors[seed_with_actor]
 
+        has_value_filter = exists(value_filter_samples) and value_filter_samples > 1
+
+        if has_value_filter:
+            assert exists(seed_actor), f'value_filter_samples requires seed_with_actor to name an actor present in the agent, got {seed_with_actor}'
+            assert value_filter_samples > 1, f'value_filter_samples must be at least 2, got {value_filter_samples}'
+            assert self.continuous_actions, 'value_filter_samples requires continuous actions'
+
         if exists(seed_actor):
             step_state, step_rnn_memories = state_latents, past_rnn_memories
             seeded_actions = []
@@ -2804,46 +3049,18 @@ class Agent(Module):
             seed_last_action_tokens = None
             chunk_action_conds = []
 
-            for _ in range(horizon):
-                step_state_reshaped, unpack_actor = pack_with_inverse(step_state, '* d')
-                step_state_reshaped = rearrange(step_state_reshaped, 'b d -> b 1 d')
+            # commit one seeding step action to the trajectory, encoding into the transition space
 
-                action_kwargs = dict(
-                    state_latents = step_state_reshaped,
-                    temperature = actor_temperature,
-                    memories = seed_actor_memory,
-                    return_memories = True,
-                    transition_risk = transition_risk_factor,
-                    value_risk = value_risk_factor
-                )
-
-                if exists(skill_actor_cond):
-                    action_kwargs.update(actor_cond = skill_actor_cond)
-
-                if exists(seed_last_action_cond):
-                    action_kwargs.update(
-                        action_cond = seed_last_action_cond,
-                        action_tokens = seed_last_action_tokens
-                    )
-
-                step_action, seed_actor_memory = seed_actor.sample(**action_kwargs)
-
-                step_action_seq = rearrange(step_action, 'b ... -> b 1 ...')
-                seed_last_action_tokens = self.encode_actions(step_action_seq)
-                if self.is_transition_action_space_raw:
-                    seed_last_action_cond = step_action_seq
-                else:
-                    seed_last_action_cond = self.to_action_latent(seed_last_action_tokens)
-
+            def append_seed_step(step_action, unpack_actor, memories):
                 if is_search_space_raw_action:
                     # raw search space - the sampled raw actions are the seed
 
                     step_action = unpack_actor(rearrange(step_action, 'b 1 ... -> b ...'))
-                    step_action_cond, step_rnn_memories = encode_action_step(step_action, step_rnn_memories)
+                    step_action_cond, next_memories = encode_action_step(step_action, memories)
                     seeded_actions.append(step_action)
                 else:
-                    # latent search space (local/global) - encode the sampled actions
-                    # to action latents, keeping the population dim
+                    # latent search space (local/global) - encode the sampled actions to action
+                    # latents, keeping the population dim
 
                     if self.continuous_actions:
                         step_action = unpack_actor(rearrange(step_action, 'b 1 d -> b d'))
@@ -2856,13 +3073,146 @@ class Agent(Module):
 
                     if self.transition_action_space == 'global':
                         encoded = rearrange(encoded, '... d -> ... 1 d')
-                        encoded, step_rnn_memories = self.action_linear_rnn(encoded, memories = step_rnn_memories, return_memories = True)
+                        encoded, next_memories = self.action_linear_rnn(encoded, memories = memories, return_memories = True)
                         encoded = rearrange(encoded, '... 1 d -> ... d')
+                    else:
+                        next_memories = memories
 
                     step_action_cond = unpack_actor(self.to_action_latent(encoded))
                     seeded_actions.append(step_action_cond)
 
-                step_state, chunk_action_conds = step_state_by_actions(step_state, step_action_cond, chunk_action_conds)
+                return step_action_cond, next_memories
+
+            if not has_value_filter:
+                for _ in range(horizon):
+                    step_state_reshaped, unpack_actor = pack_with_inverse(step_state, '* d')
+                    step_state_reshaped = rearrange(step_state_reshaped, 'b d -> b 1 d')
+
+                    action_kwargs = dict(
+                        state_latents = step_state_reshaped,
+                        temperature = actor_temperature,
+                        memories = seed_actor_memory,
+                        return_memories = True,
+                        transition_risk = transition_risk_factor,
+                        value_risk = value_risk_factor
+                    )
+
+                    if exists(skill_actor_cond):
+                        action_kwargs.update(actor_cond = skill_actor_cond)
+
+                    if exists(seed_last_action_cond):
+                        action_kwargs.update(
+                            action_cond = seed_last_action_cond,
+                            action_tokens = seed_last_action_tokens
+                        )
+
+                    step_action, seed_actor_memory = seed_actor.sample(**action_kwargs)
+
+                    step_action_seq = rearrange(step_action, 'b ... -> b 1 ...')
+                    seed_last_action_tokens = self.encode_actions(step_action_seq)
+                    if self.is_transition_action_space_raw:
+                        seed_last_action_cond = step_action_seq
+                    else:
+                        seed_last_action_cond = self.to_action_latent(seed_last_action_tokens)
+
+                    step_action_cond, step_rnn_memories = append_seed_step(step_action, unpack_actor, step_rnn_memories)
+
+                    step_state, chunk_action_conds = step_state_by_actions(step_state, step_action_cond, chunk_action_conds)
+            else:
+                # Q-filtered seeding - sample candidates per step, keep the best by Q_ema(s, a);
+                # chunks for compressed world models. Giridhar et al. https://arxiv.org/abs/2608.21204
+
+                step_chunk_size = temporal_compression if (world_model.transition_is_prefix and has_temporal_compression) else 1
+                num_candidates = value_filter_samples
+
+                for _ in range(horizon // step_chunk_size):
+                    packed_state, unpack_actor = pack_with_inverse(step_state, '* d')
+
+                    # sample candidate chunks, autoregressive within the chunk
+
+                    cand_chunks = []
+                    cand_last_action_cond = None
+                    cand_last_action_tokens = None
+
+                    for sub in range(step_chunk_size):
+                        cand_state = repeat(packed_state, 'b d -> (b k) 1 d', k = num_candidates)
+
+                        action_kwargs = dict(
+                            state_latents = cand_state,
+                            temperature = actor_temperature,
+                            memories = seed_actor_memory,
+                            return_memories = True,
+                            transition_risk = transition_risk_factor,
+                            value_risk = value_risk_factor
+                        )
+
+                        if exists(skill_actor_cond):
+                            action_kwargs.update(actor_cond = skill_actor_cond)
+
+                        if exists(cand_last_action_cond):
+                            action_kwargs.update(
+                                action_cond = cand_last_action_cond,
+                                action_tokens = cand_last_action_tokens
+                            )
+                        elif exists(seed_last_action_cond):
+                            action_kwargs.update(
+                                action_cond = repeat(seed_last_action_cond, 'b ... -> (b k) ...', k = num_candidates),
+                                action_tokens = repeat(seed_last_action_tokens, 'b ... -> (b k) ...', k = num_candidates)
+                            )
+
+                        step_action, cand_memories = seed_actor.sample(**action_kwargs)
+                        cand_chunks.append(rearrange(step_action, 'b 1 d -> b d'))
+
+                        # per-candidate context for the next sub-step
+
+                        step_action_seq = rearrange(step_action, 'b ... -> b 1 ...')
+                        cand_last_action_tokens = self.encode_actions(step_action_seq)
+                        cand_last_action_cond = step_action_seq if self.is_transition_action_space_raw else self.to_action_latent(cand_last_action_tokens)
+
+                    cand_chunks = stack(cand_chunks, dim = 1) # (b p k, c, d)
+
+                    # chunk conds - mean-pool then encode (mirrors the world model's lane conds)
+
+                    chunk_actions = reduce(cand_chunks, 'b c d -> b d', 'mean')
+
+                    if is_search_space_raw_action and not self.is_transition_action_space_raw:
+                        encoded = self.encode_actions(chunk_actions)
+
+                        if self.transition_action_space == 'global':
+                            encoded = rearrange(encoded, '... d -> ... 1 d')
+                            encoded, _ = self.action_linear_rnn(encoded, memories = step_rnn_memories, return_memories = True)
+                            encoded = rearrange(encoded, '... 1 d -> ... d')
+
+                        conds = self.to_action_latent(encoded)
+                    else:
+                        conds = chunk_actions
+
+                    # score(a) = Q_ema(s, chunk)
+
+                    scores = world_model.q_value(repeat(packed_state, 'b d -> (b k) d', k = num_candidates), conds)
+                    scores = rearrange(scores, '(b k) -> b k', k = num_candidates)
+
+                    # keep the best candidate chunk
+
+                    selected = scores.argmax(dim = -1)
+                    flat_selected = selected + torch.arange(packed_state.shape[0], device = device) * num_candidates
+                    selected_chunk = cand_chunks[flat_selected] # (b p, c, d)
+
+                    if exists(cand_memories):
+                        seed_actor_memory = tree_map_tensor(lambda t: t[flat_selected], cand_memories)
+
+                    # commit the selected chunk (same path as the unfiltered loop)
+
+                    for sub in range(step_chunk_size):
+                        step_action = rearrange(selected_chunk[:, sub], 'b d -> b 1 d')
+                        step_action_cond, step_rnn_memories = append_seed_step(step_action, unpack_actor, step_rnn_memories)
+                        step_state, chunk_action_conds = step_state_by_actions(step_state, step_action_cond, chunk_action_conds)
+
+                    # actor context = last action of the selected chunk
+
+                    last_seq = rearrange(selected_chunk[:, -1], 'b d -> b 1 d')
+                    seed_last_action_tokens = self.encode_actions(last_seq)
+                    seed_last_action_cond = last_seq if self.is_transition_action_space_raw else self.to_action_latent(seed_last_action_tokens)
 
             seeded_actions = stack(seeded_actions, dim = 2)
 

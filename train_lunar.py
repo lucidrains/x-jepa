@@ -207,10 +207,17 @@ def main(
     project_name = 'x-jepa-lunar-lander',
     record_video = False,
     use_wandb = True,
-    cpu = False
+    cpu = False,
+    q_filter_samples = 0,     # when > 0, seed the WM-phase planner with the reflexive actor, sampling this many candidate actions per step and keeping the highest-Q one (Q-Planning, Giridhar et al. arXiv 2608.21204)
+    q_lr = 3e-4,
+    q_epochs = 1,
+    seed = 0
 ):
     assert rl_type in ('ppo', 'tpo'), f"rl_type must be either 'ppo' or 'tpo', got {rl_type}"
     rl_epochs = default(rl_epochs, 2 if rl_type == 'ppo' else 4)
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
     device = Accelerator(cpu = cpu).device
     print(f"using device: {device}", flush = True)
@@ -289,6 +296,10 @@ def main(
 
         wm.eval()
 
+        seed_kwargs = dict()
+        if q_filter_samples > 0 and not use_rl and not is_random_ep:
+            seed_kwargs = dict(seed_with_actor = 'reflexive', value_filter_samples = q_filter_samples)
+
         experience = wm.interact_with_environment(
             env = env,
             max_steps = max_timesteps,
@@ -299,7 +310,8 @@ def main(
             horizon = cem_horizon,
             pop_size = cem_num_samples,
             generations = cem_num_iters,
-            elite_frac = cem_elite_frac
+            elite_frac = cem_elite_frac,
+            **seed_kwargs
         )
 
         total_reward = experience.cumulative_rewards.item()
@@ -322,11 +334,22 @@ def main(
                 rl_batch_size, rl_epochs, rl_type, rl_update_state_encoder
             )
 
+        q_loss_val = None
+
         if divisible_by(episode, train_every_eps):
             wm_loss_val = train_wm_epoch(
                 wm, buffer, optimizer, device,
                 batch_size, epochs_per_train, grad_accum_steps, use_rl
             )
+
+            if q_filter_samples > 0:
+                q_loss_val = wm.train_q(
+                    buffer.get_all_data(),
+                    steps = q_epochs * max(buffer.num_episodes // batch_size, 1),
+                    batch_size = batch_size,
+                    lr = q_lr,
+                    discount = gamma
+                )
 
         # metrics and logging
 
@@ -347,6 +370,9 @@ def main(
             phase = 1 if use_rl else 0,
             reward = total_reward
         )
+
+        if q_loss_val is not None:
+            log_dict['q_loss'] = q_loss_val
 
         if track_reward:
             log_dict.update({

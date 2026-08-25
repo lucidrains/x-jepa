@@ -74,6 +74,18 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
 ```
 
 ```bibtex
+@misc{giridhar2026beyondimitationselfimprovingrobot,
+    title   = {Beyond Imitation: Self-Improving Robot Policies via Off-Policy Q-Planning},
+    author  = {Varun Giridhar and Anant Khandelwal and Jeremy A. Collins and Ignat Georgiev and Animesh Garg},
+    year    = {2026},
+    eprint  = {2608.21204},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.RO},
+    url     = {https://arxiv.org/abs/2608.21204},
+}
+```
+
+```bibtex
 @misc{balestriero2025lejepaprovablescalableselfsupervised,
     title   = {LeJEPA: Provable and Scalable Self-Supervised Learning Without the Heuristics},
     author  = {Randall Balestriero and Yann LeCun},
