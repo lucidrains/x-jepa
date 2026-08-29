@@ -122,7 +122,7 @@ def is_empty(t):
     return len(t) == 0
 
 def bernoulli(prob):
-    return random.random() < prob
+    return random() < prob
 
 def xnor(x, y):
     return x == y
@@ -2108,6 +2108,7 @@ class Agent(Module):
 
         assert num_world_models >= 1, 'num_world_models must be at least 1'
         self.num_world_models = num_world_models
+        self.q_optimizer = None
 
         if exists(world_model):
             if isinstance(world_model, (list, tuple, ModuleList)):
