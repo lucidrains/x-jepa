@@ -11,7 +11,7 @@ from einops.layers.torch import Rearrange
 
 from x_mlps_pytorch import MLP
 
-from x_jepa.x_jepa import Agent, WorldModel, Transformer, Actor, exists, AgentRolloutWrapper, TTTMetaLearningLoss, PrefixStateTransition, compressed_lane_bounds
+from x_jepa.x_jepa import Agent, WorldModel, Transformer, Actor, exists, AgentRolloutWrapper, TTTMetaLearningLoss, PrefixStateTransition, compressed_lane_bounds, sample_action_delays, shift_cond_by_delays
 from x_jepa.min_gru import minGRUBlocks
 from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
 from x_jepa.goals import GoalGenerator, MetricResidualNetwork
@@ -3295,3 +3295,90 @@ def test_q_filtered_seeding(temporal_compression):
 
     assert filtered_mean > plain_mean + 0.3, \
         f'Q-filtered seeding should beat plain actor seeding: plain {plain_mean:+.3f} vs Q {filtered_mean:+.3f}'
+@param('temporal_compression', (1, 2, (1, 2)))
+def test_action_delay_e2e(temporal_compression):
+    # e2e - delay sampling + shift (flat and chunked), training with gradient flow, plan-time clean + explicit delays
+
+    torch.manual_seed(42)
+
+    delays = sample_action_delays(2, 8, prob = 1.0, delay_max = 3, q = 0.5, uniform_mix = 0.0, device = 'cpu')
+    assert delays.shape == (2, 8)
+    assert (delays >= 0).all() and (delays <= 3).all()
+    assert (delays <= torch.arange(8)[None, :]).all()
+
+    cond = torch.arange(2 * 8 * 4, dtype = torch.float32).reshape(2, 8, 4)
+    shifted = shift_cond_by_delays(cond, delays)
+
+    for b in range(2):
+        for t in range(8):
+            assert torch.allclose(shifted[b, t], cond[b, t - delays[b, t].item()])
+
+    chunked = torch.arange(2 * 8 * 3 * 4, dtype = torch.float32).reshape(2, 8, 3, 4)
+    chunk_shifted = shift_cond_by_delays(chunked, delays)
+
+    for b in range(2):
+        for t in range(8):
+            assert torch.allclose(chunk_shifted[b, t], chunked[b, t - delays[b, t].item()])
+
+    dim = 32
+    dim_action = 2
+
+    torch.manual_seed(0)
+    model = Transformer(dim = dim, depth = 2, dim_head = 16, heads = 2, causal = True)
+
+    agent = Agent(
+        state_encoder = nn.Linear(3, dim),
+        action_encoder = nn.Linear(dim_action, dim),
+        model = model,
+        dim_action = dim_action,
+        transition_action_space = 'raw',
+        continuous_actions = True,
+        use_action_delay = True,
+        action_delay_prob = 0.8,
+        action_delay_max = 3,
+        action_delay_pred_loss_weight = 0.1,
+        transition_horizon = 4,
+        temporal_compression = temporal_compression,
+        reg_next_state_weight = 0.
+    ).train()
+
+    states = torch.randn(2, 9, 3)
+    actions = torch.randn(2, 8, dim_action).tanh()
+
+    for idx in range(agent.num_world_models):
+        loss, breakdown = agent(states, actions, world_model_index = idx)
+        loss.backward()
+
+        transition = agent.world_models[idx].state_transition
+        assert exists(transition.to_delay_tokens)
+        assert (transition.to_delay_tokens.weight[0] == 0.).all(), 'the d = 0 slot should be zero-initialized'
+        assert exists(transition.to_delay_tokens.weight.grad)
+        assert exists(agent.world_models[idx].state_transition_for_planning.to_delay_tokens)
+        assert exists(agent.world_models[idx].to_action_delay_pred)
+        aux_param = next(agent.world_models[idx].to_action_delay_pred.parameters())
+        assert exists(aux_param.grad)
+
+    # plan-time interface - defaults to the clean slice; explicit delays run on flat and chunked
+
+    probe = agent.world_models[-1]
+    transition = probe.state_transition_for_planning
+    anchor = torch.randn(2, 1, dim)
+
+    if probe.has_temporal_compression:
+        steps = torch.randn(2, 3, 2, dim_action)
+    else:
+        steps = torch.randn(2, 3, dim_action)
+
+    pred = transition.predict(anchor, steps)
+    pred_cond = transition.predict(anchor, steps, action_delays = torch.zeros(2, 3, dtype = torch.long))
+    assert_close(pred, pred_cond, atol = 1e-6, rtol = 1e-6)
+
+    delays_probe = torch.tensor([[0, 1, 2], [2, 1, 0]])
+    pred_alt = transition.predict(anchor, steps, action_delays = delays_probe)
+    assert pred_alt.shape == pred.shape
+
+    # the clean fraction with prob = 0.4 is roughly 60%
+
+    mix_delays = sample_action_delays(64, 32, prob = 0.4, delay_max = 4, q = 0.5, uniform_mix = 0.25, device = 'cpu')
+    zero_frac = float((mix_delays == 0).float().mean())
+    assert 0.55 < zero_frac < 0.7

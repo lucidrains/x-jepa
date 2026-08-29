@@ -1,6 +1,7 @@
 # continuous cartpole - same physics as CartPole-v1, but the action is the raw force in [-1, 1]
 
 import math
+from collections import deque
 
 import gymnasium as gym
 import numpy as np
@@ -98,3 +99,58 @@ class BatchedEnv:
     def close(self):
         for env in self.envs:
             env.close()
+
+class DelayedObsEnv:
+    """delayed perception wrapper - the agent sees the environment state `delay` ticks old; with
+    `delay_max` the lag is drawn per step from the geometric-family distribution of the augmentation"""
+
+    def __init__(self, env, delay = 1, delay_max = None, prob = 0.5, q = 0.5, uniform_mix = 0.25, seed = None):
+        self.env = env
+        self.delay = delay
+        self.delay_max = delay_max
+        self.prob = prob
+        self.q = q
+        self.uniform_mix = uniform_mix
+        self.stochastic = delay_max is not None
+        self.num_envs = env.num_envs
+        self.observation_space = env.observation_space
+        self.action_space = env.action_space
+        self._queue = [deque(maxlen = max(delay, delay_max or 0) + 1) for _ in range(self.num_envs)]
+        self._rng = np.random.default_rng(seed)
+
+    def _sample_delays(self):
+        # same family as the training-time augmentation - flag between the clean channel and a
+        # truncated geometric mixed with a uniform floor
+
+        if not self.stochastic:
+            return np.full(self.num_envs, self.delay, dtype = np.int64)
+
+        flag = self._rng.random(self.num_envs) < self.prob
+        geometric = np.minimum(self._rng.geometric(self.q, self.num_envs), self.delay_max) # support 1.., P(k) = q(1 - q)^(k - 1)
+        uniform = self._rng.integers(1, self.delay_max + 1, self.num_envs)
+        mixed = np.where(self._rng.random(self.num_envs) < self.uniform_mix, uniform, geometric)
+
+        return np.where(flag, mixed, 0).astype(np.int64)
+
+    def reset(self, seed = None, options = None):
+        obs, info = self.env.reset()
+        for i in range(self.num_envs):
+            self._queue[i].clear()
+            for _ in range(max(self.delay, self.delay_max or 0) + 1):
+                self._queue[i].append(obs[i])
+
+        return obs, info
+
+    def step(self, actions):
+        obs, rewards, terminateds, truncateds, info = self.env.step(actions)
+        self._d = self._sample_delays()
+
+        delayed_obs = []
+        for i, q in enumerate(self._queue):
+            q.append(obs[i])
+            delayed_obs.append(q[-(int(self._d[i]) + 1)])
+
+        return np.stack(delayed_obs), rewards, terminateds, truncateds, info
+
+    def close(self):
+        self.env.close()

@@ -45,7 +45,7 @@ from x_jepa import Agent
 from x_jepa.x_jepa import Transformer
 from x_jepa.utils import store_experience_in_replay_buffer, divisible_by
 
-from env_cartpole import BatchedEnv
+from env_cartpole import BatchedEnv, DelayedObsEnv
 
 # fitness - reach and stay at the upright state (goal = all zeros)
 # distance between predicted next-step encoded states and the encoded goal, both in the same
@@ -138,6 +138,15 @@ def main(
     reg_next_state_weight = 0.1,
     random_action_eps = 12,
     gamma = 0.99,
+    use_action_delay = False, # train the transition on delayed action pairs, conditioned on the delay (geometric, params below)
+    action_delay_prob = 0.5,
+    action_delay_max = 4,
+    action_delay_q = 0.5, # geometric rate of the delay draw
+    action_delay_uniform_mix = 0.25,
+    action_delay_pred_loss_weight = 0., # auxiliary categorical delay prediction head - estimate the lag from (state, action); ~0.1 is the empirically sensible weight
+    plan_delay_predict = False, # plan with the delay predicted by the auxiliary head per rollout step (requires action_delay_pred_loss_weight > 0)
+    world_delay = 0, # delayed perception stream - the env feeds observations `world_delay` ticks old (for use with use_action_delay)
+    world_delay_max = 0, # stochastic delayed perception - per-step lag drawn from the training-time geometric distribution, capped at this max
     reward_avg_window = 10,
     target_avg_reward = 100.,
     print_every_eps = 1,
@@ -167,6 +176,11 @@ def main(
     group_size = max(num_envs // num_seed_groups, 1)
     env = BatchedEnv([(i // group_size) * 1000 + (i % group_size) for i in range(num_envs)], max_episode_steps = max_timesteps)
 
+    if world_delay_max > 0:
+        env = DelayedObsEnv(env, delay_max = world_delay_max, seed = seed)
+    elif world_delay > 0:
+        env = DelayedObsEnv(env, delay = world_delay, seed = seed)
+
     state_dim = int(env.observation_space.shape[0])
     action_dim = int(env.action_space.shape[-1])
 
@@ -195,6 +209,12 @@ def main(
         reg_next_state_weight = reg_next_state_weight,
         transition_horizon = cem_horizon,
         transition_lookahead = transition_lookahead,
+        use_action_delay = use_action_delay,
+        action_delay_prob = action_delay_prob,
+        action_delay_max = action_delay_max,
+        action_delay_q = action_delay_q,
+        action_delay_uniform_mix = action_delay_uniform_mix,
+        action_delay_pred_loss_weight = action_delay_pred_loss_weight,
         add_reflexive_actor = True
     ).to(device)
 
@@ -225,7 +245,8 @@ def main(
             generations = cem_num_iters,
             elite_frac = cem_elite_frac,
             commit_k_steps = commit_k_steps,
-            plan_lookahead = plan_lookahead
+            plan_lookahead = plan_lookahead,
+            plan_delay_predict = plan_delay_predict
         )
 
         total_rewards = experience.cumulative_rewards.tolist()

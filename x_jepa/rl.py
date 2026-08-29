@@ -64,7 +64,7 @@ def get_actor_log_probs_and_entropy(
             wm_out = world_model(states, actions, return_loss = False)
             wm_hiddens = wm_out.get('hiddens')
 
-    if not exists(skill_latent) and exists(skill_id) and hasattr(world_model, 'get_skill'):
+    if not exists(skill_latent) and exists(skill_id) and exists(world_model.skill_latents):
         skill_latent = world_model.get_skill(skill_id)
 
     action_preds = actor.get_action_preds(

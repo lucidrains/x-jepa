@@ -11,7 +11,7 @@ from collections import namedtuple
 
 import torch
 import torch.nn.functional as F
-from torch.distributions import Beta, Categorical
+from torch.distributions import Beta, Categorical, Geometric
 from torch.optim import Adam, Optimizer
 from torch.utils._pytree import tree_map, tree_flatten
 from torch.func import functional_call, vmap
@@ -70,7 +70,8 @@ WorldModelLoss = namedtuple('WorldModelLoss', [
     'reward_pred',
     'discount_pred',
     'reg_next_state',
-    'reg_next_encoded'
+    'reg_next_encoded',
+    'action_delay_pred'
 ])
 
 Losses = namedtuple('Losses', [
@@ -82,6 +83,7 @@ Losses = namedtuple('Losses', [
     'discount_pred',
     'reg_next_state',
     'reg_next_encoded',
+    'action_delay_pred',
     'action_recon',
     'actor',
     'actor_losses',
@@ -111,6 +113,66 @@ def default(v, d):
 
 def at_most_one_of(*args):
     return sum(map(exists, args)) <= 1
+
+# action delay augmentation - per-step lag, clean with prob (1 - prob), else truncated geometric ~ uniform floor
+
+def sample_action_delays(
+    batch,
+    seq_len,
+    *,
+    prob,
+    delay_max,
+    q,
+    uniform_mix,
+    device
+):
+    delayed = torch.rand((batch, seq_len), device = device) < prob
+
+    geometric = (Geometric(torch.tensor(q, device = device)).sample((batch, seq_len)) + 1).clamp(max = delay_max).long()
+    uniform = torch.randint(1, delay_max + 1, (batch, seq_len), device = device)
+
+    mixed = torch.where(torch.rand((batch, seq_len), device = device) < uniform_mix, uniform, geometric)
+    delays = torch.where(delayed, mixed, torch.zeros_like(mixed))
+
+    # zero out delays that would reach before the start of the trajectory
+
+    steps = rearrange(torch.arange(seq_len, device = device), 'n -> 1 n')
+    return torch.where(steps >= delays, delays, torch.zeros_like(delays))
+
+def shift_cond_by_delays(cond, delays):
+    # a_eff[t] = a[t - d] - gather along the step dim, trailing dims untouched
+
+    b, n, *rest = cond.shape
+
+    steps = rearrange(torch.arange(n, device = cond.device), 'n -> 1 n')
+    src_idx = (steps - delays).clamp(min = 0)
+
+    index = src_idx
+    for _ in rest:
+        index = rearrange(index, '... -> ... 1')
+    index = index.expand(b, n, *rest)
+
+    return torch.gather(cond, 1, index)
+
+def delay_shifted_action_cond(
+    cond,
+    *,
+    prob,
+    delay_max,
+    q,
+    uniform_mix
+):
+    delays = sample_action_delays(
+        cond.shape[0],
+        cond.shape[1],
+        prob = prob,
+        delay_max = delay_max,
+        q = q,
+        uniform_mix = uniform_mix,
+        device = cond.device
+    )
+
+    return shift_cond_by_delays(cond, delays), delays
 
 def divisible_by(num, den):
     return (num % den) == 0
@@ -582,14 +644,8 @@ class Transformer(Module):
         return ret, next_memories
 
 # fast-lewm state transition - https://arxiv.org/abs/2606.26217
-# causal transformer over [state latent] [action 1] [action 2] ..., each prefix supervises the future latent, all predicted in parallel
-#
-# with lookahead > 1, each prefix becomes an mtp (multi-token prediction) head that predicts the next
-# `lookahead` state latents in parallel - planning still consumes the immediate next latent (offset 0)
-#
-# with temporal_compression > 1, each state step is driven by `temporal_compression` raw actions,
-# flattened into a single chunk token instead of mean-pooled - so the transition needs to know the
-# compression to build the chunk projection
+# causal transformer over [state] [actions...], every prefix supervises future latent, all predicted in parallel
+# with lookahead, each prefix predicts the next `lookahead` latents; with compression, each step consumes a chunk of actions
 
 class PrefixStateTransition(Module):
     def __init__(
@@ -607,7 +663,9 @@ class PrefixStateTransition(Module):
         use_pope = True,
         use_pseudo_queries = False,
         lookahead = 1,
-        temporal_compression = 1
+        temporal_compression = 1,
+        use_action_delay = False,
+        action_delay_max = 4
     ):
         super().__init__()
         self.dim = dim
@@ -618,6 +676,18 @@ class PrefixStateTransition(Module):
         self.lookahead = lookahead
         self.temporal_compression = temporal_compression
         self.has_temporal_compression = temporal_compression > 1
+
+        # per-step action delay - embedded onto action tokens, slot 0 zero-init so the clean initialization is unchanged
+
+        self.use_action_delay = use_action_delay
+        self.action_delay_max = action_delay_max
+
+        self.to_delay_tokens = None
+
+        if use_action_delay:
+            to_delay_tokens = nn.Embedding(action_delay_max + 1, dim)
+            nn.init.zeros_(to_delay_tokens.weight)
+            self.to_delay_tokens = to_delay_tokens
 
         self.to_state_tokens = LinearNoBias(dim_state_latent, dim)
         self.to_action_tokens = LinearNoBias(dim_transition_action_input, dim)
@@ -644,7 +714,8 @@ class PrefixStateTransition(Module):
         self,
         state_latents, # (..., 1, d) anchor latent token
         actions,       # (..., h, c, d_a) chunked action tokens, or (..., h, d_a) flat
-        chunked = False
+        chunked = False,
+        action_delays = None # (..., h) per-step delay index, None -> all zeros
     ):
         if chunked:
             # flatten the `temporal_compression` raw actions of each step into one token
@@ -653,17 +724,27 @@ class PrefixStateTransition(Module):
         else:
             to_action_tokens = self.to_action_tokens
 
-        return cat((self.to_state_tokens(state_latents), to_action_tokens(actions)), dim = -2)
+        tokens = cat((self.to_state_tokens(state_latents), to_action_tokens(actions)), dim = -2)
+
+        if self.use_action_delay:
+            if not exists(action_delays):
+                action_delays = torch.zeros(actions.shape[:-1], dtype = torch.long, device = actions.device)
+
+            delay_tokens = self.to_delay_tokens(action_delays)
+            tokens = tokens + cat((torch.zeros_like(tokens[..., :1, :]), delay_tokens), dim = -2)
+
+        return tokens
 
     def predict(
         self,
         state_latents, # (..., 1, d) anchor latent
         actions,       # (..., h, c, d_a) chunked candidate action sequence, or (..., h, d_a) flat
-        lookahead = None # plan-time lookahead, clamped to the trained one
+        lookahead = None, # plan-time lookahead, clamped to the trained one
+        action_delays = None # (..., h) per-step delay index, None -> all zeros
     ):
         # predict all future latents after each action prefix in parallel
 
-        tokens = self._build_tokens(state_latents, actions, chunked = self.has_temporal_compression) # (..., 1 + h, dim)
+        tokens = self._build_tokens(state_latents, actions, chunked = self.has_temporal_compression, action_delays = action_delays) # (..., 1 + h, dim)
         tokens, unpack = pack_with_inverse(tokens, '* t d')
 
         out = self.transformer(tokens)
@@ -680,7 +761,8 @@ class PrefixStateTransition(Module):
         state_latents, # (b, n, d) anchor latent states
         action_cond,   # (b, n, c, d_a) chunked actions aligned with the states, or (b, n, d_a) flat
         valid_target_mask = None, # (b, n) validity of each next state latent target
-        horizon = None
+        horizon = None,
+        action_delays = None # (b, n) per-step delay index, None -> all zeros
     ):
         # training - non-overlapping windows (stride = horizon), multi-horizon supervision on every prefix,
         # mtp lookahead - each prefix predicts the next `lookahead` future latents
@@ -696,7 +778,13 @@ class PrefixStateTransition(Module):
         action_pattern = 'b (w h) c d_a -> b w h c d_a' if is_chunked else 'b (w h) d_a -> b w h d_a'
         action_windows = rearrange(action_cond[:, :num_windows * h], action_pattern, h = h) # (b, w, h, [c, ]d_a)
 
-        tokens = self._build_tokens(rearrange(anchor_windows, 'b w d -> b w 1 d'), action_windows, chunked = is_chunked) # (b, w, 1 + h, dim)
+        if self.use_action_delay:
+            assert action_cond.shape[1] == seq_len, 'delays must align with the action conditioning'
+            delay_windows = rearrange(action_delays[:, :num_windows * h], 'b (w h) -> b w h', h = h) if exists(action_delays) else None
+        else:
+            delay_windows = None
+
+        tokens = self._build_tokens(rearrange(anchor_windows, 'b w d -> b w 1 d'), action_windows, chunked = is_chunked, action_delays = delay_windows) # (b, w, 1 + h, dim)
         tokens = rearrange(tokens, 'b w t d -> (b w) t d')
 
         out = self.transformer(tokens)
@@ -1043,7 +1131,7 @@ class Actor(Module):
         # network (epistemic / value-uncertainty) risk condition separately
 
         if exists(risk_embedder):
-            if hasattr(risk_embedder, 'transition_risk_embedder'):
+            if exists(risk_embedder.transition_risk_embedder):
                 # combined RiskEmbedder - both risks, each embedded separately
 
                 self.transition_risk_embedder = risk_embedder.transition_risk_embedder
@@ -1550,6 +1638,9 @@ class WorldModel(Module):
         state_transition_dim_head = 16,
         transition_lookahead = 1,
         temporal_compression = 1,
+        use_action_delay = False,
+        action_delay_max = 4,
+        action_delay_pred_loss_weight = 0.,
         q_num_bins = 128,
         q_min_value = -100.,
         q_max_value = 100.,
@@ -1574,6 +1665,7 @@ class WorldModel(Module):
             dim_out = dim_state_latent * 2 if probabilistic else dim_state_latent
 
             if exists(state_transition) and not isinstance(state_transition, PrefixStateTransition):
+                assert not use_action_delay, 'action delay conditioning requires the prefix state transition'
                 return MLP(dim_state_latent + dim_transition_action_input, *((dim_model * 2,) * 2), dim_out)
 
             return PrefixStateTransition(
@@ -1586,7 +1678,9 @@ class WorldModel(Module):
                 heads = state_transition_heads,
                 dim_head = state_transition_dim_head,
                 lookahead = transition_lookahead,
-                temporal_compression = temporal_compression
+                temporal_compression = temporal_compression,
+                use_action_delay = use_action_delay,
+                action_delay_max = action_delay_max
             )
 
         if not exists(state_transition):
@@ -1627,6 +1721,9 @@ class WorldModel(Module):
         self.probabilistic_state_transition = probabilistic_state_transition
         self.probabilistic_plan_state_transition = probabilistic_plan_state_transition
 
+        self.state_transition_beta_distr = None
+        self.plan_state_transition_beta_distr = None
+
         if probabilistic_state_transition:
             self.state_transition_beta_distr = BetaDistrReadout(source_range = (-state_latent_clamp_value, state_latent_clamp_value), eps = state_transition_eps)
 
@@ -1646,6 +1743,18 @@ class WorldModel(Module):
 
         self.temporal_compression = temporal_compression
         self.has_temporal_compression = temporal_compression > 1
+        self.use_action_delay = use_action_delay
+
+        # auxiliary categorical lag prediction - estimate the current delay from (state, action) itself
+
+        self.action_delay_pred_loss_weight = action_delay_pred_loss_weight
+        self.has_action_delay_pred = action_delay_pred_loss_weight > 0.
+
+        self.to_action_delay_pred = None
+
+        if self.has_action_delay_pred:
+            assert use_action_delay, 'the delay prediction head requires the action delay augmentation'
+            self.to_action_delay_pred = MLP(dim_state_latent + dim_transition_action_input, *((dim_model * 2,) * 2), action_delay_max + 1)
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
@@ -1674,15 +1783,16 @@ class WorldModel(Module):
         next_target_state_latents,
         valid_target_mask,
         probabilistic,
-        beta_distr
+        beta_distr,
+        action_delays = None
     ):
         # fast-lewm style - transformer over action prefixes, multi-horizon supervision
 
         if self.transition_is_prefix:
-            pred_logits, mask = transition(state_latents, action_cond, valid_target_mask = valid_target_mask)
+            pred_logits, mask = transition(state_latents, action_cond, valid_target_mask = valid_target_mask, action_delays = action_delays)
 
             num_windows, h = pred_logits.shape[1], pred_logits.shape[2]
-            lookahead = getattr(transition, 'lookahead', 1)
+            lookahead = transition.lookahead
 
             anchor_windows = rearrange(state_latents[:, :num_windows * h:h], 'b w d -> b w 1 d')
 
@@ -1741,6 +1851,7 @@ class WorldModel(Module):
         prepend_embeds = None,
         excise_prepend_embeds = False,
         transition_action_cond = None,
+        action_delays = None,
         rewards = None,
         dones = None
     ):
@@ -1777,7 +1888,7 @@ class WorldModel(Module):
 
         if state_embeds_full.shape[1] < 2:
             wm_loss_breakdown = WorldModelLoss(
-                self.zero, self.zero, self.zero, self.zero, self.zero, self.zero, self.zero
+                self.zero, self.zero, self.zero, self.zero, self.zero, self.zero, self.zero, self.zero
             )
             outputs = dict(
                 embeds = embeds,
@@ -1795,6 +1906,10 @@ class WorldModel(Module):
         state_embeds, state_latents, action_embeds = (t[:, :-1] for t in (state_embeds_full, state_latents_full, action_embeds_full))
 
         action_cond = action_cond[:, :state_latents.shape[1]]
+
+        if exists(transition_action_cond):
+            transition_action_cond = transition_action_cond[:, :state_latents.shape[1]]
+
         transition_action_cond = default(transition_action_cond, action_cond)
 
         state_transition_loss, next_state_pred, transition_mask = self._compute_transition_loss(
@@ -1804,7 +1919,8 @@ class WorldModel(Module):
             next_target_state_latents,
             valid_target_mask,
             self.probabilistic_state_transition,
-            getattr(self, 'state_transition_beta_distr', None)
+            self.state_transition_beta_distr,
+            action_delays
         )
 
         plan_state_transition_loss, _, plan_transition_mask = self._compute_transition_loss(
@@ -1814,7 +1930,8 @@ class WorldModel(Module):
             next_target_state_latents,
             valid_target_mask,
             self.probabilistic_plan_state_transition,
-            getattr(self, 'plan_state_transition_beta_distr', None)
+            self.plan_state_transition_beta_distr,
+            action_delays
         )
 
         pred_next_encoded_state = self.to_next_encoded_state_pred((state_latents, action_cond))
@@ -1861,6 +1978,19 @@ class WorldModel(Module):
             if self.reg_next_encoded_weight > 0.:
                 reg_next_encoded_loss = reg(pred_next_encoded_state)
 
+        # auxiliary lag prediction - cross entropy vs sampled ground truth
+
+        action_delay_pred_loss = self.zero
+
+        if self.has_action_delay_pred and exists(action_delays):
+            labels = action_delays[:, :state_latents.shape[1]]
+            logits = self.to_action_delay_pred((state_latents, action_cond))
+
+            raw = F.cross_entropy(rearrange(logits, 'b n c -> (b n) c'), rearrange(labels, 'b n -> (b n)'), reduction = 'none')
+            raw = raw.reshape(labels.shape)
+
+            action_delay_pred_loss = masked_mean(raw, valid_target_mask, average_mode = masked_loss_average_mode)
+
         total_wm_loss = (
             next_state_latent_pred_loss +
             plan_state_pred_loss * self.plan_state_pred_loss_weight +
@@ -1868,7 +1998,8 @@ class WorldModel(Module):
             reward_pred_loss * self.reward_pred_loss_weight +
             discount_pred_loss * self.discount_pred_loss_weight +
             reg_next_state_loss * self.reg_next_state_weight +
-            reg_next_encoded_loss * self.reg_next_encoded_weight
+            reg_next_encoded_loss * self.reg_next_encoded_weight +
+            action_delay_pred_loss * self.action_delay_pred_loss_weight
         )
 
         wm_loss_breakdown = WorldModelLoss(
@@ -1878,7 +2009,8 @@ class WorldModel(Module):
             reward_pred_loss,
             discount_pred_loss,
             reg_next_state_loss,
-            reg_next_encoded_loss
+            reg_next_encoded_loss,
+            action_delay_pred_loss
         )
 
         outputs = dict(
@@ -1969,6 +2101,12 @@ class Agent(Module):
         state_transition_heads = 4,
         state_transition_dim_head = 16,
         transition_lookahead = 1,
+        use_action_delay = False,
+        action_delay_prob = 0.5,
+        action_delay_max = 4,
+        action_delay_q = 0.5,
+        action_delay_uniform_mix = 0.25,
+        action_delay_pred_loss_weight = 0., # auxiliary categorical delay prediction head - the model estimates the current lag itself (cross-entropy vs the sampled ground truth)
         reg: Module | None = None,
         reg_loss_kwargs: dict | None = None,
         state_linear_rnn_depth = 1,
@@ -2008,6 +2146,7 @@ class Agent(Module):
         self.state_latent_clamp_value = state_latent_clamp_value
         self.has_state_latent_clamp = state_latent_clamp_value > 0.
 
+        self.episodic_mems = None
         self.has_episodic_mem = episodic_mem_len > 0
         if self.has_episodic_mem:
             self.episodic_mems = EpisodicMemories(
@@ -2087,6 +2226,15 @@ class Agent(Module):
 
         self.dim_transition_action_input = dim_transition_action_input
 
+        # action delay augmentation - transition acts on delayed actions from its own history,
+        # conditioned on the ground-truth delay; plan-time delay is 0 (the agent knows its own actions)
+
+        self.use_action_delay = use_action_delay
+        self.action_delay_prob = action_delay_prob
+        self.action_delay_max = action_delay_max
+        self.action_delay_q = action_delay_q
+        self.action_delay_uniform_mix = action_delay_uniform_mix
+
         # maybe action decoding
 
         self.action_decoder = default(action_decoder, nn.Identity())
@@ -2140,6 +2288,9 @@ class Agent(Module):
                     state_transition_dim_head = state_transition_dim_head,
                     transition_lookahead = transition_lookahead,
                     temporal_compression = temporal_compressions[idx if idx < len(temporal_compressions) else 0],
+                    use_action_delay = use_action_delay,
+                    action_delay_max = action_delay_max,
+                    action_delay_pred_loss_weight = action_delay_pred_loss_weight,
                     q_frac_gradients = q_frac_gradients,
                     to_q_pred = copy.deepcopy(to_q_pred) if (exists(to_q_pred) and idx > 0) else to_q_pred
                 ) for idx in range(num_world_models)
@@ -2695,11 +2846,11 @@ class Agent(Module):
 
         device = self.device
         t = torch.arange(num_chunks, device = device).expand(batch, num_chunks)
-        idx = torch.arange(batch, device = device)[:, None].expand(batch, num_chunks)
+        idx = repeat(torch.arange(batch, device = device), 'b -> b n', n = num_chunks)
 
         if exists(lens):
             lens = tree_map_tensor_to_device(lens, device)
-            lens_chunks = ((lens[:, None] - 1) // c).clamp(max = num_chunks)
+            lens_chunks = repeat((lens - 1) // c, 'b -> b 1').clamp(max = num_chunks)
         else:
             lens_chunks = torch.full((batch, 1), num_chunks, dtype = torch.long, device = device)
 
@@ -2827,7 +2978,8 @@ class Agent(Module):
         risk_factor: float | Tensor | None = None, # deprecated alias for transition_risk_factor
         value_risk_factor: float | Tensor | None = None,
         discount_factor: float | Tensor | None = None,
-        plan_lookahead: int | None = None # prefix transition only - steps to predict per re-anchored pass, defaults to the full horizon in one parallel pass; fall back to fewer and redo the prediction until the horizon is covered
+        plan_lookahead: int | None = None, # prefix transition only - steps to predict per re-anchored pass, defaults to the full horizon in one parallel pass; fall back to fewer and redo the prediction until the horizon is covered
+        plan_delay_predict: bool = False # use the auxiliary delay prediction head (argmax) to select the delay slice per rollout step, instead of always planning on the clean channel
     ):
         batch, device = first_tensor(states).shape[0], self.device
         state_len, action_len = first_tensor(states).shape[1], actions.shape[1]
@@ -2856,8 +3008,17 @@ class Agent(Module):
         is_search_space_raw_action = search_space == 'raw'
         dim_action = self.dim_action if is_search_space_raw_action else self.dim_transition_action_input
 
-        has_reward_pred = exists(getattr(world_model, 'to_reward_pred', None))
-        has_discount_pred = exists(getattr(world_model, 'to_discount_pred', None))
+        has_reward_pred = exists(world_model.to_reward_pred)
+        has_discount_pred = exists(world_model.to_discount_pred)
+
+        # estimated lag - auxiliary head picks the delay slice per step (estimate, don't reveal)
+
+        has_delay_pred = plan_delay_predict and world_model.has_action_delay_pred
+
+        def predict_delays(state, action_cond):
+            with torch.no_grad():
+                logits = world_model.to_action_delay_pred((state.detach(), action_cond.detach()))
+            return logits.argmax(dim = -1)
 
         has_cem_temperature = cem_temperature > 0.
         has_gradient_steps = gradient_steps > 0
@@ -2999,7 +3160,12 @@ class Agent(Module):
                 # with temporal compression, one step is a chunk of `temporal_compression` raw actions
 
                 transition_action = rearrange(action, '... c d -> ... 1 c d') if has_temporal_compression else rearrange(action, '... d -> ... 1 d')
-                logits = transition.predict(rearrange(state, '... d -> ... 1 d'), transition_action)
+                action_delays = None
+
+                if has_delay_pred:
+                    action_delays = rearrange(predict_delays(state, action), '... -> ... 1')
+
+                logits = transition.predict(rearrange(state, '... d -> ... 1 d'), transition_action, action_delays = action_delays)
                 logits = rearrange(logits, '... 1 d -> ... d')
             else:
                 logits = transition((state, action))
@@ -3307,7 +3473,13 @@ class Agent(Module):
                     chunk_step_actions_cond = actions_cond[:, :, chunk_start:chunk_end]
 
                     step_anchor = rearrange(step_state_latents, 'b p d -> b p 1 d')
-                    pred_residuals = world_model.ema_state_transition_for_planning.predict(step_anchor, chunk_actions_cond) # (b, p, l, d)
+                    action_delays = None
+
+                    if has_delay_pred:
+                        delays = predict_delays(step_anchor[..., 0, :], chunk_step_actions_cond[:, :, 0])
+                        action_delays = repeat(delays, 'b p -> b p h', h = chunk_actions_cond.shape[2])
+
+                    pred_residuals = world_model.ema_state_transition_for_planning.predict(step_anchor, chunk_actions_cond, action_delays = action_delays) # (b, p, l, d)
 
                     if world_model.probabilistic_plan_state_transition:
                         chunk_pred_states, chunk_entropies = world_model.plan_state_transition_beta_distr(pred_residuals, sample = True, return_entropy = True)
@@ -4164,6 +4336,23 @@ class Agent(Module):
 
         action_cond = action_cond[:, :orig_actions.shape[1]]
 
+        # action delay augmentation - delayed transition action cond, other heads stay aligned
+
+        transition_action_cond_shifted = transition_action_cond
+        action_delays = None
+
+        if self.use_action_delay and self.training:
+            source = default(transition_action_cond, action_cond)
+
+            if exists(source):
+                transition_action_cond_shifted, action_delays = delay_shifted_action_cond(
+                    source,
+                    prob = self.action_delay_prob,
+                    delay_max = self.action_delay_max,
+                    q = self.action_delay_q,
+                    uniform_mix = self.action_delay_uniform_mix
+                )
+
         # forward world model
 
         world_model = self.get_world_model(world_model_index)
@@ -4181,8 +4370,9 @@ class Agent(Module):
             model_memories = model_memories,
             prepend_memories = None,
             has_episodic_mem = self.has_episodic_mem,
-            episodic_mems = getattr(self, 'episodic_mems', None),
-            transition_action_cond = transition_action_cond,
+            episodic_mems = self.episodic_mems,
+            transition_action_cond = transition_action_cond_shifted,
+            action_delays = action_delays,
             rewards = rewards,
             dones = dones
         )

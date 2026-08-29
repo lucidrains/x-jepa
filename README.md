@@ -283,3 +283,14 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
     url     = {https://www.mdpi.com/1424-8220/25/1/191}
 }
 ```
+
+```bibtex
+@inproceedings{bouteiller2021reinforcementlearningdelays,
+    title   = {Reinforcement Learning with Random Delays},
+    author  = {Yann Bouteiller and Simon Ramstedt and Giovanni Beltrame and Christopher J. Pal and Jonathan Binas},
+    booktitle = {International Conference on Learning Representations},
+    year    = {2021},
+    note    = {Delay-Correcting Actor-Critic (DCAC)},
+    url     = {https://openreview.net/forum?id=QFYnKlBJYR},
+}
+```
