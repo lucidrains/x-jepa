@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Callable, Literal, NamedTuple, Any, Sequence
+from typing import Callable, Literal, NamedTuple, Any, Sequence, Iterable
 
 import math
 import copy
@@ -132,6 +132,9 @@ def cast_tuple(t, length = 1):
 
 def cast_tensor(t):
     return t if is_tensor(t) else tensor(t)
+
+def cap_at_seq_len(t, seq_len):
+    return tree_map(lambda x: x[:, :seq_len], t) if exists(t) else None
 
 def first_tensor(t):
     tensors, _ = tree_flatten(t)
@@ -1039,27 +1042,22 @@ class Actor(Module):
 
         self.discount_factor = discount_factor
 
-        # risk embedders - the transition (aleatoric / dynamics) risk and the value
-        # network (epistemic / value-uncertainty) risk condition separately
-
+        # risk embedders
+ 
+        transition_risk_embedder = None
+ 
         if exists(risk_embedder):
-            if hasattr(risk_embedder, 'transition_risk_embedder'):
-                # combined RiskEmbedder - both risks, each embedded separately
-
-                self.transition_risk_embedder = risk_embedder.transition_risk_embedder
-                self.value_risk_embedder = default(value_risk_embedder, risk_embedder.value_risk_embedder)
+            if isinstance(risk_embedder, RiskEmbedder):
+                transition_risk_embedder = risk_embedder.transition_risk_embedder
+                value_risk_embedder = default(value_risk_embedder, risk_embedder.value_risk_embedder)
             else:
-                # deprecated - a bare transition risk embedder passed as risk_embedder
-
-                self.transition_risk_embedder = risk_embedder
-                self.value_risk_embedder = default(value_risk_embedder, ValueRiskEmbedder(dim) if exists(value_risk_factor) else None)
-        else:
-            if exists(risk_factor):
-                assert exists(dim), 'dim must be passed to actor if transition_risk_factor is provided'
-                self.transition_risk_embedder = TransitionRiskEmbedder(dim)
-            else:
-                self.transition_risk_embedder = None
-            self.value_risk_embedder = default(value_risk_embedder, ValueRiskEmbedder(dim) if exists(value_risk_factor) else None)
+                transition_risk_embedder = risk_embedder
+        elif exists(risk_factor):
+            assert exists(dim), 'dim must be passed to actor if risk_factor is provided'
+            transition_risk_embedder = TransitionRiskEmbedder(dim)
+ 
+        self.transition_risk_embedder = transition_risk_embedder
+        self.value_risk_embedder = default(value_risk_embedder, ValueRiskEmbedder(dim) if exists(value_risk_factor) else None)
 
         self.transition_risk_factor = risk_factor
         self.value_risk_factor = value_risk_factor
@@ -3391,7 +3389,7 @@ class Agent(Module):
                     pred_state_entropies = rearrange(pred_state_entropies, 'h b p d -> b p h d')
 
                 pred_next_encoded_states = rearrange(pred_next_encoded_states, 'h b p d -> b p h d')
-                pred_values = rearrange(pred_values, 'h b p -> b p h')
+                pred_values = rearrange(pred_values, 'h b p ... -> b p h ...')
 
                 if has_reward_pred:
                     pred_rewards = rearrange(pred_rewards, 'h b p -> b p h')
@@ -3764,7 +3762,16 @@ class Agent(Module):
                     while mask.ndim < real.ndim:
                         mask = mask.unsqueeze(-1)
 
-                    return torch.where(mask, torch.as_tensor(final, dtype = real.dtype, device = real.device), real)
+                    if (
+                        not is_tensor(final) and
+                        isinstance(final, Iterable) and
+                        any(f is None for f in final)
+                    ):
+                        final = stack([torch.as_tensor(default(f, real[0]), dtype = real.dtype, device = real.device) for f in final])
+                    else:
+                        final = torch.as_tensor(final, dtype = real.dtype, device = real.device)
+
+                    return torch.where(mask, final, real)
 
                 next_state = tree_map(restore_final_obs, next_state, info['final_observation'])
 
@@ -4302,15 +4309,15 @@ class Agent(Module):
         pred_values = self.value_network(val_state_tokens, val_state_latents, discounts)
 
         if exists(returns_tensor):
+            seq_len = returns_tensor.shape[1]
+
             value_loss = self.value_network.compute_loss(
-                pred_values,
+                cap_at_seq_len(pred_values, seq_len),
                 returns_tensor,
-                cond = (val_state_tokens, val_state_latents),
-                mask = mask,
+                cond = cap_at_seq_len((val_state_tokens, val_state_latents), seq_len),
+                mask = cap_at_seq_len(mask, seq_len),
                 average_mode = masked_loss_average_mode
             )
-
-
 
         # action latent uniform loss
 
@@ -4331,7 +4338,8 @@ class Agent(Module):
         goal_loss = self.zero
 
         if self.learn_goal_generator and exists(returns_tensor):
-            flat_state_latents = rearrange(state_latents_full.detach(), '... d -> (...) d')
+            seq_len = returns_tensor.shape[1]
+            flat_state_latents = rearrange(cap_at_seq_len(state_latents_full, seq_len).detach(), '... d -> (...) d')
 
             flat_returns = rearrange(returns_tensor, '... -> (...)')
 
