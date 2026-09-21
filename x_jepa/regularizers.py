@@ -1,13 +1,17 @@
 import math
 
 import torch
+from torch import nn
 import torch.nn.functional as F
 from torch.nn import Module
 
 from functools import wraps
-from einops import rearrange, repeat
+from einops import rearrange, repeat, einsum
 
 # helpers
+
+def exists(v):
+    return v is not None
 
 def l2norm(t):
     return F.normalize(t, dim = -1)
@@ -192,3 +196,88 @@ class TemporalStraightening(Module):
         latents
     ):
         return temporal_straightening_loss(latents, eps = self.eps)
+
+# jepa-anything https://arxiv.org/abs/2609.20800
+
+@cast_compute_dtype
+def coordinate_std_floor_loss(samples, min_std = 0.1, eps = 1e-6):
+    samples = rearrange(samples, '... d -> (...) d')
+    std = (samples.var(dim = 0, unbiased = False) + eps).sqrt()
+    return F.relu(min_std - std).mean()
+
+def factor_activity_loss(factors, min_std = 0.1, eps = 1e-6):
+    return coordinate_std_floor_loss(rearrange(factors, '... k r -> (...) (k r)'), min_std = min_std, eps = eps)
+
+def encoder_variance_loss(states, min_std = 0.1, eps = 1e-6):
+    return coordinate_std_floor_loss(states, min_std = min_std, eps = eps)
+
+# orthogonal subspaces module
+
+class OrthogonalSubspaces(Module):
+    """
+    Orthogonal Subspaces Projection from JEPA-Anything (arXiv:2609.20800).
+    Decomposes latent state of dimension d into K orthogonal subspaces of dimension r (d = K * r).
+    """
+    def __init__(
+        self,
+        dim,
+        num_subspaces,
+        use_pinv = True
+    ):
+        super().__init__()
+        assert dim % num_subspaces == 0, f'dim {dim} must be divisible by num_subspaces {num_subspaces}'
+
+        self.dim = dim
+        self.num_subspaces = num_subspaces
+        self.use_pinv = use_pinv
+
+        self.basis = nn.Parameter(rearrange(torch.eye(dim), '(k r) d -> k r d', k = num_subspaces))
+
+        self._cached_synthesis = None
+
+    def train(self, mode = True):
+        super().train(mode)
+        self._cached_synthesis = None
+        return self
+
+    @property
+    def synthesis_basis(self):
+        # transpose synthesis is exact while the basis is orthonormal, the pseudoinverse stays exact as it drifts
+
+        if not self.use_pinv:
+            return self.basis
+
+        if not self.training and exists(self._cached_synthesis):
+            return self._cached_synthesis
+
+        flat_basis = rearrange(self.basis, 'k r d -> (k r) d')
+        synthesis = rearrange(torch.linalg.pinv(flat_basis).T, '(k r) d -> k r d', k = self.num_subspaces)
+
+        if not self.training:
+            self._cached_synthesis = synthesis
+
+        return synthesis
+
+    def project(self, state):
+        return einsum(state, self.basis, '... d, k r d -> ... k r')
+
+    def compose(self, factors):
+        return einsum(factors, self.synthesis_basis, '... k r, k r d -> ... d')
+
+    def reconstruct(self, state):
+        return self.compose(self.project(state))
+
+    def residual_factors(self, state, residual):
+        residual = rearrange(residual, '... (k r) -> ... k r', k = self.num_subspaces)
+        return self.project(state) + residual
+
+    def add_residual(self, state, residual):
+        return self.compose(self.residual_factors(state, residual))
+
+    def orthogonal_loss(self):
+        flat_basis = rearrange(self.basis, 'k r d -> (k r) d')
+        identity = torch.eye(self.dim, device = self.basis.device, dtype = self.basis.dtype)
+        return (flat_basis @ flat_basis.T - identity).square().sum()
+
+    def forward(self, state):
+        return self.project(state)

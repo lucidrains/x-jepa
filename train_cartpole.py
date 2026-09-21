@@ -80,6 +80,7 @@ def train_wm_epoch(wm, buffer, optimizer, device, batch_size, epochs_per_train, 
     loss_val = 0.0
     reward_loss_val = 0.0
     discount_loss_val = 0.0
+    ortho_loss_val = 0.0
     total_batches = epochs_per_train * batches_per_epoch
 
     for step in range(total_batches):
@@ -108,8 +109,9 @@ def train_wm_epoch(wm, buffer, optimizer, device, batch_size, epochs_per_train, 
             loss_val = loss.item()
             reward_loss_val = loss_breakdown.reward_pred.item()
             discount_loss_val = loss_breakdown.discount_pred.item()
+            ortho_loss_val = loss_breakdown.orthogonal.item() if hasattr(loss_breakdown, 'orthogonal') else 0.0
 
-    return loss_val, reward_loss_val, discount_loss_val
+    return loss_val, reward_loss_val, discount_loss_val, ortho_loss_val
 
 # main
 
@@ -149,7 +151,14 @@ def main(
     transition_type = 'prefix', # 'prefix' for fast-lewm action-prefix transformer, 'mlp' for classic one-step
     transition_lookahead = 3, # mtp lookahead for the prefix transition - each prefix predicts the next `lookahead` latents
     plan_lookahead = None, # plan-time lookahead (prefix transition) - steps predicted per re-anchored pass; fall back to fewer and redo the prediction until the horizon is covered; defaults to the full horizon in one parallel pass
-    train_reward_heads = True # train the reward and continuation heads (requires rewards/dones in the buffer); False exercises the heads-free training path
+    train_reward_heads = True, # train the reward and continuation heads (requires rewards/dones in the buffer); False exercises the heads-free training path
+    num_orthogonal_subspaces = None,
+    orthogonal_loss_weight = 0.1, # JEPA-Anything projector-Gram weight (sum-reduction loss)
+    orthogonal_factor_activity_weight = 0.05,
+    orthogonal_encoder_variance_weight = 0.02,
+    orthogonal_min_std = 0.1,
+    use_dynamic_rollout_loss_weighting = False,
+    dynamic_rollout_loss_decay = 1.
 ):
     device = Accelerator(cpu = cpu).device
     print(f"using device: {device}", flush = True)
@@ -157,6 +166,7 @@ def main(
     # fire passes cli booleans as strings - coerce so `--use_wandb false` actually disables logging
 
     use_wandb = (str(use_wandb).lower() == 'true') if isinstance(use_wandb, str) else bool(use_wandb)
+    use_dynamic_rollout_loss_weighting = (str(use_dynamic_rollout_loss_weighting).lower() == 'true') if isinstance(use_dynamic_rollout_loss_weighting, str) else bool(use_dynamic_rollout_loss_weighting)
 
     if use_wandb:
         wandb.init(project = project_name, config = dict(seed = seed))
@@ -195,7 +205,14 @@ def main(
         reg_next_state_weight = reg_next_state_weight,
         transition_horizon = cem_horizon,
         transition_lookahead = transition_lookahead,
-        add_reflexive_actor = True
+        add_reflexive_actor = True,
+        num_orthogonal_subspaces = num_orthogonal_subspaces,
+        orthogonal_loss_weight = orthogonal_loss_weight,
+        orthogonal_factor_activity_weight = orthogonal_factor_activity_weight,
+        orthogonal_encoder_variance_weight = orthogonal_encoder_variance_weight,
+        orthogonal_min_std = orthogonal_min_std,
+        use_dynamic_rollout_loss_weighting = use_dynamic_rollout_loss_weighting,
+        dynamic_rollout_loss_decay = dynamic_rollout_loss_decay
     ).to(device)
 
     optimizer = Adam(wm.parameters(), lr = lr)
@@ -206,6 +223,7 @@ def main(
     wm_loss_val = 0.0
     wm_reward_loss_val = 0.0
     wm_discount_loss_val = 0.0
+    wm_ortho_loss_val = 0.0
     suffix = f"-{tag}" if tag else ""
     buffer_folder = f"./{env_name.lower().replace('-v1', '')}-memories{suffix}"
 
@@ -240,7 +258,7 @@ def main(
         )
 
         if divisible_by(episode, train_every_eps):
-            wm_loss_val, wm_reward_loss_val, wm_discount_loss_val = train_wm_epoch(wm, buffer, optimizer, device, batch_size, epochs_per_train, grad_accum_steps, train_window = train_window, batches_per_epoch = batches_per_epoch, train_reward_heads = train_reward_heads)
+            wm_loss_val, wm_reward_loss_val, wm_discount_loss_val, wm_ortho_loss_val = train_wm_epoch(wm, buffer, optimizer, device, batch_size, epochs_per_train, grad_accum_steps, train_window = train_window, batches_per_epoch = batches_per_epoch, train_reward_heads = train_reward_heads)
 
         # metrics and logging
 
@@ -258,7 +276,8 @@ def main(
             if num_seed_groups > 1:
                 gmeans = [float(np.mean(total_rewards[g * group_size:(g + 1) * group_size])) for g in range(num_seed_groups)]
                 group_info = " | groups: " + " ".join(f"{g:5.1f}" for g in gmeans)
-            print(f"episode {episode:4d} [WM planning]  | reward mean: {batch_mean:6.2f} max: {batch_max:6.2f} | avg{reward_avg_window}: {avg_reward:6.2f} | wm_loss: {wm_loss_val:.4f} | reward_loss: {wm_reward_loss_val:.4f} | discount_loss: {wm_discount_loss_val:.4f}{group_info}", flush = True)
+            ortho_info = f" | ortho_loss: {wm_ortho_loss_val:.4f}" if wm_ortho_loss_val > 0. else ""
+            print(f"episode {episode:4d} [WM planning]  | reward mean: {batch_mean:6.2f} max: {batch_max:6.2f} | avg{reward_avg_window}: {avg_reward:6.2f} | wm_loss: {wm_loss_val:.4f} | reward_loss: {wm_reward_loss_val:.4f} | discount_loss: {wm_discount_loss_val:.4f}{ortho_info}{group_info}", flush = True)
 
         if use_wandb:
             wandb.log(dict(episode = episode, reward = batch_mean, avg_reward = avg_reward))

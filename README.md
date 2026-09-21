@@ -283,3 +283,15 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
     url     = {https://www.mdpi.com/1424-8220/25/1/191}
 }
 ```
+
+```bibtex
+@misc{cui2026jepaanythinglearningpredictivemodels,
+    title   = {JEPA-Anything: Learning Predictive Models across Different Worlds},
+    author  = {Taoyong Cui and Zhongyao Wang and Xinyue Xu and Weiyang Liu and Zhaochen Yu and Yuying Zhang and Qiang Gao and Mengyue Yang},
+    year    = {2026},
+    eprint  = {2609.20800},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2609.20800}
+}
+```

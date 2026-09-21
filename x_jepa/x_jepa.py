@@ -30,6 +30,7 @@ from x_mlps_pytorch import MLP
 from hl_gauss_pytorch import HLGaussLoss
 
 from torch_einops_utils import (
+    exclusive_cumsum,
     pad_right_at_dim_to,
     temp_eval,
     batched_index_select,
@@ -50,7 +51,7 @@ from PoPE_pytorch import PoPE, apply_pope_to_qk
 from env_ssl_wrapper import compose_env
 
 from x_jepa.utils import Experience, masked_mean, accepts_kwarg, filter_kwargs_for_fn
-from x_jepa.regularizers import SigReg, uniform_wasserstein_loss, temporal_straightening_loss
+from x_jepa.regularizers import SigReg, uniform_wasserstein_loss, temporal_straightening_loss, OrthogonalSubspaces, factor_activity_loss, encoder_variance_loss
 from x_jepa.min_gru import minGRUBlocks
 from x_jepa.goals import GoalGenerator
 from x_jepa.flow_matching import FlowMatching
@@ -70,7 +71,10 @@ WorldModelLoss = namedtuple('WorldModelLoss', [
     'reward_pred',
     'discount_pred',
     'reg_next_state',
-    'reg_next_encoded'
+    'reg_next_encoded',
+    'orthogonal',
+    'orthogonal_factor_activity',
+    'orthogonal_encoder_variance'
 ])
 
 Losses = namedtuple('Losses', [
@@ -82,6 +86,9 @@ Losses = namedtuple('Losses', [
     'discount_pred',
     'reg_next_state',
     'reg_next_encoded',
+    'orthogonal',
+    'orthogonal_factor_activity',
+    'orthogonal_encoder_variance',
     'action_recon',
     'actor',
     'actor_losses',
@@ -1043,9 +1050,9 @@ class Actor(Module):
         self.discount_factor = discount_factor
 
         # risk embedders
- 
+
         transition_risk_embedder = None
- 
+
         if exists(risk_embedder):
             if isinstance(risk_embedder, RiskEmbedder):
                 transition_risk_embedder = risk_embedder.transition_risk_embedder
@@ -1055,7 +1062,7 @@ class Actor(Module):
         elif exists(risk_factor):
             assert exists(dim), 'dim must be passed to actor if risk_factor is provided'
             transition_risk_embedder = TransitionRiskEmbedder(dim)
- 
+
         self.transition_risk_embedder = transition_risk_embedder
         self.value_risk_embedder = default(value_risk_embedder, ValueRiskEmbedder(dim) if exists(value_risk_factor) else None)
 
@@ -1521,6 +1528,19 @@ def extract_temporal_compressed_lanes(
 
     return states, actions, mask, returns, rewards, dones
 
+# losses
+
+# dynamic rollout loss weighting
+# weight each rollout step by exp(-decay * cumulative loss of preceding steps), as errors compound through the dynamics model
+
+def dynamic_rollout_loss_weights(
+    step_losses, # (r b n)
+    decay = 1.,
+    dim = 0
+):
+    cum_step_losses = exclusive_cumsum(step_losses, dim = dim)
+    return (-decay * cum_step_losses).exp()
+
 # world model module
 
 class WorldModel(Module):
@@ -1553,9 +1573,19 @@ class WorldModel(Module):
         q_max_value = 100.,
         q_use_symlog = True,
         q_frac_gradients = 0., # fraction of the Q head gradient flowing into the world model, like the value head
-        to_q_pred: Module | None = None # custom Q head MLP over (state latent, action cond)
+        to_q_pred: Module | None = None, # custom Q head MLP over (state latent, action cond)
+        num_orthogonal_subspaces: int | None = None,
+        orthogonal_loss_weight: float = 0.1,
+        orthogonal_factor_activity_weight: float = 0.05,
+        orthogonal_encoder_variance_weight: float = 0.02,
+        orthogonal_min_std: float = 0.1,
+        use_dynamic_rollout_loss_weighting: bool = False,
+        dynamic_rollout_loss_decay: float = 1.
     ):
         super().__init__()
+
+        self.use_dynamic_rollout_loss_weighting = use_dynamic_rollout_loss_weighting
+        self.dynamic_rollout_loss_decay = dynamic_rollout_loss_decay
 
         # transformer backbone
 
@@ -1640,6 +1670,20 @@ class WorldModel(Module):
         self.reg_next_state_weight = reg_next_state_weight
         self.reg_next_encoded_weight = reg_next_encoded_weight
 
+        # orthogonal subspaces
+
+        self.has_orthogonal_subspaces = exists(num_orthogonal_subspaces) and num_orthogonal_subspaces > 0
+
+        self.orthogonal_subspaces = OrthogonalSubspaces(
+            dim = dim_state_latent,
+            num_subspaces = num_orthogonal_subspaces
+        ) if self.has_orthogonal_subspaces else None
+
+        self.orthogonal_loss_weight = orthogonal_loss_weight
+        self.orthogonal_factor_activity_weight = orthogonal_factor_activity_weight
+        self.orthogonal_encoder_variance_weight = orthogonal_encoder_variance_weight
+        self.orthogonal_min_std = orthogonal_min_std
+
         # temporal compression (hierarchical state transition & chunked action planning)
 
         self.temporal_compression = temporal_compression
@@ -1663,6 +1707,15 @@ class WorldModel(Module):
 
     def q_loss(self, logits, returns, mask = None, reduction = None):
         return self.q_hl_gauss(logits, returns, mask = mask, reduction = reduction)
+
+    def apply_transition_residual(self, state_latents, residuals):
+        # residual prediction - a plain latent-space residual, or per-factor residuals
+        # synthesized through the orthogonal subspaces when OPF is enabled
+
+        if not self.has_orthogonal_subspaces:
+            return state_latents + residuals
+
+        return self.orthogonal_subspaces.add_residual(state_latents, residuals)
 
     def _compute_transition_loss(
         self,
@@ -1700,10 +1753,23 @@ class WorldModel(Module):
             if probabilistic:
                 loss = beta_distr(pred_logits, target = target_windows.detach()).sum(dim = -1)
                 pred = beta_distr(pred_logits)
+            elif self.has_orthogonal_subspaces:
+                # opf - each output block predicts one factor's delta; synthesize with the pseudoinverse
+
+                subspaces = self.orthogonal_subspaces
+                pred_factors = subspaces.residual_factors(anchor_windows, pred_logits)
+                target_factors = subspaces.project(target_windows.detach())
+                loss = reduce(F.mse_loss(pred_factors, target_factors, reduction = 'none'), '... k r -> ...', 'mean')
+                pred = subspaces.compose(pred_factors)
             else:
                 pred = anchor_windows + pred_logits
                 loss_pattern = 'b w h l d -> b w h l' if lookahead > 1 else 'b w h d -> b w h'
                 loss = reduce(F.smooth_l1_loss(pred, target_windows.detach(), reduction = 'none'), loss_pattern, 'mean')
+
+            if self.use_dynamic_rollout_loss_weighting and lookahead > 1:
+                step_losses = rearrange(loss, 'b w h l -> l (b w h)')
+                weights = dynamic_rollout_loss_weights(step_losses, decay = self.dynamic_rollout_loss_decay, dim = 0)
+                loss = loss * rearrange(weights.detach(), 'l (b w h) -> b w h l', b = loss.shape[0], w = loss.shape[1], h = loss.shape[2])
 
             return loss, pred, mask
 
@@ -1713,6 +1779,14 @@ class WorldModel(Module):
             pred_logits = transition((state_latents, action_cond))
             loss = beta_distr(pred_logits, target = next_target_state_latents.detach()).sum(dim = -1)
             pred = beta_distr(pred_logits)
+        elif self.has_orthogonal_subspaces:
+            pred_residual = transition((state_latents, action_cond))
+
+            subspaces = self.orthogonal_subspaces
+            pred_factors = subspaces.residual_factors(state_latents, pred_residual)
+            target_factors = subspaces.project(next_target_state_latents.detach())
+            loss = reduce(F.mse_loss(pred_factors, target_factors, reduction = 'none'), '... k r -> ...', 'mean')
+            pred = subspaces.compose(pred_factors)
         else:
             pred_residual = transition((state_latents, action_cond))
             pred = state_latents + pred_residual
@@ -1775,7 +1849,7 @@ class WorldModel(Module):
 
         if state_embeds_full.shape[1] < 2:
             wm_loss_breakdown = WorldModelLoss(
-                self.zero, self.zero, self.zero, self.zero, self.zero, self.zero, self.zero
+                self.zero, self.zero, self.zero, self.zero, self.zero, self.zero, self.zero, self.zero, self.zero, self.zero
             )
             outputs = dict(
                 embeds = embeds,
@@ -1859,6 +1933,21 @@ class WorldModel(Module):
             if self.reg_next_encoded_weight > 0.:
                 reg_next_encoded_loss = reg(pred_next_encoded_state)
 
+        orthogonal_loss = self.zero
+        orthogonal_factor_activity_loss = self.zero
+        orthogonal_encoder_variance_loss = self.zero
+
+        if self.has_orthogonal_subspaces:
+            orthogonal_loss = self.orthogonal_subspaces.orthogonal_loss()
+            orthogonal_factor_activity_loss = factor_activity_loss(
+                self.orthogonal_subspaces.project(next_target_state_latents.detach()),
+                min_std = self.orthogonal_min_std
+            )
+            orthogonal_encoder_variance_loss = encoder_variance_loss(
+                state_latents,
+                min_std = self.orthogonal_min_std
+            )
+
         total_wm_loss = (
             next_state_latent_pred_loss +
             plan_state_pred_loss * self.plan_state_pred_loss_weight +
@@ -1866,7 +1955,10 @@ class WorldModel(Module):
             reward_pred_loss * self.reward_pred_loss_weight +
             discount_pred_loss * self.discount_pred_loss_weight +
             reg_next_state_loss * self.reg_next_state_weight +
-            reg_next_encoded_loss * self.reg_next_encoded_weight
+            reg_next_encoded_loss * self.reg_next_encoded_weight +
+            orthogonal_loss * self.orthogonal_loss_weight +
+            orthogonal_factor_activity_loss * self.orthogonal_factor_activity_weight +
+            orthogonal_encoder_variance_loss * self.orthogonal_encoder_variance_weight
         )
 
         wm_loss_breakdown = WorldModelLoss(
@@ -1876,7 +1968,10 @@ class WorldModel(Module):
             reward_pred_loss,
             discount_pred_loss,
             reg_next_state_loss,
-            reg_next_encoded_loss
+            reg_next_encoded_loss,
+            orthogonal_loss,
+            orthogonal_factor_activity_loss,
+            orthogonal_encoder_variance_loss
         )
 
         outputs = dict(
@@ -1985,6 +2080,13 @@ class Agent(Module):
         temporal_compression: int | Sequence[int] = 1,
         q_frac_gradients = 0., # fraction of the Q head gradient flowing into the world model, like the value head
         to_q_pred: Module | None = None, # custom Q head MLP over (state latent, action cond)
+        num_orthogonal_subspaces: int | None = None,
+        orthogonal_loss_weight: float = 0.1,
+        orthogonal_factor_activity_weight: float = 0.05,
+        orthogonal_encoder_variance_weight: float = 0.02,
+        orthogonal_min_std: float = 0.1,
+        use_dynamic_rollout_loss_weighting: bool = False,
+        dynamic_rollout_loss_decay: float = 1.,
         use_diayn = False,
         num_skills = 8,
         dim_skill = 32,
@@ -2139,7 +2241,14 @@ class Agent(Module):
                     transition_lookahead = transition_lookahead,
                     temporal_compression = temporal_compressions[idx if idx < len(temporal_compressions) else 0],
                     q_frac_gradients = q_frac_gradients,
-                    to_q_pred = copy.deepcopy(to_q_pred) if (exists(to_q_pred) and idx > 0) else to_q_pred
+                    to_q_pred = copy.deepcopy(to_q_pred) if (exists(to_q_pred) and idx > 0) else to_q_pred,
+                    num_orthogonal_subspaces = num_orthogonal_subspaces,
+                    orthogonal_loss_weight = orthogonal_loss_weight,
+                    orthogonal_factor_activity_weight = orthogonal_factor_activity_weight,
+                    orthogonal_encoder_variance_weight = orthogonal_encoder_variance_weight,
+                    orthogonal_min_std = orthogonal_min_std,
+                    use_dynamic_rollout_loss_weighting = use_dynamic_rollout_loss_weighting,
+                    dynamic_rollout_loss_decay = dynamic_rollout_loss_decay
                 ) for idx in range(num_world_models)
             ]
 
@@ -3005,7 +3114,7 @@ class Agent(Module):
             if world_model.probabilistic_plan_state_transition:
                 return world_model.plan_state_transition_beta_distr(logits, sample = True, return_entropy = return_entropy)
 
-            next_state = state + logits
+            next_state = world_model.apply_transition_residual(state, logits)
 
             if clamp_state_latent_to_range and self.has_state_latent_clamp:
                 next_state.clamp_(-self.state_latent_clamp_value, self.state_latent_clamp_value)
@@ -3311,7 +3420,7 @@ class Agent(Module):
                         chunk_pred_states, chunk_entropies = world_model.plan_state_transition_beta_distr(pred_residuals, sample = True, return_entropy = True)
                         pred_state_entropies.append(chunk_entropies)
                     else:
-                        chunk_pred_states = step_anchor + pred_residuals
+                        chunk_pred_states = world_model.apply_transition_residual(step_anchor, pred_residuals)
 
                         if clamp_state_latent_to_range and self.has_state_latent_clamp:
                             chunk_pred_states.clamp_(-self.state_latent_clamp_value, self.state_latent_clamp_value)
@@ -3320,6 +3429,7 @@ class Agent(Module):
 
                     chunk_prev_state_latents = cat((step_anchor, chunk_pred_states[:, :, :-1]), dim = -2)
                     chunk_encoded_states = world_model.to_next_encoded_state_pred((chunk_prev_state_latents, chunk_step_actions_cond))
+
                     chunk_values = self.value_network(chunk_encoded_states, chunk_pred_states, discount = discount_factor, transition_risk = transition_risk_factor, value_risk = value_risk_factor)
 
                     chunk_rewards, chunk_discounts = rollout_heads(chunk_prev_state_latents, chunk_step_actions_cond)

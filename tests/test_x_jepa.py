@@ -3295,3 +3295,43 @@ def test_q_filtered_seeding(temporal_compression):
 
     assert filtered_mean > plain_mean + 0.3, \
         f'Q-filtered seeding should beat plain actor seeding: plain {plain_mean:+.3f} vs Q {filtered_mean:+.3f}'
+
+@param('transition_type', ('prefix', 'mlp'))
+@param('use_reg', (False, True))
+def test_world_model_orthogonal_subspaces(transition_type, use_reg):
+    dim = 32
+
+    state_transition = MLP(dim + 4, *((dim * 2,) * 2), dim) if transition_type == 'mlp' else None
+
+    agent = Agent(
+        state_encoder = nn.Linear(16, dim),
+        action_encoder = nn.Linear(4, dim),
+        model = Transformer(dim = dim, depth = 1, causal = True),
+        state_transition = state_transition,
+        dim_action = 4,
+        continuous_actions = True,
+        transition_action_space = 'raw',
+        num_orthogonal_subspaces = 4,
+        reg_next_state_weight = 0.1 if use_reg else 0.,
+        transition_horizon = 4
+    )
+
+    states = torch.randn(2, 4, 16)
+    actions = torch.randn(2, 3, 4).tanh()
+    returns = torch.randn(2, 4)
+
+    loss, _ = agent(states, actions, returns = returns)
+    assert loss.ndim == 0
+    loss.backward()
+
+    # planning rollout with orthogonal subspaces
+
+    planned = agent.plan(
+        states[:, :2],
+        actions[:, :1],
+        horizon = 2,
+        pop_size = 8,
+        generations = 2,
+        fitness_fn = lambda pred_state_latents: reduce(pred_state_latents, 'b p ... -> b p', 'sum')
+    )
+    assert planned.shape == (2, 2, 4)
