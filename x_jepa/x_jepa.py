@@ -1169,7 +1169,7 @@ class Actor(Module):
         return_log_prob = False
     ):
         if self.continuous_actions:
-            action = self.action_distr(action_preds, sample = True, temperature = temperature)
+            action = self.action_distr(action_preds, sample = temperature > 0., temperature = temperature)
 
             if not return_log_prob:
                 return action
@@ -1177,6 +1177,11 @@ class Actor(Module):
             log_probs = -self.action_distr(action_preds, target = action)
             log_probs = reduce(log_probs, '... d -> ...', 'sum')
             return action, log_probs
+
+        if temperature <= 0.:
+            action = action_preds.argmax(dim = -1)
+            dist = Categorical(logits = action_preds)
+            return (action, dist.log_prob(action)) if return_log_prob else action
 
         logits = safe_divide(action_preds, temperature)
         dist = Categorical(logits = logits)
@@ -2923,6 +2928,7 @@ class Agent(Module):
         actor_temperature = 1.,
         value_filter_samples: int | None = None,       # seed actor with best-of-N actions by Q(s, a) - Q-Planning (Giridhar et al. 2026, arXiv 2608.21204); only used with seed_with_actor
         clamp_state_latent_to_range = True,
+        use_ema_for_planning = True,
         return_action_latent = False,
         search_space: Literal['raw', 'local_global'] | None = None,
         memories = None,
@@ -3039,7 +3045,11 @@ class Agent(Module):
         if self.has_episodic_mem and not exists(model_memories):
             prepend_memories = self.episodic_mems(batch)
 
-        (embeds, _), next_model_memories = world_model.ema_model(
+        prompt_model = world_model.ema_model if use_ema_for_planning else world_model.model
+        plan_transition = (world_model.ema_state_transition_for_planning
+                           if use_ema_for_planning else world_model.state_transition_for_planning)
+
+        (embeds, _), next_model_memories = prompt_model(
             tokens,
             past_layers = wm_past_layers,
             return_hiddens = True,
@@ -3071,7 +3081,9 @@ class Agent(Module):
         else:
             means = torch.rand(shape, device = device) * 2. - 1.
 
-        stds = torch.rand(shape, device = device)
+        # a seed turns CEM into local refinement instead of a blind re-search
+        stds = (torch.full(shape, .5, device = device)
+                if exists(seed_action) else torch.rand(shape, device = device))
         variances = (stds ** 2).clamp_min(cem_min_var)
 
         # precompute past rnn memories for rnn action latents, repeating to population size
@@ -3100,7 +3112,7 @@ class Agent(Module):
         # helper for advancing state
 
         def advance_state(state, action, return_entropy = False):
-            transition = world_model.ema_state_transition_for_planning
+            transition = plan_transition
 
             if world_model.transition_is_prefix:
                 # with temporal compression, one step is a chunk of `temporal_compression` raw actions
@@ -3414,7 +3426,7 @@ class Agent(Module):
                     chunk_step_actions_cond = actions_cond[:, :, chunk_start:chunk_end]
 
                     step_anchor = rearrange(step_state_latents, 'b p d -> b p 1 d')
-                    pred_residuals = world_model.ema_state_transition_for_planning.predict(step_anchor, chunk_actions_cond) # (b, p, l, d)
+                    pred_residuals = plan_transition.predict(step_anchor, chunk_actions_cond) # (b, p, l, d)
 
                     if world_model.probabilistic_plan_state_transition:
                         chunk_pred_states, chunk_entropies = world_model.plan_state_transition_beta_distr(pred_residuals, sample = True, return_entropy = True)
@@ -3669,6 +3681,7 @@ class Agent(Module):
         # return the top winner
 
         winning_actions = fittest_actions[:, 0]
+        winning_pred_latents = batched_index_select(pred_state_latents, elite_indices[:, :1], dim = 1)[:, 0] if (return_pred_state_latents or return_pred_states) else None
 
         decoded_actions = winning_actions
 
@@ -3686,7 +3699,6 @@ class Agent(Module):
             out = (decoded_actions, winning_actions)
 
         if return_pred_state_latents or return_pred_states:
-            winning_pred_latents = batched_index_select(pred_state_latents, elite_indices, dim = 1)[:, 0]
             out = (*cast_tuple(out), winning_pred_latents)
 
         if not return_memories:
@@ -3708,6 +3720,7 @@ class Agent(Module):
         cast_double_to_float: bool = True,
         actor_module: str | None = None, # can be any custom key, but 'reflexive' or 'bc' are standard
         actor_temperature = 1.0,
+        warm_start = False,
         callback: Callable[..., Any] | None = None,
         action_fn: Callable[..., Any] | None = None,
         commit_k_steps: int | None = None,
@@ -3750,6 +3763,7 @@ class Agent(Module):
         memories = None
         action_queue = []
         pred_state_latent_queue = []
+        prev_plan = None
 
         # skills
 
@@ -3831,6 +3845,15 @@ class Agent(Module):
                 memories = None
             else:
                 if not action_queue:
+                    if warm_start and exists(prev_plan):
+                        # shift the previous plan by the committed steps, reuse it as the CEM mean
+                        committed_steps = commit_k_steps
+                        warm_seed = torch.cat([
+                            prev_plan[:, committed_steps:],
+                            prev_plan[:, -1:].expand(-1, committed_steps, -1)
+                        ], dim = 1)
+                        plan_kwargs = dict(plan_kwargs, seed_action = warm_seed)
+
                     plan_out, memories = self.plan(
                         states = state_seq,
                         actions = empty_actions,
@@ -3849,6 +3872,7 @@ class Agent(Module):
 
                     planned_actions, *rest = cast_tuple(plan_out)
                     pred_latents = rest[0] if rest else None
+                    prev_plan = planned_actions
 
                     action_queue = [*planned_actions[:, :commit_k_steps].unbind(dim = 1)]
                     pred_state_latent_queue = [*pred_latents[:, :commit_k_steps].unbind(dim = 1)] if exists(pred_latents) else []
@@ -4085,6 +4109,7 @@ class Agent(Module):
         behavior_clone: bool | str | tuple[str, ...] | list[str] = True,
         behavior_clone_weight: Tensor | None = None, # Float['batch'] - per-trajectory weight on the behavior-clone loss, generalizing a mask (0./1. weights recover masking); when given, the actor loss is returned per-batch (b,) and excluded from the total loss, so the caller owns the weighted reduction
         return_loss = True,
+        return_outputs = False,
         memories = None,
         return_memories = False,
         masked_loss_average_mode: str | None = None
@@ -4540,6 +4565,9 @@ class Agent(Module):
         )
 
         out = (total_loss, loss_breakdown)
+        if return_outputs:
+            out = (*out, agent_outputs)
+
         return (out, next_memories) if return_memories else out
 
 # test-time training

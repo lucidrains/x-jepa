@@ -11,3 +11,10 @@ from x_jepa.regularizers import (
     factor_activity_loss,
     encoder_variance_loss
 )
+
+from x_jepa.state_space import (
+    StateDecoder,
+    StateValue,
+    StateSpaceHeads,
+    state_space_fitness
+)
