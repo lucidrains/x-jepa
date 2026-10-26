@@ -12,9 +12,11 @@ from x_jepa.regularizers import (
     encoder_variance_loss
 )
 
-from x_jepa.state_space import (
+from x_jepa.state_heads import (
     StateDecoder,
     StateValue,
     StateSpaceHeads,
     state_space_fitness
 )
+
+from x_jepa.log_depth_recurrent import LogDepthRecurrentModel

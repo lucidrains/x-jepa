@@ -12,6 +12,7 @@ from einops.layers.torch import Rearrange
 from x_mlps_pytorch import MLP
 
 from x_jepa.x_jepa import Agent, WorldModel, Transformer, Actor, exists, AgentRolloutWrapper, TTTMetaLearningLoss, PrefixStateTransition, compressed_lane_bounds
+from x_jepa.log_depth_recurrent import LogDepthRecurrentModel
 from x_jepa.min_gru import minGRUBlocks
 from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
 from x_jepa.goals import GoalGenerator, MetricResidualNetwork
@@ -807,6 +808,57 @@ def test_world_model_plan_with_memories():
 
         first_action = planned_actions[:, :1]
         assert first_action.shape == (batch_size, 1, 4)
+
+@param('model_type', ('transformer', 'log-depth'))
+@torch.no_grad()
+def test_plan_memory_replays_executed_actions(model_type):
+    torch.manual_seed(0)
+
+    dim = 32
+
+    model = Transformer(dim = dim, depth = 2, causal = True) if model_type == 'transformer' else LogDepthRecurrentModel(dim = dim, depth = 2, max_seq_len = 128)
+
+    agent = Agent(
+        state_encoder = nn.Linear(4, dim),
+        action_encoder = nn.Linear(1, dim),
+        model = model,
+        dim_action = 1,
+        continuous_actions = True,
+        transition_action_space = 'raw',
+        state_linear_rnn_depth = 0,
+        action_linear_rnn_depth = 0
+    ).eval()
+
+    states = torch.randn(2, 6, 4)
+    actions = torch.randn(2, 5, 1).tanh()
+    seed_action = torch.randn(2, 1, 1, 1)
+    empty_actions = torch.empty(2, 0, 1)
+
+    fitness_fn = lambda pred_state_latents: reduce(pred_state_latents, 'b p h d -> b p', 'sum')
+
+    def plan(states, actions, memories = None, return_memories = False):
+        return agent.plan(
+            states = states,
+            actions = actions,
+            fitness_fn = fitness_fn,
+            horizon = 1,
+            pop_size = 1,
+            generations = 1,
+            seed_action = seed_action,
+            memories = memories,
+            return_memories = return_memories,
+            return_pred_state_latents = True
+        )
+
+    memories = None
+
+    for t in range(5):
+        out, memories = plan(states[:, t:t + 1], empty_actions, memories, return_memories = True)
+        full_history = plan(states[:, :t + 1], actions[:, :t])[1]
+
+        assert_close(out[1], full_history, atol = 1e-5, rtol = 1e-5)
+
+        memories = agent.update_memories_with_action(actions[:, t], memories)
 
 @torch.no_grad()
 def test_interact_with_environment():

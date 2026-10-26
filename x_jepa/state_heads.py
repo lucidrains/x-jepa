@@ -1,4 +1,4 @@
-"""state-space heads for latent world models"""
+"""state readout heads for latent world models - decoder + V(s), not an SSM"""
 
 import torch
 import torch.nn.functional as F

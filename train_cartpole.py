@@ -23,6 +23,12 @@
 #   python train_cartpole.py
 #   python train_cartpole.py --transition_type mlp
 #
+# log-depth recurrent backbone (https://arxiv.org/abs/2609.28212) at the full 500-step horizon:
+#
+#   python train_cartpole.py --model_type log-depth \
+#       --max_timesteps 500 --target_avg_reward 500 \
+#       --cem_num_samples 256 --cem_num_iters 6
+#
 # overridable via fire, e.g.:
 #   python train_cartpole.py --num_envs 16 --num_episodes 30 --cpu true
 
@@ -43,6 +49,7 @@ from x_mlps_pytorch import MLP
 
 from x_jepa import Agent
 from x_jepa.x_jepa import Transformer
+from x_jepa.log_depth_recurrent import LogDepthRecurrentModel
 from x_jepa.utils import store_experience_in_replay_buffer, divisible_by
 
 from env_cartpole import BatchedEnv
@@ -103,6 +110,7 @@ def train_wm_epoch(wm, buffer, optimizer, device, batch_size, epochs_per_train, 
         (loss / grad_accum_steps).backward()
 
         if divisible_by(step + 1, grad_accum_steps) or (step + 1) == total_batches:
+            torch.nn.utils.clip_grad_norm_(wm.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()
             wm.update()
@@ -136,7 +144,7 @@ def main(
     cem_num_iters = 8,
     cem_elite_frac = 0.1,
     cem_horizon = 8,
-    commit_k_steps = 8,
+    commit_k_steps = 1,
     reg_next_state_weight = 0.1,
     random_action_eps = 12,
     gamma = 0.99,
@@ -149,6 +157,7 @@ def main(
     use_wandb = False,
     cpu = False,
     transition_type = 'prefix', # 'prefix' for fast-lewm action-prefix transformer, 'mlp' for classic one-step
+    model_type = 'transformer', # 'transformer' | 'log-depth'
     transition_lookahead = 3, # mtp lookahead for the prefix transition - each prefix predicts the next `lookahead` latents
     plan_lookahead = None, # plan-time lookahead (prefix transition) - steps predicted per re-anchored pass; fall back to fewer and redo the prediction until the horizon is covered; defaults to the full horizon in one parallel pass
     train_reward_heads = True, # train the reward and continuation heads (requires rewards/dones in the buffer); False exercises the heads-free training path
@@ -184,6 +193,17 @@ def main(
     action_encoder = MLP(action_dim, hidden_dim, dim)
 
     assert transition_type in ('prefix', 'mlp'), f'unknown transition_type: {transition_type}'
+    assert model_type in ('transformer', 'log-depth'), f'unknown model_type: {model_type}'
+
+    if model_type == 'log-depth':
+        lr = min(lr, 1e-3) # tree scan is less forgiving at the transformer lr
+        model = LogDepthRecurrentModel(
+            dim = dim,
+            depth = depth,
+            max_seq_len = 2 * train_window
+        )
+    else:
+        model = Transformer(dim = dim, depth = depth, causal = True)
 
     state_transition = None
 
@@ -193,7 +213,7 @@ def main(
     wm = Agent(
         state_encoder = state_encoder,
         action_encoder = action_encoder,
-        model = Transformer(dim = dim, depth = depth, causal = True),
+        model = model,
         state_transition = state_transition,
         dim_action = action_dim,
         continuous_actions = True,

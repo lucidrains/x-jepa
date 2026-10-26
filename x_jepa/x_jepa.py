@@ -2928,7 +2928,7 @@ class Agent(Module):
         actor_temperature = 1.,
         value_filter_samples: int | None = None,       # seed actor with best-of-N actions by Q(s, a) - Q-Planning (Giridhar et al. 2026, arXiv 2608.21204); only used with seed_with_actor
         clamp_state_latent_to_range = True,
-        use_ema_for_planning = True,
+        use_ema_for_planning = False, # online model tracks planning latents better than the EMA target
         return_action_latent = False,
         search_space: Literal['raw', 'local_global'] | None = None,
         memories = None,
@@ -2997,13 +2997,17 @@ class Agent(Module):
 
         states_prompt = slice_state_seq(states, start = offset, step = temporal_compression)
         actions_prompt = pool_actions(actions[:, offset:], temporal_compression = temporal_compression)
-        actions_prompt = pad_right_at_dim_to(actions_prompt, first_tensor(states_prompt).shape[1], dim = 1)
+
+        if action_len > 0:
+            actions_prompt = pad_right_at_dim_to(actions_prompt, first_tensor(states_prompt).shape[1], dim = 1)
 
         # get the state and action latents
 
         state_tokens, sensory_layer_hiddens, _ = self.encode_states(self.state_encoder, states_prompt)
 
-        if has_temporal_compression:
+        if action_len == 0:
+            action_tokens = None
+        elif has_temporal_compression:
             if self.continuous_actions:
                 action_tokens = self.encode_actions(actions_prompt)
             else:
@@ -3028,18 +3032,25 @@ class Agent(Module):
             return_memories = True
         )
 
-        rnn_action_tokens, next_action_rnn_memories = self.action_linear_rnn(
-            action_tokens,
-            memories = action_rnn_memories,
-            return_memories = True
-        )
+        if action_len > 0:
+            rnn_action_tokens, next_action_rnn_memories = self.action_linear_rnn(
+                action_tokens,
+                memories = action_rnn_memories,
+                return_memories = True
+            )
 
-        tokens = rearrange([rnn_state_tokens, rnn_action_tokens], 'sa b n d -> b (n sa) d')
+            tokens = rearrange([rnn_state_tokens, rnn_action_tokens], 'sa b n d -> b (n sa) d')
+        else:
+            next_action_rnn_memories = action_rnn_memories
+            tokens = rnn_state_tokens
 
         wm_past_layers = None
 
         if self.pass_sensory_hiddens_to_world_model:
-            wm_past_layers = [rearrange([h, torch.zeros_like(h)], 'sa b n d -> b (n sa) d') for h in sensory_layer_hiddens]
+            wm_past_layers = [
+                h if action_len == 0 else rearrange([h, torch.zeros_like(h)], 'sa b n d -> b (n sa) d')
+                for h in sensory_layer_hiddens
+            ]
 
         prepend_memories = None
         if self.has_episodic_mem and not exists(model_memories):
@@ -3058,7 +3069,7 @@ class Agent(Module):
             return_memories = True
         )
 
-        state_embeds = embeds[:, -2] # (b d)
+        state_embeds = embeds[:, -1] if action_len == 0 else embeds[:, -2] # (b d)
 
         state_latents = self.to_state_latent(state_embeds)
 
@@ -3708,6 +3719,35 @@ class Agent(Module):
         return out, next_memories
 
     @torch.no_grad()
+    def update_memories_with_action(
+        self,
+        action,
+        memories,
+        world_model_index = 0,
+        use_ema_for_planning = False
+    ):
+        if not exists(memories):
+            return memories
+
+        state_rnn_memories, action_rnn_memories, model_memories = memories
+
+        action = torch.as_tensor(action, device = self.device)
+        action = rearrange(action, 'b ... -> b 1 ...')
+
+        action_tokens = self.encode_actions(action)
+        rnn_action_tokens, action_rnn_memories = self.action_linear_rnn(
+            action_tokens,
+            memories = action_rnn_memories,
+            return_memories = True
+        )
+
+        world_model = self.get_world_model(world_model_index)
+        prompt_model = world_model.ema_model if use_ema_for_planning else world_model.model
+        _, model_memories = prompt_model(rnn_action_tokens, memories = model_memories, return_memories = True)
+
+        return state_rnn_memories, action_rnn_memories, model_memories
+
+    @torch.no_grad()
     @temp_eval
     def interact_with_environment(
         self,
@@ -3737,6 +3777,7 @@ class Agent(Module):
         value_risk_factor = default(value_risk_factor, self.value_risk_factor)
 
         world_model = self.get_world_model(world_model_index)
+        use_ema_for_planning = plan_kwargs.get('use_ema_for_planning', False)
         temporal_compression = world_model.temporal_compression
         has_temporal_compression = world_model.has_temporal_compression
 
@@ -3854,6 +3895,9 @@ class Agent(Module):
                         ], dim = 1)
                         plan_kwargs = dict(plan_kwargs, seed_action = warm_seed)
 
+                    # planning prompt carries only the current state - the executed action
+                    # is appended to memory after env.step
+
                     plan_out, memories = self.plan(
                         states = state_seq,
                         actions = empty_actions,
@@ -3885,6 +3929,14 @@ class Agent(Module):
             actions.append(action.cpu() if return_cpu else action)
 
             next_state, reward, terminated, truncated, info = env.step(action)
+
+            if exists(memories):
+                memories = self.update_memories_with_action(
+                    action,
+                    memories,
+                    world_model_index = world_model_index,
+                    use_ema_for_planning = use_ema_for_planning
+                )
 
             # episode padding zeroes done envs' obs - restore the true terminal obs from info,
             # so the model never trains on zero states (which can masquerade as a goal)
