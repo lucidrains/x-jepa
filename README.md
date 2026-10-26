@@ -307,3 +307,15 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
     url     = {https://arxiv.org/abs/2609.20800}
 }
 ```
+
+```bibtex
+@misc{cowsik2026selfplaypretrainingzerodata,
+    title   = {Self-Play Pretraining with Zero Data},
+    author  = {Aditya Cowsik and Kfir Dolev and Michael Y. Li and G. Bruno De Luca and Nourya Cohen and Noah D. Goodman and Yoav Levine},
+    year    = {2026},
+    eprint  = {2609.30063},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.AI},
+    url     = {https://arxiv.org/abs/2609.30063}
+}
+```

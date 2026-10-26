@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torch.distributions import Beta, Categorical
 from torch.optim import Adam, Optimizer
 from torch.utils._pytree import tree_map, tree_flatten
-from torch.func import functional_call, vmap
+from torch.func import functional_call, vmap, jvp
 
 import einx
 from torch import nn, cat, stack, tensor, is_tensor, Tensor, atleast_1d
@@ -1995,6 +1995,30 @@ class WorldModel(Module):
         )
 
         return (total_wm_loss, wm_loss_breakdown), outputs
+
+    def loss_jvp(
+        self,
+        tangent: dict[str, Tensor],
+        *args,
+        **kwargs
+    ):
+        # per sample loss and its directional derivative along a parameter tangent
+
+        params = {
+            name: param.detach()
+            for name, param in self.named_parameters()
+            if param.requires_grad and name in tangent
+        }
+
+        tangent = {name: tangent[name] for name in params}
+
+        def functional_loss(p):
+            (loss, _), _ = functional_call(self, p, args, dict(kwargs, return_per_sample_loss = True))
+            return loss
+
+        loss, loss_tangent = jvp(functional_loss, (params,), (tangent,))
+
+        return loss, loss_tangent.detach()
 
 # agent
 
