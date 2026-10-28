@@ -36,6 +36,35 @@ def log(x, eps = 1e-20):
 def l1norm(t):
     return F.normalize(t, p = 1., dim = -1)
 
+def is_discount_range(discount):
+    return isinstance(discount, tuple) and len(discount) == 2
+
+def resolve_discount(
+    discount,
+    batch = None,
+    device = None,
+    dtype = torch.float32,
+    sample = False
+):
+    if not is_discount_range(discount):
+        return discount
+
+    low, high = discount
+    assert 0. <= low <= high <= 1., f'discount_factor range ({low}, {high}) must satisfy 0 <= min <= max <= 1'
+
+    if sample and exists(batch):
+        return torch.empty((batch,), device = device, dtype = dtype).uniform_(low, high)
+
+    return 0.5 * (low + high)
+
+def broadcast_cond(cond, target_tensor):
+    cond = cast_tensor(resolve_discount(cond))
+
+    while cond.ndim < target_tensor.ndim - 1:
+        cond = cond.unsqueeze(-1)
+
+    return cond.broadcast_to(target_tensor.shape[:-1])
+
 # discount embedder
 
 class DiscountEmbedder(Module):
@@ -59,8 +88,8 @@ class DiscountEmbedder(Module):
         return self.zero.device
 
     def forward(self, discount):
-        device = self.device
-        discount = cast_tensor(discount).to(device)
+        device, dtype = self.device, self.zero.dtype
+        discount = cast_tensor(discount).to(device = device, dtype = dtype)
 
         one_minus_discount = 1. - discount
         negative_log_discount = -log(1. - discount, eps = self.eps)
@@ -92,7 +121,8 @@ class TransitionRiskEmbedder(Module):
         )
 
     def forward(self, risk):
-        risk = rearrange(cast_tensor(risk), '... -> ... 1')
+        device, dtype = self.bin_centers.device, self.bin_centers.dtype
+        risk = rearrange(cast_tensor(risk).to(device = device, dtype = dtype), '... -> ... 1')
 
         bin_distance = risk - self.bin_centers
         bin_weights = l1norm((-0.5 * (bin_distance / self.sigma) ** 2).exp())
@@ -191,20 +221,10 @@ class ValueHead(Module):
 
     def get_discount_embed(self, target_tensor, discount = None, ema = False):
         discount = default(discount, self.discount_factor)
-
         if not exists(discount):
             return 0.
 
-        discount = atleast_1d(cast_tensor(discount))
-        discount = rearrange(discount, 'batch -> batch 1')
-
-        if target_tensor.ndim == 3:
-            seq_len = target_tensor.shape[1]
-            discount = repeat(discount, 'batch 1 -> batch seq_len', seq_len = seq_len)
-        else:
-            discount = rearrange(discount, 'batch 1 -> batch')
-
-        return self.embed_discount(discount, ema = ema)
+        return self.embed_discount(broadcast_cond(discount, target_tensor), ema = ema)
 
     def embed_transition_risk(self, transition_risk, ema = False):
         if not exists(self.transition_risk_embedder):
@@ -214,24 +234,11 @@ class ValueHead(Module):
         return transition_risk_embedder(transition_risk)
 
     def get_transition_risk_embed(self, target_tensor, transition_risk = None, ema = False):
-        if not exists(self.transition_risk_embedder):
-            return 0.
-
         transition_risk = default(transition_risk, self.transition_risk_factor)
-
-        if not exists(transition_risk):
+        if not (exists(self.transition_risk_embedder) and exists(transition_risk)):
             return 0.
 
-        transition_risk = atleast_1d(cast_tensor(transition_risk))
-        transition_risk = rearrange(transition_risk, 'batch -> batch 1')
-
-        if target_tensor.ndim == 3:
-            seq_len = target_tensor.shape[1]
-            transition_risk = repeat(transition_risk, 'batch 1 -> batch seq_len', seq_len = seq_len)
-        else:
-            transition_risk = rearrange(transition_risk, 'batch 1 -> batch')
-
-        return self.embed_transition_risk(transition_risk, ema = ema)
+        return self.embed_transition_risk(broadcast_cond(transition_risk, target_tensor), ema = ema)
 
     def embed_value_risk(self, value_risk, ema = False):
         if not exists(self.value_risk_embedder):
@@ -241,24 +248,11 @@ class ValueHead(Module):
         return value_risk_embedder(value_risk)
 
     def get_value_risk_embed(self, target_tensor, value_risk = None, ema = False):
-        if not exists(self.value_risk_embedder):
-            return 0.
-
         value_risk = default(value_risk, self.value_risk_factor)
-
-        if not exists(value_risk):
+        if not (exists(self.value_risk_embedder) and exists(value_risk)):
             return 0.
 
-        value_risk = atleast_1d(cast_tensor(value_risk))
-        value_risk = rearrange(value_risk, 'batch -> batch 1')
-
-        if target_tensor.ndim == 3:
-            seq_len = target_tensor.shape[1]
-            value_risk = repeat(value_risk, 'batch 1 -> batch seq_len', seq_len = seq_len)
-        else:
-            value_risk = rearrange(value_risk, 'batch 1 -> batch')
-
-        return self.embed_value_risk(value_risk, ema = ema)
+        return self.embed_value_risk(broadcast_cond(value_risk, target_tensor), ema = ema)
 
     def condition_tokens(self, state_tokens, discount, transition_risk, value_risk = None, ema = False):
         discount_embed = self.get_discount_embed(state_tokens, discount, ema = ema)
@@ -416,7 +410,8 @@ class EnsembleValue(ValueHead):
         raw_value_loss = F.smooth_l1_loss(pred_values, returns, reduction = 'none')
 
         if exists(self._bootstrap_masks):
-            raw_value_loss = raw_value_loss * self._bootstrap_masks
+            bootstrap_masks = self._bootstrap_masks[:, :raw_value_loss.shape[1]] if self._bootstrap_masks.ndim > 2 else self._bootstrap_masks
+            raw_value_loss = raw_value_loss * bootstrap_masks
 
         return masked_mean(raw_value_loss, mask, average_mode = average_mode)
 

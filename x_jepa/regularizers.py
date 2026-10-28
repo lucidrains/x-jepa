@@ -179,9 +179,13 @@ def temporal_straightening_loss(
     velocities = torch.diff(latents, dim = -2)
 
     past_vel, future_vel = velocities[..., :-1, :], velocities[..., 1:, :]
+    active = (past_vel.norm(dim = -1) > eps) & (future_vel.norm(dim = -1) > eps)
+
+    if not active.any():
+        return latents.new_zeros(())
 
     cos_sim = F.cosine_similarity(past_vel, future_vel, dim = -1, eps = eps)
-    return (1. - cos_sim).mean()
+    return (1. - cos_sim[active]).mean()
 
 class TemporalStraightening(Module):
     def __init__(

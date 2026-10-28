@@ -113,8 +113,11 @@ CrossSensoryPairLoss = namedtuple('CrossSensoryPairLoss', ['src', 'tgt', 'loss']
 def exists(v):
     return v is not None
 
-def default(v, d):
-    return v if exists(v) else d
+def default(*vals):
+    for v in vals:
+        if exists(v):
+            return v
+    return None
 
 def at_most_one_of(*args):
     return sum(map(exists, args)) <= 1
@@ -949,10 +952,14 @@ def calc_returns(
     # pack to ensure at least 2 dimensions for assoc scan
 
     if is_tensor(discount_factor):
+        discount_factor = discount_factor.to(device = rewards.device, dtype = rewards.dtype)
         discount_factor, _ = pack([atleast_1d(discount_factor)], 'b *')
 
     if is_tensor(next_values):
+        next_values = next_values.to(device = rewards.device, dtype = rewards.dtype)
         next_values, _ = pack([next_values], 'b *')
+    else:
+        next_values = torch.full((rewards.shape[0], 1), next_values, device = rewards.device, dtype = rewards.dtype)
 
     gates = discount_factor * (~is_done).float()
 
@@ -983,6 +990,7 @@ def calc_returns(
 
     return returns
 
+from x_jepa.state_heads import n_step_returns, n_step_td_target
 from x_jepa.value_networks import (
     Value,
     DiscountEmbedder,
@@ -993,8 +1001,82 @@ from x_jepa.value_networks import (
     DistributionalValue,
     MeanVarianceValue,
     FlowValue,
-    create_value_network
+    create_value_network,
+    resolve_discount,
+    broadcast_cond
 )
+
+def rollout_return(
+    pred_rewards: Tensor | None = None,
+    pred_discounts: Tensor | None = None,
+    pred_values: Tensor | None = None,
+    discount_factor: float | Tensor | tuple[float, float] = 0.99,
+    bootstrap_value_weight: float = 1.,
+    termination_threshold: float | None = None,
+    value_network: Module | None = None,
+    value_risk_factor: float | Tensor | None = None
+):
+    # discounted rollout rewards + discounted terminal-gated bootstrap value:
+    #   G^(H) = sum_{k=0}^{H-1} gamma^k (prod_{j=0}^{k-1} c_j) r_k + w * gamma^H (prod_{j=0}^{H-1} c_j) V(s_H; gamma)
+
+    ref = default(pred_rewards, pred_values)
+    assert exists(ref), 'either pred_rewards or pred_values must be provided to rollout_return'
+
+    batch, pop_size, horizon = ref.shape[:3]
+    device, dtype = ref.device, ref.dtype
+
+    gamma = torch.as_tensor(default(resolve_discount(discount_factor), 0.99), device = device, dtype = dtype)
+    gamma = rearrange(gamma, 'b -> b 1') if gamma.ndim == 1 else gamma
+
+    if exists(pred_discounts):
+        cont = (pred_discounts >= termination_threshold).to(dtype) if exists(termination_threshold) else pred_discounts.to(dtype)
+        survived = cont.cumprod(dim = -1)
+        alive_before = F.pad(survived[..., :-1], (1, 0), value = 1.)
+    else:
+        survived = alive_before = torch.ones((batch, pop_size, horizon), device = device, dtype = dtype)
+
+    total = torch.zeros((batch, pop_size), device = device, dtype = dtype)
+
+    if exists(pred_rewards):
+        steps = torch.arange(horizon, device = device, dtype = dtype)
+        step_discounts = gamma[..., None] ** steps
+        total = total + reduce(pred_rewards * step_discounts * alive_before, 'b p h -> b p', 'sum')
+
+    if exists(pred_values) and bootstrap_value_weight != 0.:
+        if pred_values.ndim == 4:
+            val_mean, val_std = value_network.mean_and_uncertainty(pred_values) if exists(value_network) else (pred_values.mean(dim = -1), pred_values.std(dim = -1))
+        else:
+            val_mean, val_std = pred_values, None
+
+        if exists(value_risk_factor) and exists(val_std):
+            risk = broadcast_cond(value_risk_factor, pred_values).to(device = device, dtype = dtype) if pred_values.ndim == 4 else torch.as_tensor(value_risk_factor, device = device, dtype = dtype)
+            val_score = val_mean + risk * val_std
+        else:
+            val_score = val_mean
+
+        bootstrap = (gamma ** horizon) * survived[:, :, -1] * val_score[:, :, -1]
+        total = total + bootstrap_value_weight * bootstrap
+
+    return total
+
+def make_rollout_fitness(
+    discount_factor: float | Tensor | None = None,
+    bootstrap_value_weight: float = 1.,
+    termination_threshold: float | None = None,
+    value_risk_factor: float | Tensor | None = None
+):
+    def fitness_fn(pred_rewards, pred_discounts, pred_values, discount_factor = discount_factor):
+        return rollout_return(
+            pred_rewards = pred_rewards,
+            pred_discounts = pred_discounts,
+            pred_values = pred_values,
+            discount_factor = default(discount_factor, 0.99),
+            bootstrap_value_weight = bootstrap_value_weight,
+            termination_threshold = termination_threshold,
+            value_risk_factor = value_risk_factor
+        )
+
+    return fitness_fn
 
 # classes
 
@@ -1070,55 +1152,25 @@ class Actor(Module):
         self.value_risk_factor = value_risk_factor
 
     def get_discount_embed(self, target_tensor, discount = None):
-        if not exists(self.discount_embedder):
-            return 0.
-
         discount = default(discount, self.discount_factor)
-
-        if not exists(discount):
+        if not (exists(self.discount_embedder) and exists(discount)):
             return 0.
 
-        discount = cast_tensor(discount)
-
-        if discount.ndim == 1 and target_tensor.ndim == 3:
-            discount = rearrange(discount, 'b -> b 1')
-
-        discount = discount.broadcast_to(target_tensor.shape[:-1])
-        return self.discount_embedder(discount)
+        return self.discount_embedder(broadcast_cond(discount, target_tensor))
 
     def get_transition_risk_embed(self, target_tensor, transition_risk = None):
-        if not exists(self.transition_risk_embedder):
-            return 0.
-
         transition_risk = default(transition_risk, self.transition_risk_factor)
-
-        if not exists(transition_risk):
+        if not (exists(self.transition_risk_embedder) and exists(transition_risk)):
             return 0.
 
-        transition_risk = cast_tensor(transition_risk)
-
-        if transition_risk.ndim == 1 and target_tensor.ndim == 3:
-            transition_risk = rearrange(transition_risk, 'b -> b 1')
-
-        transition_risk = transition_risk.broadcast_to(target_tensor.shape[:-1])
-        return self.transition_risk_embedder(transition_risk)
+        return self.transition_risk_embedder(broadcast_cond(transition_risk, target_tensor))
 
     def get_value_risk_embed(self, target_tensor, value_risk = None):
-        if not exists(self.value_risk_embedder):
-            return 0.
-
         value_risk = default(value_risk, self.value_risk_factor)
-
-        if not exists(value_risk):
+        if not (exists(self.value_risk_embedder) and exists(value_risk)):
             return 0.
 
-        value_risk = cast_tensor(value_risk)
-
-        if value_risk.ndim == 1 and target_tensor.ndim == 3:
-            value_risk = rearrange(value_risk, 'b -> b 1')
-
-        value_risk = value_risk.broadcast_to(target_tensor.shape[:-1])
-        return self.value_risk_embedder(value_risk)
+        return self.value_risk_embedder(broadcast_cond(value_risk, target_tensor))
 
     # deprecated alias - use get_transition_risk_embed
 
@@ -1805,6 +1857,7 @@ class WorldModel(Module):
         action_cond,
         ema_encoded_state,
         to_state_latent: Callable,
+        mask = None,
         valid_target_mask = None,
         masked_loss_average_mode: str = 'timestep',
         reg: Module | None = None,
@@ -1846,8 +1899,8 @@ class WorldModel(Module):
         )
 
         target_state_embeds, _ = rearrange(target_embeds, 'b (n sa) d -> sa b n d', sa = 2)
-        next_target_state_embeds = target_state_embeds[:, 1:]
-        next_target_state_latents = to_state_latent(next_target_state_embeds)
+        target_state_latents_full = to_state_latent(target_state_embeds)
+        next_target_state_latents = target_state_latents_full[:, 1:]
 
         state_embeds_full, action_embeds_full = rearrange(embeds, 'b (n sa) d -> sa b n d', sa = 2)
         state_latents_full = to_state_latent(state_embeds_full)
@@ -1862,6 +1915,7 @@ class WorldModel(Module):
                 next_model_memories = next_model_memories,
                 state_embeds_full = state_embeds_full,
                 state_latents_full = state_latents_full,
+                target_state_latents_full = target_state_latents_full,
                 state_latents = state_latents_full,
                 action_cond = action_cond,
                 next_state_pred = None,
@@ -1869,6 +1923,7 @@ class WorldModel(Module):
             )
             return (self.zero, wm_loss_breakdown), outputs
 
+        action_cond_full = action_cond
         state_embeds, state_latents, action_embeds = (t[:, :-1] for t in (state_embeds_full, state_latents_full, action_embeds_full))
 
         action_cond = action_cond[:, :state_latents.shape[1]]
@@ -1915,16 +1970,19 @@ class WorldModel(Module):
 
         reward_pred_loss = self.zero
         discount_pred_loss = self.zero
+        reward_mask = default(mask, valid_target_mask) if action_cond_full.shape[1] >= state_latents_full.shape[1] else default(valid_target_mask, mask)
 
         if exists(rewards):
-            pred_rewards = rearrange(self.to_reward_pred((state_latents, action_cond)), '... 1 -> ...')
-            target_rewards = rewards[:, :state_latents.shape[1]].detach()
-            reward_pred_loss = masked_mean(F.smooth_l1_loss(pred_rewards, target_rewards, reduction = 'none'), valid_target_mask, average_mode = masked_loss_average_mode)
+            reward_len = min(state_latents_full.shape[1], action_cond_full.shape[1], rewards.shape[1])
+            pred_rewards = rearrange(self.to_reward_pred((state_latents_full[:, :reward_len], action_cond_full[:, :reward_len])), '... 1 -> ...')
+            target_rewards = rewards[:, :reward_len].detach()
+            reward_pred_loss = masked_mean(F.smooth_l1_loss(pred_rewards, target_rewards, reduction = 'none'), reward_mask[:, :reward_len] if exists(reward_mask) else None, average_mode = masked_loss_average_mode)
 
         if exists(dones):
-            pred_discount_logits = rearrange(self.to_discount_pred((state_latents, action_cond)), '... 1 -> ...')
-            target_continuation = (1. - dones.float())[:, :state_latents.shape[1]].detach()
-            discount_pred_loss = masked_mean(F.binary_cross_entropy_with_logits(pred_discount_logits, target_continuation, reduction = 'none'), valid_target_mask, average_mode = masked_loss_average_mode)
+            done_len = min(state_latents_full.shape[1], action_cond_full.shape[1], dones.shape[1])
+            pred_discount_logits = rearrange(self.to_discount_pred((state_latents_full[:, :done_len], action_cond_full[:, :done_len])), '... 1 -> ...')
+            target_continuation = (1. - dones.float())[:, :done_len].detach()
+            discount_pred_loss = masked_mean(F.binary_cross_entropy_with_logits(pred_discount_logits, target_continuation, reduction = 'none'), reward_mask[:, :done_len] if exists(reward_mask) else None, average_mode = masked_loss_average_mode)
 
         reg_next_state_loss = self.zero
         reg_next_encoded_loss = self.zero
@@ -1988,6 +2046,7 @@ class WorldModel(Module):
             state_embeds = state_embeds,
             action_embeds = action_embeds,
             state_latents_full = state_latents_full,
+            target_state_latents_full = target_state_latents_full,
             state_latents = state_latents,
             action_cond = action_cond,
             next_state_pred = next_state_pred,
@@ -2710,6 +2769,40 @@ class Agent(Module):
             masks = masks
         )
 
+    def predict_value(
+        self,
+        states: States,
+        discount: float | Tensor | None = None,
+        transition_risk: float | Tensor | None = None,
+        value_risk: float | Tensor | None = None,
+        ema: bool = False,
+        return_uncertainty: bool = False
+    ):
+        is_single_step = is_tensor(states) and states.ndim == 2
+        if is_single_step:
+            states = rearrange(states, 'b d -> b 1 d')
+
+        base_encoder = self.ema_state_encoder if ema else self.state_encoder
+        val_state_tokens, _ = self.get_value_state_tokens(states, base_state_encoder = base_encoder)
+        val_state_latents = self.to_state_latent(val_state_tokens)
+
+        forward_fn = self.value_network.forward_ema if ema else self.value_network.forward
+        pred_values = forward_fn(
+            val_state_tokens,
+            val_state_latents,
+            discount = discount,
+            transition_risk = transition_risk,
+            value_risk = value_risk
+        )
+        mean, std = self.value_network.mean_and_uncertainty(pred_values)
+
+        if is_single_step:
+            mean = rearrange(mean, 'b 1 ... -> b ...')
+            if exists(std):
+                std = rearrange(std, 'b 1 ... -> b ...')
+
+        return (mean, std) if return_uncertainty else mean
+
     def update(self):
         [ema.update() for ema in self.ema_state_encoder]
         for wm in self.world_models:
@@ -2969,9 +3062,9 @@ class Agent(Module):
         batch, device = first_tensor(states).shape[0], self.device
         state_len, action_len = first_tensor(states).shape[1], actions.shape[1]
 
-        transition_risk_factor = default(transition_risk_factor, default(risk_factor, self.transition_risk_factor))
+        transition_risk_factor = default(transition_risk_factor, risk_factor, self.transition_risk_factor)
         value_risk_factor = default(value_risk_factor, self.value_risk_factor)
-        discount_factor = default(discount_factor, self.discount_factor)
+        discount_factor = resolve_discount(default(discount_factor, self.discount_factor))
 
         # handle skill conditioning for planning
 
@@ -3002,7 +3095,7 @@ class Agent(Module):
         # validation
 
         assert at_most_one_of(seed_with_actor, latent_action_model, seed_action), 'can only seed planning with at most one of seed_with_actor, latent_action_model, or seed_action'
-        assert exists(fitness_fn) or exists(goal_state), 'either fitness_fn or goal_state must be provided'
+        assert exists(fitness_fn) or exists(goal_state) or has_reward_pred, 'either fitness_fn, goal_state, or a world model reward head must be provided'
         assert action_len == (state_len - 1)
         assert generations > 0
         assert horizon >= 1
@@ -3238,6 +3331,11 @@ class Agent(Module):
 
                 return step_action_cond, next_memories
 
+            def expand_for_actor(cond, r):
+                if is_tensor(cond) and cond.ndim >= 1 and cond.shape[0] == batch:
+                    return repeat(cond, 'b ... -> (b r) ...', r = r)
+                return cond
+
             if not has_value_filter:
                 for _ in range(horizon):
                     step_state_reshaped, unpack_actor = pack_with_inverse(step_state, '* d')
@@ -3248,8 +3346,9 @@ class Agent(Module):
                         temperature = actor_temperature,
                         memories = seed_actor_memory,
                         return_memories = True,
-                        transition_risk = transition_risk_factor,
-                        value_risk = value_risk_factor
+                        discount = expand_for_actor(discount_factor, pop_size),
+                        transition_risk = expand_for_actor(transition_risk_factor, pop_size),
+                        value_risk = expand_for_actor(value_risk_factor, pop_size)
                     )
 
                     if exists(skill_actor_cond):
@@ -3297,8 +3396,9 @@ class Agent(Module):
                             temperature = actor_temperature,
                             memories = seed_actor_memory,
                             return_memories = True,
-                            transition_risk = transition_risk_factor,
-                            value_risk = value_risk_factor
+                            discount = expand_for_actor(discount_factor, pop_size * num_candidates),
+                            transition_risk = expand_for_actor(transition_risk_factor, pop_size * num_candidates),
+                            value_risk = expand_for_actor(value_risk_factor, pop_size * num_candidates)
                         )
 
                         if exists(skill_actor_cond):
@@ -3591,20 +3691,32 @@ class Agent(Module):
                 fitness_fn_kwargs = {k: v for k, v in kwargs.items() if k in fitness_fn_params}
                 fitnesses = fitness_fn(**fitness_fn_kwargs)
 
-            elif not exists(goal_dist_fn) and exists(self.quasimetric_distance_network):
-                # evaluate MRN distance on predicted states and goal
-                # enforces state (left) to goal (right) encoder asymmetry
+            elif exists(encoded_goal):
+                if not exists(goal_dist_fn) and exists(self.quasimetric_distance_network):
+                    # evaluate MRN distance on predicted states and goal
+                    # enforces state (left) to goal (right) encoder asymmetry
 
-                _, p, h, _ = pred_state_latents.shape
-                encoded_goal_expanded = encoded_goal.expand(-1, p, h, -1)
-                distances = self.quasimetric_distance_network(pred_state_latents, encoded_goal_expanded)
-                fitnesses = -reduce(distances, 'b p h -> b p', 'sum')
+                    _, p, h, _ = pred_state_latents.shape
+                    encoded_goal_expanded = encoded_goal.expand(-1, p, h, -1)
+                    distances = self.quasimetric_distance_network(pred_state_latents, encoded_goal_expanded)
+                    fitnesses = -reduce(distances, 'b p h -> b p', 'sum')
+                else:
+                    # default to simple distance function if goal state provided
+
+                    dist_fn = default(goal_dist_fn, partial(F.smooth_l1_loss, reduction = 'none'))
+                    distance_to_goal = dist_fn(pred_next_encoded_states, encoded_goal.expand_as(pred_next_encoded_states))
+                    fitnesses = -reduce(distance_to_goal, 'b p h d -> b p', 'sum')
             else:
-                # default to simple distance function if goal state provided
+                # default to discounted rollout return + discounted terminal-gated value bootstrap
 
-                dist_fn = default(goal_dist_fn, partial(F.smooth_l1_loss, reduction = 'none'))
-                distance_to_goal = dist_fn(pred_next_encoded_states, encoded_goal.expand_as(pred_next_encoded_states))
-                fitnesses = -reduce(distance_to_goal, 'b p h d -> b p', 'sum')
+                fitnesses = rollout_return(
+                    pred_rewards = pred_rewards,
+                    pred_discounts = pred_discounts,
+                    pred_values = pred_values,
+                    discount_factor = discount_factor,
+                    value_network = self.value_network,
+                    value_risk_factor = value_risk_factor
+                )
 
             return fitnesses, pred_state_latents
 
@@ -3794,11 +3906,13 @@ class Agent(Module):
         transition_risk_factor: float | Tensor | None = None,
         risk_factor: float | Tensor | None = None, # deprecated alias for transition_risk_factor
         value_risk_factor: float | Tensor | None = None,
+        discount_factor: float | Tensor | None = None,
         risk_entropy_bonus_weight: float = 1.0,
         **plan_kwargs
     ):
-        transition_risk_factor = default(transition_risk_factor, default(risk_factor, self.transition_risk_factor))
+        transition_risk_factor = default(transition_risk_factor, risk_factor, self.transition_risk_factor)
         value_risk_factor = default(value_risk_factor, self.value_risk_factor)
+        discount_factor = resolve_discount(default(discount_factor, self.discount_factor))
 
         world_model = self.get_world_model(world_model_index)
         use_ema_for_planning = plan_kwargs.get('use_ema_for_planning', False)
@@ -3895,6 +4009,7 @@ class Agent(Module):
                     sensory_layer_hiddens = ema_encoded_sensory_states,
                     temperature = actor_temperature,
                     return_log_prob = True,
+                    discount = discount_factor,
                     transition_risk = transition_risk_factor,
                     value_risk = value_risk_factor
                 )
@@ -3935,6 +4050,7 @@ class Agent(Module):
                         skill_id = skill_id,
                         transition_risk_factor = transition_risk_factor,
                         value_risk_factor = value_risk_factor,
+                        discount_factor = discount_factor,
                         **plan_kwargs
                     )
 
@@ -3972,16 +4088,7 @@ class Agent(Module):
                     while mask.ndim < real.ndim:
                         mask = mask.unsqueeze(-1)
 
-                    if (
-                        not is_tensor(final) and
-                        isinstance(final, Iterable) and
-                        any(f is None for f in final)
-                    ):
-                        final = stack([torch.as_tensor(default(f, real[0]), dtype = real.dtype, device = real.device) for f in final])
-                    else:
-                        final = torch.as_tensor(final, dtype = real.dtype, device = real.device)
-
-                    return torch.where(mask, final, real)
+                    return torch.where(mask, torch.as_tensor(final, dtype = real.dtype, device = real.device), real)
 
                 next_state = tree_map(restore_final_obs, next_state, info['final_observation'])
 
@@ -4099,7 +4206,14 @@ class Agent(Module):
 
             # get next values
 
-            next_values = self.value_network.forward_ema(ema_state_tokens, ema_state_latents, squeeze_out = True)
+            next_values = self.value_network.forward_ema(
+                ema_state_tokens,
+                ema_state_latents,
+                discount = discount_factor,
+                transition_risk = transition_risk_factor,
+                value_risk = value_risk_factor,
+                squeeze_out = True
+            )
 
         all_ema_state_latents = None
         has_diayn = self.use_diayn and diversity_skill_loss_weight > 0.
@@ -4136,9 +4250,9 @@ class Agent(Module):
 
         # returns
 
-        returns = calc_returns(rewards, terminateds, next_values, self.discount_factor)
+        returns = calc_returns(rewards, terminateds, next_values, discount_factor)
 
-        batch_discount = cast_tensor(self.value_network.discount_factor).to(self.device).expand(batch)
+        batch_discount = cast_tensor(discount_factor).to(self.device).expand(batch)
         returns = (batch_discount, returns)
 
         # actor log prob for ppo
@@ -4159,7 +4273,7 @@ class Agent(Module):
             returns = returns,
             state_latents = all_ema_state_latents,
             skill_ids = skill_ids_tensor,
-            discount_factor = self.discount_factor,
+            discount_factor = discount_factor,
             transition_risk_factor = transition_risk_factor,
             value_risk_factor = value_risk_factor,
             base_reward = base_reward,
@@ -4182,6 +4296,9 @@ class Agent(Module):
         returns = None,
         rewards = None,
         dones = None,
+        discounts = None,
+        discount_factor = None,
+        n_step: int | None = None,
         behavior_clone: bool | str | tuple[str, ...] | list[str] = True,
         behavior_clone_weight: Tensor | None = None, # Float['batch'] - per-trajectory weight on the behavior-clone loss, generalizing a mask (0./1. weights recover masking); when given, the actor loss is returned per-batch (b,) and excluded from the total loss, so the caller owns the weighted reduction
         return_loss = True,
@@ -4391,6 +4508,7 @@ class Agent(Module):
             action_cond = action_cond,
             ema_encoded_state = ema_encoded_state,
             to_state_latent = self.to_state_latent,
+            mask = mask,
             valid_target_mask = valid_target_mask,
             masked_loss_average_mode = masked_loss_average_mode,
             reg = self.reg,
@@ -4441,6 +4559,18 @@ class Agent(Module):
             valid_action_mask = mask[:, :raw_action_loss.shape[1]] if exists(mask) else None
             action_recon_loss = masked_mean(raw_action_loss, valid_action_mask, average_mode = masked_loss_average_mode)
 
+        # resolve discount conditioning (supports scalar, per-batch / per-step tensor, or (min, max) UVFA range)
+
+        tuple_discounts, returns_tensor = returns if isinstance(returns, (tuple, list)) else (None, returns)
+        has_custom_discounts = exists(discounts) or exists(discount_factor) or (isinstance(self.discount_factor, tuple) and not exists(tuple_discounts))
+        discounts = resolve_discount(
+            default(discounts, discount_factor, tuple_discounts, self.discount_factor),
+            batch = batch,
+            device = device,
+            dtype = self.zero.dtype,
+            sample = True
+        )
+
         # behavior clone
         # with a per-batch weight, the weighted per-batch loss stays for the caller and the aggregate stays zero
 
@@ -4458,6 +4588,8 @@ class Agent(Module):
                 behavior_clone_actors = behavior_clone
             else:
                 behavior_clone_actors = list(self.actors.keys())
+
+            actor_discounts = cap_at_seq_len(discounts, bc_seq_len) if (is_tensor(discounts) and discounts.ndim == 2) else discounts
 
             for name, actor in self.actors.items():
                 if name not in behavior_clone_actors:
@@ -4486,6 +4618,7 @@ class Agent(Module):
                     action_tokens = tree_map_detach(action_tokens),
                     sensory_layer_hiddens = actor_sensory_hiddens,
                     world_model_hiddens = tree_map_detach(world_model_hiddens) if exists(world_model_hiddens) else None,
+                    discount = actor_discounts,
                     memories = model_memories[name] if exists(model_memories) and name in model_memories else None,
                     return_memories = return_memories
                 )
@@ -4506,14 +4639,57 @@ class Agent(Module):
 
         value_loss = self.zero
 
-        discounts = None
-        returns_tensor = None
+        if exists(rewards) and (has_custom_discounts or (not exists(returns_tensor) and exists(n_step))):
+            with torch.no_grad():
+                r_len = rewards.shape[1]
+                target_state_latents_full = agent_outputs['target_state_latents_full']
+                ema_val_all = self.value_network.forward_ema(
+                    ema_encoded_state,
+                    target_state_latents_full,
+                    discounts
+                )
+                ema_val_mean, _ = self.value_network.mean_and_uncertainty(ema_val_all)
 
-        if exists(returns):
-            if isinstance(returns, tuple):
-                discounts, returns_tensor = returns
-            else:
-                returns_tensor = returns
+                state_valid_len = mask.long().sum(dim = -1) if exists(mask) else torch.full((batch,), state_len, device = device, dtype = torch.long)
+                last_state_idx = (state_valid_len - 1).clamp(min = 0, max = state_len - 1)
+                next_values = ema_val_mean.gather(1, last_state_idx[:, None]).squeeze(1)
+
+                dones_for_ret = dones[:, :r_len].bool() if exists(dones) else torch.zeros((batch, r_len), dtype = torch.bool, device = device)
+                r_mask = (mask[:, :r_len] if (action_len == state_len or r_len == state_len) else valid_target_mask[:, :r_len]) if exists(mask) else None
+
+                returns_tensor = calc_returns(
+                    rewards[:, :r_len],
+                    dones_for_ret,
+                    next_values,
+                    default(discounts, 0.99),
+                    mask = r_mask
+                )
+
+        if exists(n_step) and exists(returns_tensor):
+            with torch.no_grad():
+                seq_len = returns_tensor.shape[1]
+                target_state_latents_full = agent_outputs['target_state_latents_full']
+                disc_seq = cap_at_seq_len(discounts, seq_len) if (is_tensor(discounts) and discounts.ndim == 2) else discounts
+
+                ema_values = self.value_network.forward_ema(
+                    cap_at_seq_len(ema_encoded_state, seq_len),
+                    cap_at_seq_len(target_state_latents_full, seq_len),
+                    disc_seq
+                )
+                if returns_tensor.ndim == 2:
+                    ema_values, _ = self.value_network.mean_and_uncertainty(ema_values)
+
+                val_mask = (mask[:, :seq_len] if (action_len == state_len or seq_len == state_len) else valid_target_mask[:, :seq_len]) if exists(mask) else None
+                valid_len = val_mask.long().sum(dim = -1, keepdim = True) if exists(val_mask) else None
+
+                returns_tensor = n_step_td_target(
+                    returns_tensor,
+                    ema_values,
+                    discounts = disc_seq,
+                    n_step = n_step,
+                    valid_len = valid_len,
+                    dones = dones
+                )
 
         val_state_tokens, _ = self.get_value_state_tokens(states, base_state_tokens = state_tokens)
         val_state_latents = self.frac_gradient(self.to_state_latent(val_state_tokens))
@@ -4521,14 +4697,28 @@ class Agent(Module):
 
         if exists(returns_tensor):
             seq_len = returns_tensor.shape[1]
+            val_loss_mask = (mask[:, :seq_len] if (action_len == state_len or seq_len == state_len) else valid_target_mask[:, :seq_len]) if exists(mask) else None
 
             value_loss = self.value_network.compute_loss(
                 cap_at_seq_len(pred_values, seq_len),
                 returns_tensor,
                 cond = cap_at_seq_len((val_state_tokens, val_state_latents), seq_len),
-                mask = cap_at_seq_len(mask, seq_len),
+                mask = val_loss_mask,
                 average_mode = masked_loss_average_mode
             )
+
+            plan_cond = (ema_encoded_state.detach(), state_latents_full.detach())
+            plan_pred_values = self.value_network(*plan_cond, discounts)
+
+            plan_value_loss = self.value_network.compute_loss(
+                cap_at_seq_len(plan_pred_values, seq_len),
+                returns_tensor,
+                cond = cap_at_seq_len(plan_cond, seq_len),
+                mask = val_loss_mask,
+                average_mode = masked_loss_average_mode
+            )
+
+            value_loss = (value_loss + plan_value_loss) * 0.5
 
         # action latent uniform loss
 
@@ -4587,13 +4777,17 @@ class Agent(Module):
 
         if exists(self.quasimetric_distance_network) and ema_encoded_state.shape[1] > 1:
             seq_len = ema_encoded_state.shape[1]
+            valid_lens = lens.clamp(min = 2, max = seq_len)[:, None] if exists(lens) else torch.full((batch, 1), seq_len, device = device, dtype = torch.long)
+            num_pairs = 8
 
-            t1 = torch.randint(0, seq_len, (batch,), device = device)
-            t2 = torch.randint(0, seq_len, (batch,), device = device)
+            t1 = (torch.rand((batch, num_pairs), device = device) * valid_lens).long()
+            t2 = (torch.rand((batch, num_pairs), device = device) * valid_lens).long()
+            t2[:, 0] = t1[:, 0]
+            t2[:, -1] = valid_lens[:, 0] - 1
 
             # enforces state (left) to goal (right) encoder asymmetry
-            state_left = batched_index_select(state_latents_full, t1, dim = 1)
-            state_right = batched_index_select(ema_encoded_state, t2, dim = 1)
+            state_left = batched_index_select(state_latents_full.detach(), t1, dim = 1)
+            state_right = batched_index_select(ema_encoded_state.detach(), t2, dim = 1)
 
             quasimetric_distance_loss = self.quasimetric_distance_network.time_contrastive_loss(
                 state_left,

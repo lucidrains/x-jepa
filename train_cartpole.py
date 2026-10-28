@@ -47,38 +47,49 @@ import wandb
 from torch_einops_utils import tree_map_tensor_to_device
 from x_mlps_pytorch import MLP
 
-from x_jepa import Agent
+from x_jepa import Agent, rollout_return
 from x_jepa.x_jepa import Transformer
 from x_jepa.log_depth_recurrent import LogDepthRecurrentModel
-from x_jepa.utils import store_experience_in_replay_buffer, divisible_by
+from x_jepa.utils import default, store_experience_in_replay_buffer, divisible_by
 
 from env_cartpole import BatchedEnv
 
-# fitness - reach and stay at the upright state (goal = all zeros)
-# distance between predicted next-step encoded states and the encoded goal, both in the same
-# ema-encoder space, so the fitness is well calibrated for CEM
+# fitness - reach and stay at the upright state (goal = all zeros), optionally augmented or
+# replaced by n-step rollout return + discounted n-step bootstrap value V(s_{t+n})
 
-def make_fitness():
-    def fitness_fn(pred_next_encoded_states, encoded_goal):
-        dist_cost = F.smooth_l1_loss(
-            pred_next_encoded_states,
-            encoded_goal.expand_as(pred_next_encoded_states),
-            reduction = 'none'
-        ).sum(dim = -1)
+def make_fitness(
+    gamma = 0.99,
+    use_bootstrap_value = True,
+    bootstrap_value_weight = 0.1
+):
+    def goal_fitness_fn(pred_next_encoded_states, encoded_goal):
+        dist_cost = F.smooth_l1_loss(pred_next_encoded_states, encoded_goal.expand_as(pred_next_encoded_states), reduction = 'none')
+        return -dist_cost.sum(dim = (-2, -1))
 
-        return -dist_cost.sum(dim = -1)
+    if not use_bootstrap_value:
+        return goal_fitness_fn
+
+    def fitness_fn(pred_next_encoded_states, encoded_goal, pred_rewards, pred_discounts, pred_values, discount_factor = None):
+        ret = rollout_return(
+            pred_rewards = pred_rewards,
+            pred_discounts = pred_discounts,
+            pred_values = pred_values,
+            discount_factor = default(discount_factor, gamma)
+        )
+        return goal_fitness_fn(pred_next_encoded_states, encoded_goal) + bootstrap_value_weight * ret
 
     return fitness_fn
 
 # training helpers
 
-def train_wm_epoch(wm, buffer, optimizer, device, batch_size, epochs_per_train, grad_accum_steps, train_window = 64, batches_per_epoch = 6, train_reward_heads = True):
+def train_wm_epoch(wm, buffer, optimizer, device, batch_size, epochs_per_train, grad_accum_steps, train_window = 64, batches_per_epoch = 6, train_reward_heads = True, n_step = None):
     # fixed-length window sampling - keeps training cost bounded regardless of episode length
 
     dl = buffer.dataloader(
         batch_size = batch_size,
         shuffle = True,
         n_steps = train_window,
+        return_indices = True,
         sequence_fields = ('states', 'actions', 'returns', 'rewards', 'dones'),
         fieldname_map = {'seq_states': 'states', 'seq_actions': 'actions', 'seq_returns': 'returns', 'seq_rewards': 'rewards', 'seq_dones': 'dones'}
     )
@@ -101,7 +112,10 @@ def train_wm_epoch(wm, buffer, optimizer, device, batch_size, epochs_per_train, 
         states, actions, returns = batch['states'], batch['actions'], batch['returns']
         lens = batch.get('n_step_lens', batch.get('episode_len', batch.get('episode_lens')))
 
-        wm_kwargs = dict(lens = lens, returns = returns, behavior_clone = True)
+        if '_indices' in batch and 'episode_len' in batch:
+            lens = torch.minimum(lens, (batch['episode_len'] - batch['_indices'][:, 1]).clamp(min = 0))
+
+        wm_kwargs = dict(lens = lens, returns = returns, n_step = n_step, behavior_clone = True)
 
         if train_reward_heads:
             wm_kwargs.update(rewards = batch['rewards'], dones = batch['dones'])
@@ -161,6 +175,9 @@ def main(
     transition_lookahead = 3, # mtp lookahead for the prefix transition - each prefix predicts the next `lookahead` latents
     plan_lookahead = None, # plan-time lookahead (prefix transition) - steps predicted per re-anchored pass; fall back to fewer and redo the prediction until the horizon is covered; defaults to the full horizon in one parallel pass
     train_reward_heads = True, # train the reward and continuation heads (requires rewards/dones in the buffer); False exercises the heads-free training path
+    n_step = 8, # n-step TD bootstrap horizon for value head training (None uses full rollout returns)
+    use_bootstrap_value = True, # incorporate discounted n-step bootstrap value V(s_{t+n}) during CEM planning
+    bootstrap_value_weight = 0.1,
     num_orthogonal_subspaces = None,
     orthogonal_loss_weight = 0.1, # JEPA-Anything projector-Gram weight (sum-reduction loss)
     orthogonal_factor_activity_weight = 0.05,
@@ -175,6 +192,7 @@ def main(
     # fire passes cli booleans as strings - coerce so `--use_wandb false` actually disables logging
 
     use_wandb = (str(use_wandb).lower() == 'true') if isinstance(use_wandb, str) else bool(use_wandb)
+    use_bootstrap_value = (str(use_bootstrap_value).lower() == 'true') if isinstance(use_bootstrap_value, str) else bool(use_bootstrap_value)
     use_dynamic_rollout_loss_weighting = (str(use_dynamic_rollout_loss_weighting).lower() == 'true') if isinstance(use_dynamic_rollout_loss_weighting, str) else bool(use_dynamic_rollout_loss_weighting)
 
     if use_wandb:
@@ -256,7 +274,11 @@ def main(
             env = env,
             max_steps = max_timesteps,
             goal_state = None if is_random_ep else torch.zeros((1, state_dim), device = device),
-            fitness_fn = None if is_random_ep else make_fitness(),
+            fitness_fn = None if is_random_ep else make_fitness(
+                gamma = gamma,
+                use_bootstrap_value = use_bootstrap_value and train_reward_heads,
+                bootstrap_value_weight = bootstrap_value_weight
+            ),
             action_fn = (lambda env: env.action_space.sample()) if is_random_ep else None,
             horizon = cem_horizon,
             pop_size = cem_num_samples,
@@ -278,7 +300,7 @@ def main(
         )
 
         if divisible_by(episode, train_every_eps):
-            wm_loss_val, wm_reward_loss_val, wm_discount_loss_val, wm_ortho_loss_val = train_wm_epoch(wm, buffer, optimizer, device, batch_size, epochs_per_train, grad_accum_steps, train_window = train_window, batches_per_epoch = batches_per_epoch, train_reward_heads = train_reward_heads)
+            wm_loss_val, wm_reward_loss_val, wm_discount_loss_val, wm_ortho_loss_val = train_wm_epoch(wm, buffer, optimizer, device, batch_size, epochs_per_train, grad_accum_steps, train_window = train_window, batches_per_epoch = batches_per_epoch, train_reward_heads = train_reward_heads, n_step = n_step if train_reward_heads else None)
 
         # metrics and logging
 

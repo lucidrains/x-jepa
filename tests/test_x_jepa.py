@@ -3387,3 +3387,566 @@ def test_world_model_orthogonal_subspaces(transition_type, use_reg):
         fitness_fn = lambda pred_state_latents: reduce(pred_state_latents, 'b p ... -> b p', 'sum')
     )
     assert planned.shape == (2, 2, 4)
+
+def test_state_value_uvfa_discount_conditioning_e2e():
+    from x_jepa import StateValue, StateSpaceHeads, state_space_fitness, n_step_returns
+
+    torch.manual_seed(0)
+
+    dim = 32
+    state_dim = 1
+    dim_action = 1
+
+    def make_agent_and_heads():
+        agent = Agent(
+            model = Transformer(dim = dim, depth = 1, causal = True),
+            dim_action = dim_action,
+            state_encoder = MLP(state_dim, 64, dim),
+            action_encoder = MLP(dim_action, 64, dim),
+            transition_action_space = 'raw',
+            continuous_actions = True,
+            transition_horizon = 1,
+            state_transition_depth = 1,
+            discount_factor = 0.99
+        )
+        heads = StateSpaceHeads(dim, state_dim, hidden = 64, value_scale = 1.)
+        return agent, heads
+
+    # 1. assertions when StateValue is not trained with universal value function (UVFA) discount conditioning
+
+    agent_untrained, heads_untrained = make_agent_and_heads()
+    dummy_states = torch.zeros(2, 4, state_dim)
+    dummy_actions = torch.zeros(2, 3, dim_action)
+    dummy_returns = torch.ones(2, 4)
+
+    fitness_untrained = state_space_fitness(
+        heads_untrained.decode,
+        heads_untrained.state_value,
+        goal = torch.zeros(state_dim),
+        value_scale = 1.,
+        goal_weight = 0.
+    )
+
+    # calling StateValue / state_value or planning with discount_factor before training must assert out
+
+    with pytest.raises(AssertionError, match = 'not trained with discount factor conditioning'):
+        heads_untrained.state_value(dummy_states, discount = 0.95)
+
+    with pytest.raises(AssertionError, match = 'not trained with discount factor conditioning'):
+        agent_untrained.plan(dummy_states[:, :1], dummy_actions[:, :0], horizon = 2, pop_size = 4, generations = 1, fitness_fn = fitness_untrained, discount_factor = 0.95)
+
+    # training WITHOUT discount factor conditioning still asserts out when any discount_factor is used at eval / plan time
+
+    _, _, out_u = agent_untrained(dummy_states, dummy_actions, return_outputs = True)
+    loss_u, _ = heads_untrained.loss(out_u['state_latents_full'], dummy_states, dummy_actions, returns = dummy_returns)
+    loss_u.backward()
+
+    assert not heads_untrained.value.has_trained_with_discount
+    assert not heads_untrained.value.is_uvfa_trained
+    assert heads_untrained.state_value(dummy_states).shape == (2, 4)
+
+    for g in (0.2, 0.5, 0.95, 0.99):
+        with pytest.raises(AssertionError, match = 'not trained with discount factor conditioning'):
+            heads_untrained.state_value(dummy_states, discount = g)
+
+    with pytest.raises(AssertionError, match = 'not trained with discount factor conditioning'):
+        agent_untrained.plan(dummy_states[:, :1], dummy_actions[:, :0], horizon = 2, pop_size = 4, generations = 1, fitness_fn = fitness_untrained, discount_factor = 0.95)
+
+    # training with only a SINGLE fixed discount factor (not UVFA) only allows that single discount and rejects any other discount factor
+
+    agent_single, heads_single = make_agent_and_heads()
+    fitness_single = state_space_fitness(
+        heads_single.decode,
+        heads_single.state_value,
+        goal = torch.zeros(state_dim),
+        value_scale = 1.,
+        goal_weight = 0.
+    )
+
+    for _ in range(3):
+        loss_s, _ = heads_single.loss(out_u['state_latents_full'].detach(), dummy_states, dummy_actions, returns = dummy_returns, discounts = 0.99)
+        loss_s.backward()
+
+    assert heads_single.value.has_trained_with_discount
+    assert not heads_single.value.is_uvfa_trained
+    assert heads_single.state_value(dummy_states, discount = 0.99).shape == (2, 4)
+
+    for other_discount in (0.0, 0.2, 0.5, 0.85, 0.95, torch.tensor([0.5, 0.99])):
+        with pytest.raises(AssertionError, match = 'not UVFA'):
+            heads_single.state_value(dummy_states, discount = other_discount)
+
+        with pytest.raises(AssertionError, match = 'not UVFA'):
+            agent_single.plan(dummy_states[:, :1], dummy_actions[:, :0], horizon = 2, pop_size = 4, generations = 1, fitness_fn = fitness_single, discount_factor = other_discount)
+
+    with pytest.raises(AssertionError, match = 'requires a discount factor'):
+        heads_single.state_value(dummy_states)
+
+    # 2. n_step_returns helper and StateSpaceHeads n_step integration
+
+    lens = torch.tensor([4, 3])
+    gammas_test = torch.tensor([0.9, 0.95])
+    td_ret = heads_single.n_step_returns(dummy_states, dummy_returns, discounts = gammas_test, lens = lens, n_step = 2)
+    assert td_ret.shape == (2, 4)
+    assert float(td_ret[1, 3].item()) == 0.
+
+    loss_nstep, _ = heads_single.loss(
+        out_u['state_latents_full'].detach(),
+        dummy_states,
+        dummy_actions,
+        returns = (gammas_test, dummy_returns),
+        n_step = 2,
+        lens = lens
+    )
+    loss_nstep.backward()
+    heads_single.update()
+
+    # 3. end-to-end UVFA training: once trained with universal VF, ANY discount factor in [0, 1] can be used
+    # 1D env: left (s < 0) gives an immediate reward (0.6), right (s > 0) gives a larger
+    # 6-step delayed reward (2.0 * gamma^6). Myopic gamma = 0.2 prefers left; far-sighted gamma = 0.99 prefers right.
+
+    def true_return(s, gamma):
+        s_val = s.squeeze(-1)
+        left_val = 0.6 * torch.sigmoid(-5.0 * s_val)
+        right_val = 2.0 * (gamma ** 6.0) * torch.sigmoid(5.0 * s_val)
+        return left_val + right_val
+
+    agent, heads = make_agent_and_heads()
+    opt = torch.optim.Adam(list(agent.parameters()) + list(heads.parameters()), lr = 3e-3)
+
+    batch_size, seq_len = 32, 5
+    for _ in range(250):
+        s0 = torch.rand(batch_size, 1, 1) * 1.6 - 0.8
+        acts = torch.rand(batch_size, seq_len - 1, 1) * 2. - 1.
+        traj = [s0]
+        for t in range(seq_len - 1):
+            traj.append((traj[-1] + 0.4 * acts[:, t:t + 1]).clamp(-1., 1.))
+        states_b = torch.cat(traj, dim = 1)
+
+        gammas = torch.where(torch.rand(batch_size) < 0.5, torch.full((batch_size,), 0.2), torch.full((batch_size,), 0.99))
+        rets_b = true_return(states_b, gammas[:, None])
+        rews_b = torch.zeros(batch_size, seq_len)
+        dones_b = torch.zeros(batch_size, seq_len, dtype = torch.bool)
+
+        wm_loss, _, outputs = agent(states_b, acts, rewards = rews_b, dones = dones_b, behavior_clone = False, return_outputs = True)
+        aux_loss, _ = heads.loss(
+            outputs['state_latents_full'],
+            states_b,
+            acts,
+            returns = (gammas, rets_b),
+            rewards = rews_b,
+            dones = dones_b,
+            world_model = agent.get_world_model(0)
+        )
+        (wm_loss + aux_loss).backward()
+        opt.step()
+        opt.zero_grad()
+        agent.update()
+        heads.update()
+
+    assert heads.value.has_trained_with_discount
+    assert heads.value.is_uvfa_trained
+
+    # once UVFA-trained, ANY discount factor in [0, 1] (scalars, unseen interpolated values, per-batch tensors, per-step tensors) works
+
+    for arbitrary_discount in (0.0, 0.12, 0.2, 0.37, 0.5, 0.68, 0.85, 0.93, 0.99, 1.0):
+        pred_v = heads.state_value(dummy_states, discount = arbitrary_discount)
+        assert pred_v.shape == (2, 4)
+
+    assert heads.state_value(dummy_states, discount = torch.tensor([0.15, 0.82])).shape == (2, 4)
+    assert heads.state_value(dummy_states, discount = torch.linspace(0.1, 0.95, 8).reshape(2, 4)).shape == (2, 4)
+
+    with pytest.raises(AssertionError, match = 'requires a discount factor'):
+        heads.state_value(dummy_states)
+
+    for invalid_discount in (-0.1, 1.1):
+        with pytest.raises(AssertionError, match = 'must be in \\[0, 1\\]'):
+            heads.state_value(dummy_states, discount = invalid_discount)
+
+    # verify UVFA value predictions flip preference between myopic (0.2) and far-sighted (0.99)
+
+    probe_states = torch.tensor([[[-0.6]], [[0.6]]]) # left vs right
+    v_myopic = heads.state_value(probe_states, discount = 0.2).squeeze(-1)
+    v_farsighted = heads.state_value(probe_states, discount = 0.99).squeeze(-1)
+
+    assert v_myopic[0] > v_myopic[1], f'myopic gamma=0.2 should prefer left state: {v_myopic.tolist()}'
+    assert v_farsighted[1] > v_farsighted[0], f'far-sighted gamma=0.99 should prefer right state: {v_farsighted.tolist()}'
+
+    # verify e2e rollout with interact_with_environment accepts any discount_factor and flips behavior accordingly
+
+    class CorridorEnv:
+        def __init__(self, batch = 4):
+            self.batch = batch
+            self.is_vector_env = True
+            self.num_envs = batch
+            self.state = None
+
+        def reset(self):
+            self.state = torch.zeros(self.batch, 1)
+            return self.state.clone(), {}
+
+        def step(self, action):
+            action = torch.as_tensor(action, dtype = torch.float32).reshape(self.batch, 1).clamp(-1., 1.)
+            self.state = (self.state + 0.4 * action).clamp(-1., 1.)
+            reward = torch.zeros(self.batch)
+            terminated = torch.zeros(self.batch, dtype = torch.bool)
+            truncated = torch.zeros(self.batch, dtype = torch.bool)
+            return self.state.clone(), reward, terminated, truncated, {}
+
+    fitness = state_space_fitness(
+        heads.decode,
+        heads.state_value,
+        goal = torch.zeros(state_dim),
+        value_scale = 1.,
+        value_weight = 1.,
+        value_best_weight = 0.,
+        goal_weight = 0.
+    )
+
+    # any unseen discount factor in [0, 1] (including per-env tensor) works during planning
+
+    env_mixed = CorridorEnv(batch = 4)
+    exp_mixed = agent.interact_with_environment(
+        env_mixed,
+        max_steps = 2,
+        horizon = 1,
+        plan_lookahead = 1,
+        pop_size = 16,
+        generations = 1,
+        fitness_fn = fitness,
+        discount_factor = torch.tensor([0.15, 0.45, 0.75, 0.95]),
+        use_ema_for_planning = False
+    )
+    assert exp_mixed.states.shape[0] == 4
+
+    env_myopic = CorridorEnv(batch = 4)
+    exp_myopic = agent.interact_with_environment(
+        env_myopic,
+        max_steps = 3,
+        horizon = 1,
+        plan_lookahead = 1,
+        pop_size = 32,
+        generations = 2,
+        fitness_fn = fitness,
+        discount_factor = 0.2,
+        use_ema_for_planning = False
+    )
+
+    env_farsighted = CorridorEnv(batch = 4)
+    exp_farsighted = agent.interact_with_environment(
+        env_farsighted,
+        max_steps = 3,
+        horizon = 1,
+        plan_lookahead = 1,
+        pop_size = 32,
+        generations = 2,
+        fitness_fn = fitness,
+        discount_factor = 0.99,
+        use_ema_for_planning = False
+    )
+
+    assert exp_myopic.discount_factor == 0.2
+    assert exp_farsighted.discount_factor == 0.99
+    assert env_myopic.state.mean().item() < -0.1, f'myopic rollout should move left (< -0.1), got {env_myopic.state.mean().item():.3f}'
+    assert env_farsighted.state.mean().item() > 0.1, f'far-sighted rollout should move right (> 0.1), got {env_farsighted.state.mean().item():.3f}'
+
+def test_rollout_return_discounted_rewards_and_terminal_bootstrap():
+    from x_jepa import rollout_return, make_rollout_fitness
+    from train_cartpole import make_fitness as make_cartpole_fitness
+
+    b, p, h = 2, 3, 5
+    gamma = 0.9
+
+    rewards = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]).view(1, 1, h).expand(b, p, h).clone()
+    values = torch.full((b, p, h), 20.0)
+    discounts_alive = torch.ones((b, p, h))
+
+    # 1. no termination: sum_{k=0}^{H-1} gamma^k r_k + gamma^H V(s_H)
+
+    ret_alive = rollout_return(rewards, discounts_alive, values, discount_factor = gamma)
+    expected_alive = sum((gamma ** k) * float(k + 1) for k in range(h)) + (gamma ** h) * 20.0
+    assert_close(ret_alive, torch.full((b, p), expected_alive), atol = 1e-5, rtol = 1e-5)
+
+    # 2. termination at step 2 (c_2 = 0): step 2's own transition reward r_2 IS received,
+    #    while steps 3, 4 and the final bootstrap V(s_H) are gated out to 0
+
+    discounts_term2 = torch.ones((b, p, h))
+    discounts_term2[:, :, 2] = 0.0
+    ret_term2 = rollout_return(rewards, discounts_term2, values, discount_factor = gamma)
+    expected_term2 = 1.0 + gamma * 2.0 + (gamma ** 2) * 3.0
+    assert_close(ret_term2, torch.full((b, p), expected_term2), atol = 1e-5, rtol = 1e-5)
+
+    # 3. termination on final step H-1: all rollout rewards 0..H-1 count, bootstrap V(s_H) does not
+
+    discounts_term_last = torch.ones((b, p, h))
+    discounts_term_last[:, :, -1] = 0.0
+    ret_term_last = rollout_return(rewards, discounts_term_last, values, discount_factor = gamma)
+    expected_term_last = sum((gamma ** k) * float(k + 1) for k in range(h))
+    assert_close(ret_term_last, torch.full((b, p), expected_term_last), atol = 1e-5, rtol = 1e-5)
+
+    # 4. soft continuation probabilities c_k in (0, 1)
+
+    soft_c = torch.tensor([0.95, 0.8, 0.5, 0.2, 0.9]).view(1, 1, h).expand(b, p, h)
+    ret_soft = rollout_return(rewards, soft_c, values, discount_factor = gamma)
+
+    alive_prod = 1.0
+    expected_soft = 0.0
+    for k in range(h):
+        expected_soft += (gamma ** k) * alive_prod * float(k + 1)
+        alive_prod *= float(soft_c[0, 0, k].item())
+    expected_soft += (gamma ** h) * alive_prod * 20.0
+    assert_close(ret_soft, torch.full((b, p), expected_soft), atol = 1e-5, rtol = 1e-5)
+
+    # 5. per-batch custom discount factor tensor
+
+    batch_gammas = torch.tensor([0.5, 0.95])
+    ret_batch_gamma = rollout_return(rewards, discounts_alive, values, discount_factor = batch_gammas)
+    for b_idx, g_val in enumerate(batch_gammas.tolist()):
+        exp_b = sum((g_val ** k) * float(k + 1) for k in range(h)) + (g_val ** h) * 20.0
+        assert_close(ret_batch_gamma[b_idx], torch.full((p,), exp_b), atol = 1e-5, rtol = 1e-5)
+
+    # 6. ensemble 4D pred_values with value_risk_factor
+
+    ens_values = torch.stack([torch.full((b, p, h), 10.0), torch.full((b, p, h), 30.0)], dim = -1)
+    ret_risk = rollout_return(rewards, discounts_alive, ens_values, discount_factor = gamma, value_risk_factor = -0.5)
+    std_val = ens_values.std(dim = -1)[0, 0, -1].item()
+    expected_risk = sum((gamma ** k) * float(k + 1) for k in range(h)) + (gamma ** h) * (20.0 - 0.5 * std_val)
+    assert_close(ret_risk, torch.full((b, p), expected_risk), atol = 1e-5, rtol = 1e-5)
+
+    # 7. cartpole make_fitness accounts for rollout rewards even when final step terminates
+
+    cp_fitness = make_cartpole_fitness(gamma = gamma, use_bootstrap_value = True, bootstrap_value_weight = 1.0)
+    pred_enc = torch.zeros(b, p, h, 4)
+    enc_goal = torch.zeros(b, 1, 1, 4)
+    # trajectory 0 dies on step 0 (c_0 = 0), trajectory 1 survives until step H-1 then dies (c_{H-1} = 0)
+    disc_compare = torch.ones(b, 2, h)
+    disc_compare[:, 0, 0] = 0.0
+    disc_compare[:, 1, -1] = 0.0
+    rew_compare = torch.ones(b, 2, h)
+    val_compare = torch.full((b, 2, h), 50.0)
+    cp_scores = cp_fitness(pred_enc[:, :2], enc_goal, rew_compare, disc_compare, val_compare)
+    assert (cp_scores[:, 1] > cp_scores[:, 0]).all(), 'surviving H-1 steps before dying must score higher than dying on step 0'
+
+    # 8. Agent.plan default rollout fitness and make_rollout_fitness
+
+    agent = Agent(
+        state_encoder = nn.Linear(4, 16),
+        action_encoder = nn.Linear(2, 16),
+        model = Transformer(dim = 16, depth = 1, causal = True),
+        dim_action = 2,
+        continuous_actions = True,
+        transition_action_space = 'raw',
+        transition_horizon = 4
+    )
+    planned = agent.plan(
+        states = torch.randn(2, 1, 4),
+        actions = torch.empty(2, 0, 2),
+        horizon = 3,
+        pop_size = 8,
+        generations = 2,
+        discount_factor = torch.tensor([0.5, 0.95])
+    )
+    assert planned.shape == (2, 3, 2)
+
+    planned_custom = agent.plan(
+        states = torch.randn(2, 1, 4),
+        actions = torch.empty(2, 0, 2),
+        horizon = 3,
+        pop_size = 8,
+        generations = 2,
+        fitness_fn = make_rollout_fitness(discount_factor = 0.9)
+    )
+    assert planned_custom.shape == (2, 3, 2)
+
+def test_terminal_transition_discount_and_reward_head_training():
+    torch.manual_seed(0)
+    dim = 32
+    agent = Agent(
+        state_encoder = MLP(2, 32, dim),
+        action_encoder = MLP(1, 32, dim),
+        model = Transformer(dim = dim, depth = 1, causal = True),
+        dim_action = 1,
+        continuous_actions = True,
+        transition_action_space = 'raw',
+        transition_horizon = 4
+    )
+
+    # episode of length L = 3 in a buffer of length 4 (index 2 is the terminal transition, index 3 is padding)
+    batch, seq_len = 8, 4
+    lens = torch.full((batch,), 3, dtype = torch.long)
+    states = torch.zeros(batch, seq_len, 2)
+    states[:, 0, 0] = 0.0
+    states[:, 1, 0] = 0.5
+    states[:, 2, 0] = 1.0 # terminal state before final action
+    actions = torch.ones(batch, seq_len, 1) * 0.5
+
+    rewards = torch.zeros(batch, seq_len)
+    rewards[:, 0] = 1.0
+    rewards[:, 1] = 1.0
+    rewards[:, 2] = -5.0  # terminal penalty at step L - 1 = 2
+    rewards[:, 3] = 999.0 # padded step (must be masked out)
+
+    dones = torch.zeros(batch, seq_len, dtype = torch.bool)
+    dones[:, 2] = True    # episode terminates at step L - 1 = 2
+
+    opt = torch.optim.Adam(agent.parameters(), lr = 3e-3)
+    for _ in range(120):
+        loss, lb = agent(states, actions, lens = lens, rewards = rewards, dones = dones, behavior_clone = False)
+        assert lb.discount_pred.item() > 0.
+        assert lb.reward_pred.item() > 0.
+        loss.backward()
+        opt.step()
+        opt.zero_grad()
+        agent.update()
+
+    agent.eval()
+    with torch.no_grad():
+        _, _, outputs = agent(states, actions, lens = lens, rewards = rewards, dones = dones, behavior_clone = False, return_outputs = True)
+        state_latents = outputs['state_latents_full'][:, :3]
+        wm = agent.get_world_model(0)
+        pred_cont = wm.to_discount_pred((state_latents, actions[:, :3])).squeeze(-1).sigmoid()
+        pred_rew = wm.to_reward_pred((state_latents, actions[:, :3])).squeeze(-1)
+
+    assert pred_cont[:, 0].mean().item() > 0.8, f'step 0 continuation should be > 0.8, got {pred_cont[:, 0].mean().item():.3f}'
+    assert pred_cont[:, 1].mean().item() > 0.8, f'step 1 continuation should be > 0.8, got {pred_cont[:, 1].mean().item():.3f}'
+    assert pred_cont[:, 2].mean().item() < 0.2, f'terminal step L-1 continuation should be < 0.2, got {pred_cont[:, 2].mean().item():.3f}'
+    assert (pred_rew[:, 2] - (-5.0)).abs().mean().item() < 0.5, f'terminal step L-1 reward should be near -5.0, got {pred_rew[:, 2].mean().item():.3f}'
+
+def test_n_step_bootstrapping_and_terminal_handling():
+    from x_jepa import n_step_returns
+
+    batch, seq_len = 2, 5
+    gamma = 0.9
+    states = torch.zeros(batch, seq_len, 2)
+
+    # Constant value function V(s) = 10.0 (intentionally LOWER than MC return 100.0 to verify no maximization bias)
+    value_fn = lambda s, discount = None: torch.full(s.shape[:2], 10.0, device = s.device, dtype = s.dtype)
+
+    rewards = torch.ones(batch, seq_len)
+    dones = torch.zeros(batch, seq_len, dtype = torch.bool)
+    dones[1, 1] = True # batch 1 terminates at step 1!
+
+    # MC returns: batch 0 has 100 everywhere; batch 1 has 1 + 0.9 * 1 = 1.9 at step 0, 1.0 at step 1
+    mc_returns = torch.full((batch, seq_len), 100.0)
+    mc_returns[1, 0] = 1.9
+    mc_returns[1, 1] = 1.0
+    mc_returns[1, 2:] = 50.0 # post-termination steps in buffer
+
+    td_ret = n_step_returns(
+        states,
+        returns = mc_returns,
+        value_fn = value_fn,
+        discounts = gamma,
+        n_step = 2,
+        rewards = rewards,
+        dones = dones
+    )
+
+    # Batch 0 (no dones): at t = 0,1,2 (where t + 2 <= 4), 2-step TD return is 1 + 0.9 * 1 + 0.9^2 * 10 = 10.0 (NOT max(10, 100) = 100!)
+    expected_b0_t0 = 1.0 + gamma * 1.0 + (gamma ** 2) * 10.0
+    assert_close(td_ret[0, :3], torch.full((3,), expected_b0_t0), atol = 1e-5, rtol = 1e-5)
+
+    # Batch 1 (terminates at step 1): at t = 0, n_step = 2 must NOT bootstrap V(s_2) = 10 across done at step 1!
+    # Return at t = 0 must be exactly r_0 + gamma * r_1 = 1.9, and at t = 1 must be r_1 = 1.0
+    assert_close(td_ret[1, 0], torch.tensor(1.9), atol = 1e-5, rtol = 1e-5)
+    assert_close(td_ret[1, 1], torch.tensor(1.0), atol = 1e-5, rtol = 1e-5)
+
+    # Telescoping path (when rewards is not passed, only returns + dones) gives the exact same result
+    mc_returns_consistent = torch.tensor([
+        [1.0 + gamma * 1.0 + (gamma ** 2) * 100.0, 1.0 + gamma * 100.0, 100.0, 100.0, 100.0],
+        [1.9, 1.0, 50.0, 50.0, 50.0]
+    ])
+    td_ret_tele = n_step_returns(
+        states,
+        returns = mc_returns_consistent,
+        value_fn = value_fn,
+        discounts = gamma,
+        n_step = 2,
+        dones = dones
+    )
+    assert_close(td_ret_tele[0, 0], torch.tensor(expected_b0_t0), atol = 1e-4, rtol = 1e-4)
+    assert_close(td_ret_tele[1, 0], torch.tensor(1.9), atol = 1e-5, rtol = 1e-5)
+    assert_close(td_ret_tele[1, 1], torch.tensor(1.0), atol = 1e-5, rtol = 1e-5)
+
+    # Empty lens (lens == 0 from post-episode window) produces all zeros
+    td_zero_len = n_step_returns(
+        states,
+        returns = mc_returns,
+        value_fn = value_fn,
+        discounts = gamma,
+        lens = torch.tensor([0, 2]),
+        n_step = 2,
+        rewards = rewards,
+        dones = dones
+    )
+    assert (td_zero_len[0] == 0.).all()
+
+@param('value_network_type', ('value', 'ensemble', 'distributional'))
+@param('transition_type', ('prefix', 'mlp'))
+@param('n_step', (None, 3))
+def test_agent_uvfa_custom_discount_factors_e2e(value_network_type, transition_type, n_step):
+    torch.manual_seed(0)
+    dim = 32
+
+    state_transition = MLP(dim + 1, *((dim * 2,) * 2), dim) if transition_type == 'mlp' else None
+
+    agent = Agent(
+        state_encoder = MLP(1, 64, dim),
+        action_encoder = MLP(1, 64, dim),
+        model = Transformer(dim = dim, depth = 1, causal = True),
+        state_transition = state_transition,
+        dim_action = 1,
+        continuous_actions = True,
+        transition_action_space = 'raw',
+        discount_factor = (0.1, 0.99),
+        add_reflexive_actor = True,
+        value_network_type = value_network_type,
+        num_value_heads = 3
+    )
+
+    # 6-step trajectory with reward = 1 per step and terminal step at index 5:
+    # average return across steps is ~1.09 for gamma = 0.1 vs ~3.26 for gamma = 0.95
+
+    batch_size, seq_len = 32, 6
+    states = torch.zeros(batch_size, seq_len, 1)
+    actions = torch.zeros(batch_size, seq_len, 1)
+    rewards = torch.ones(batch_size, seq_len)
+    dones = torch.zeros(batch_size, seq_len, dtype = torch.bool)
+    dones[:, -1] = True
+
+    opt = torch.optim.Adam(agent.parameters(), lr = 5e-3)
+    for step in range(80):
+        custom_g = None if (step % 2 == 0) else torch.where(torch.rand(batch_size) < 0.5, 0.1, 0.95)
+        loss, lb = agent(states, actions, rewards = rewards, dones = dones, discounts = custom_g, n_step = n_step)
+        assert lb.value.item() > 0.
+        loss.backward()
+        opt.step()
+        opt.zero_grad()
+        agent.update()
+
+    agent.eval()
+    probe_2d = torch.zeros(2, 1)
+    probe_3d = torch.zeros(2, 3, 1)
+
+    v_low = agent.predict_value(probe_2d, discount = 0.1)
+    v_high, std_high = agent.predict_value(probe_2d, discount = 0.95, return_uncertainty = True)
+    v_batch = agent.predict_value(probe_3d, discount = torch.tensor([0.1, 0.95]))
+
+    assert v_low.shape == (2,) and v_high.shape == (2,) and v_batch.shape == (2, 3)
+    if value_network_type != 'value':
+        assert exists(std_high) and std_high.shape == (2,)
+    assert v_high.mean().item() > v_low.mean().item() + 1.2
+    assert v_batch[1, 0].item() > v_batch[0, 0].item() + 1.2
+
+    # CEM planning (discounted rollout rewards + terminal-gated discounted bootstrap value)
+
+    for discount in (0.8, torch.tensor([0.2, 0.95])):
+        planned = agent.plan(
+            states = probe_3d[:, :1],
+            actions = torch.empty(2, 0, 1),
+            horizon = 2,
+            pop_size = 8,
+            generations = 2,
+            seed_with_actor = 'reflexive',
+            discount_factor = discount
+        )
+        assert planned.shape == (2, 2, 1)

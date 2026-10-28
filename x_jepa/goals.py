@@ -131,7 +131,7 @@ class MetricResidualNetwork(Module):
         is_backward = ~is_forward
 
         # forward transitions (t2 >= t1): distance should match exact time elapsed
-        forward_loss = F.mse_loss(dists[is_forward], dt[is_forward].float()) if is_forward.any() else self.zero
+        forward_loss = F.smooth_l1_loss(dists[is_forward], dt[is_forward].float().clamp(max = self.margin)) if is_forward.any() else self.zero
 
         # backward transitions (t2 < t1): distance should be large
         backward_loss = F.relu(self.margin - dists[is_backward]).mean() if is_backward.any() else self.zero
