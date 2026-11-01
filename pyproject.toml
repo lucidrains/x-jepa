@@ -1,6 +1,6 @@
 [project]
 name = "x-jepa"
-version = "0.0.116"
+version = "0.1.0"
 description = "Explorations into JEPA"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -47,6 +47,7 @@ Repository = "https://codeberg.org/lucidrains/x-jepa"
 examples = []
 test = [
     "pytest",
+    "pytest-xdist>=3.5",
     "gymnasium",
     "populora>=0.1.12"
 ]
@@ -58,6 +59,7 @@ pythonpath = [
 testpaths = [
     "tests"
 ]
+addopts = "-n auto --dist=load"
 
 [build-system]
 requires = ["hatchling"]

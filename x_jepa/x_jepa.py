@@ -102,8 +102,7 @@ Losses = namedtuple('Losses', [
     'cross_sensory_align_sigreg',
     'cross_sensory_align_breakdown',
     'intrinsics',
-    'intrinsics_breakdown',
-    'quasimetric_distance'
+    'intrinsics_breakdown'
 ])
 
 CrossSensoryPairLoss = namedtuple('CrossSensoryPairLoss', ['src', 'tgt', 'loss'])
@@ -2163,8 +2162,6 @@ class Agent(Module):
         intrinsic_loss_weight: float = 1.,
         intrinsic_frac_gradient: float | Sequence[float] = 0.,
         episodic_mem_len = 0,
-        quasimetric_distance_network = None,
-        quasimetric_distance_loss_weight = 1.,
         temporal_compression: int | Sequence[int] = 1,
         q_frac_gradients = 0., # fraction of the Q head gradient flowing into the world model, like the value head
         to_q_pred: Module | None = None, # custom Q head MLP over (state latent, action cond)
@@ -2498,11 +2495,6 @@ class Agent(Module):
             )
             self.goal_flow_matching = FlowMatching(model = self.goal_generator)
 
-        # quasimetric
-
-        self.quasimetric_distance_network = quasimetric_distance_network
-        self.quasimetric_distance_loss_weight = quasimetric_distance_loss_weight
-
         # intrinsics
 
         self.intrinsic_loss_weight = intrinsic_loss_weight
@@ -2681,6 +2673,15 @@ class Agent(Module):
                 total_view_idx += 1
 
         return sum(encoded), sensory_layer_hiddens, sensory_for_alignment
+
+    def encode_states_noncontextual(
+        self,
+        states: States,
+        ema = True
+    ):
+        encoder = self.ema_state_encoder if ema else self.state_encoder
+        embed, _, _ = self.encode_states(encoder, states)
+        return embed
 
     def add_actor(self, name: str, actor: Module, actor_loss_weight = 1.0):
         self.actors[name] = actor
@@ -3692,20 +3693,11 @@ class Agent(Module):
                 fitnesses = fitness_fn(**fitness_fn_kwargs)
 
             elif exists(encoded_goal):
-                if not exists(goal_dist_fn) and exists(self.quasimetric_distance_network):
-                    # evaluate MRN distance on predicted states and goal
-                    # enforces state (left) to goal (right) encoder asymmetry
+                # default to simple distance function if goal state provided
 
-                    _, p, h, _ = pred_state_latents.shape
-                    encoded_goal_expanded = encoded_goal.expand(-1, p, h, -1)
-                    distances = self.quasimetric_distance_network(pred_state_latents, encoded_goal_expanded)
-                    fitnesses = -reduce(distances, 'b p h -> b p', 'sum')
-                else:
-                    # default to simple distance function if goal state provided
-
-                    dist_fn = default(goal_dist_fn, partial(F.smooth_l1_loss, reduction = 'none'))
-                    distance_to_goal = dist_fn(pred_next_encoded_states, encoded_goal.expand_as(pred_next_encoded_states))
-                    fitnesses = -reduce(distance_to_goal, 'b p h d -> b p', 'sum')
+                dist_fn = default(goal_dist_fn, partial(F.smooth_l1_loss, reduction = 'none'))
+                distance_to_goal = dist_fn(pred_next_encoded_states, encoded_goal.expand_as(pred_next_encoded_states))
+                fitnesses = -reduce(distance_to_goal, 'b p h d -> b p', 'sum')
             else:
                 # default to discounted rollout return + discounted terminal-gated value bootstrap
 
@@ -3853,6 +3845,37 @@ class Agent(Module):
 
         next_memories = (next_state_rnn_memories, next_action_rnn_memories, next_model_memories)
         return out, next_memories
+
+    @torch.no_grad()
+    @temp_eval
+    def plan_to_goal_embedding(
+        self,
+        states: States,
+        actions,
+        goal_embedding: Tensor,
+        **plan_kwargs
+    ):
+        # plan against a goal already living in the non-contextual state-encoder
+        # space, e.g. a c-slerp subgoal from `x_jepa.crl_planning`
+
+        from x_jepa.crl_planning import subgoal_fitness
+
+        assert 'fitness_fn' not in plan_kwargs, 'fitness_fn is supplied by plan_to_goal_embedding'
+
+        return self.plan(
+            states,
+            actions,
+            fitness_fn = subgoal_fitness(goal_embedding),
+            **plan_kwargs
+        )
+
+    def crl_learner(self, *args, **kwargs):
+        from x_jepa.crl_planning import XJepaCRLLearner
+        return XJepaCRLLearner(self, *args, **kwargs)
+
+    def crl_planner(self, *args, **kwargs):
+        from x_jepa.crl_planning import XJepaCRLPlanner
+        return XJepaCRLPlanner(self, *args, **kwargs)
 
     @torch.no_grad()
     def update_memories_with_action(
@@ -4771,31 +4794,6 @@ class Agent(Module):
                 intrinsics_loss = sum(ind_losses)
                 intrinsics_breakdown = tuple(ind_losses)
 
-        # quasimetric loss
-
-        quasimetric_distance_loss = self.zero
-
-        if exists(self.quasimetric_distance_network) and ema_encoded_state.shape[1] > 1:
-            seq_len = ema_encoded_state.shape[1]
-            valid_lens = lens.clamp(min = 2, max = seq_len)[:, None] if exists(lens) else torch.full((batch, 1), seq_len, device = device, dtype = torch.long)
-            num_pairs = 8
-
-            t1 = (torch.rand((batch, num_pairs), device = device) * valid_lens).long()
-            t2 = (torch.rand((batch, num_pairs), device = device) * valid_lens).long()
-            t2[:, 0] = t1[:, 0]
-            t2[:, -1] = valid_lens[:, 0] - 1
-
-            # enforces state (left) to goal (right) encoder asymmetry
-            state_left = batched_index_select(state_latents_full.detach(), t1, dim = 1)
-            state_right = batched_index_select(ema_encoded_state.detach(), t2, dim = 1)
-
-            quasimetric_distance_loss = self.quasimetric_distance_network.time_contrastive_loss(
-                state_left,
-                state_right,
-                t1,
-                t2
-            )
-
         # losses
 
         loss_breakdown = Losses(
@@ -4814,8 +4812,7 @@ class Agent(Module):
             cross_sensory_align_sigreg_loss,
             cross_sensory_align_breakdown,
             intrinsics_loss,
-            intrinsics_breakdown,
-            quasimetric_distance_loss
+            intrinsics_breakdown
         )
 
         total_loss = (
@@ -4830,8 +4827,7 @@ class Agent(Module):
             align_pre_state_action_repr_sigreg_loss * self.align_pre_state_action_repr_sigreg_weight +
             cross_sensory_align_loss * self.cross_sensory_align_loss_weight +
             cross_sensory_align_sigreg_loss * self.cross_sensory_align_sigreg_weight +
-            intrinsics_loss * self.intrinsic_loss_weight +
-            quasimetric_distance_loss * self.quasimetric_distance_loss_weight
+            intrinsics_loss * self.intrinsic_loss_weight
         )
 
         out = (total_loss, loss_breakdown)

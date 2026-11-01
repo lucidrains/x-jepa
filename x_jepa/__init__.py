@@ -23,3 +23,20 @@ from x_jepa.state_heads import (
 )
 
 from x_jepa.log_depth_recurrent import LogDepthRecurrentModel
+
+from x_jepa.crl_planning import (
+    HypersphericalInfoNCE,
+    cayley_rotation,
+    l2norm,
+    FIFOBuffer,
+    CRLBatch,
+    XJepaCRLLearner,
+    CSlerpPlan,
+    c_slerp_plan,
+    SUBGOAL_METHODS,
+    SubgoalPlan,
+    SubgoalProposal,
+    propose_subgoals,
+    XJepaCRLPlanner,
+    subgoal_fitness
+)

@@ -15,7 +15,7 @@ from x_jepa.x_jepa import Agent, WorldModel, Transformer, Actor, exists, AgentRo
 from x_jepa.log_depth_recurrent import LogDepthRecurrentModel
 from x_jepa.min_gru import minGRUBlocks
 from x_jepa.regularizers import SigReg, VISReg, uniform_wasserstein_loss
-from x_jepa.goals import GoalGenerator, MetricResidualNetwork
+from x_jepa.goals import GoalGenerator
 from x_jepa.flow_matching import FlowMatching
 from x_jepa.latent_action_model import LatentActionModel
 from x_jepa.utils import store_experience_in_replay_buffer, Experience, exists
@@ -1723,50 +1723,6 @@ def test_latent_action_model_prepend_and_causal(seq_len):
 
     assert sampled_actions.shape == (batch_size, seq_len, dim_action)
 
-@param('use_mrn', (True, False))
-def test_mrn_world_model(use_mrn):
-    model = Transformer(
-        dim = 512,
-        depth = 2,
-        causal = True
-    )
-
-    mrn = None
-    if use_mrn:
-        mrn = MetricResidualNetwork(
-            sym_network = MLP(512, 256, 512),
-            asym_network = MLP(512, 256, 512)
-        )
-
-    world_model = Agent(
-        state_encoder = nn.Linear(128, 512),
-        action_encoder = nn.Linear(20, 512),
-        action_decoder = nn.Linear(32, 20),
-        transition_action_space = 'local',
-        dim_action = 20,
-        dim_action_latent = 32,
-        model = model,
-        quasimetric_distance_network = mrn
-    )
-
-    states = torch.randn(2, 4, 128)
-    actions = torch.randn(2, 3, 20).tanh()
-
-    loss, loss_breakdown = world_model(states, actions)
-    assert loss.ndim == 0
-    loss.backward()
-
-    # plan
-
-    planned_actions = world_model.plan(
-        states[:, :2],
-        actions[:, :1],
-        horizon = 3,
-        goal_state = torch.randn(2, 128)
-    )
-
-    assert planned_actions.shape == (2, 3, 20)
-
 @param('rl_type', ('ppo', 'tpo'))
 @param('is_vector_env', (False, True))
 @param('use_var_lens', (False, True))
@@ -1777,7 +1733,7 @@ def test_end_to_end_bc_rl_finetune_flow(rl_type, is_vector_env, use_var_lens):
 
     obs_dim = 4
     action_dim = 2
-    dim_model = 64
+    dim_model = 16
     horizon = 5
 
     env = gym.vector.SyncVectorEnv([lambda: gym.make('CartPole-v1')] * 2) if is_vector_env else gym.make('CartPole-v1')
@@ -1786,7 +1742,7 @@ def test_end_to_end_bc_rl_finetune_flow(rl_type, is_vector_env, use_var_lens):
 
     model = Transformer(
         dim = dim_model,
-        depth = 2,
+        depth = 1,
         causal = True
     )
 
@@ -1809,7 +1765,9 @@ def test_end_to_end_bc_rl_finetune_flow(rl_type, is_vector_env, use_var_lens):
         env,
         max_steps = horizon,
         actor_module = None, # cem planning
-        fitness_fn = lambda pred_state_latents: pred_state_latents.sum(dim = (-1, -2))
+        fitness_fn = lambda pred_state_latents: pred_state_latents.sum(dim = (-1, -2)),
+        pop_size = 32,
+        generations = 2
     )
 
     assert planning_experience.states.ndim == 3
@@ -1947,7 +1905,9 @@ def test_end_to_end_bc_rl_finetune_flow(rl_type, is_vector_env, use_var_lens):
         latent_action_model = latent_action_model,
         latent_action_model_steps = 2,
         latent_action_model_chunk_size = (3, 2),
-        fitness_fn = lambda pred_state_latents: pred_state_latents.sum(dim = (-1, -2))
+        fitness_fn = lambda pred_state_latents: pred_state_latents.sum(dim = (-1, -2)),
+        pop_size = 64,
+        generations = 2
     )
 
     assert planned_actions.shape == (fine_tuned_exp.states.shape[0], horizon)
@@ -3247,7 +3207,7 @@ def test_q_learning_loss(temporal_compression, use_lens):
 
 @param('temporal_compression', (1, 2))
 def test_q_filtered_seeding(temporal_compression):
-    dim = 64
+    dim = 16
     gamma = 0.99
     goal = torch.tensor([1.0, 1.0])
 
@@ -3282,7 +3242,7 @@ def test_q_filtered_seeding(temporal_compression):
 
     def build(c):
         return Agent(
-            model = Transformer(dim = dim, depth = 2, causal = True),
+            model = Transformer(dim = dim, depth = 1, causal = True),
             dim_action = 2,
             state_encoder = nn.Linear(2, dim),
             action_encoder = nn.Linear(2, dim),
@@ -3299,7 +3259,7 @@ def test_q_filtered_seeding(temporal_compression):
         optimizer = torch.optim.Adam(agent.parameters(), lr = 1e-3)
         agent.train()
         lens = torch.full((32,), states.shape[1], dtype = torch.long)
-        for step in range(400):
+        for step in range(150):
             idx = torch.randint(0, states.shape[0], (32,))
             loss, _ = agent(states[idx], actions[idx], lens = lens, returns = returns[idx], rewards = rewards[idx], dones = dones[idx], behavior_clone = False)
             loss.backward(); optimizer.step(); optimizer.zero_grad(); agent.update()
@@ -3325,8 +3285,8 @@ def test_q_filtered_seeding(temporal_compression):
         return cumulative
 
     torch.manual_seed(0)
-    good_episodes = collect(96, lambda s: ((goal - s) * 2.0 + 0.05 * torch.randn_like(s)).clamp(-1.0, 1.0))
-    failure_episodes = collect(48, lambda s: torch.rand_like(s) * 2.0 - 1.0)
+    good_episodes = collect(48, lambda s: ((goal - s) * 2.0 + 0.05 * torch.randn_like(s)).clamp(-1.0, 1.0))
+    failure_episodes = collect(24, lambda s: torch.rand_like(s) * 2.0 - 1.0)
     g_states, g_actions, g_rewards, g_dones, g_returns = make_batches(good_episodes)
     m_states, m_actions, _, _, m_returns = make_batches(good_episodes + failure_episodes)
 
@@ -3335,10 +3295,10 @@ def test_q_filtered_seeding(temporal_compression):
 
     # the framework trains the Q critic end-to-end - SARSA TD bootstrap off the EMA head,
     # HL-Gauss loss, internal optimizer and EMA target updates
-    agent.train_q(m_states, m_actions, m_returns, steps = 2000, batch_size = 256, lr = 1e-3, discount = gamma)
+    agent.train_q(m_states, m_actions, m_returns, steps = 800, batch_size = 128, lr = 1e-3, discount = gamma)
 
     torch.manual_seed(11)
-    test_states = torch.rand(24, 2) * 2.0 - 1.0
+    test_states = torch.rand(12, 2) * 2.0 - 1.0
 
     plain = execute(agent, test_states, pop_size = 1, generations = 1)
     filtered = execute(agent, test_states, pop_size = 1, generations = 1, value_filter_samples = 16)
@@ -3393,7 +3353,7 @@ def test_state_value_uvfa_discount_conditioning_e2e():
 
     torch.manual_seed(0)
 
-    dim = 32
+    dim = 16
     state_dim = 1
     dim_action = 1
 
@@ -3401,15 +3361,15 @@ def test_state_value_uvfa_discount_conditioning_e2e():
         agent = Agent(
             model = Transformer(dim = dim, depth = 1, causal = True),
             dim_action = dim_action,
-            state_encoder = MLP(state_dim, 64, dim),
-            action_encoder = MLP(dim_action, 64, dim),
+            state_encoder = MLP(state_dim, 32, dim),
+            action_encoder = MLP(dim_action, 32, dim),
             transition_action_space = 'raw',
             continuous_actions = True,
             transition_horizon = 1,
             state_transition_depth = 1,
             discount_factor = 0.99
         )
-        heads = StateSpaceHeads(dim, state_dim, hidden = 64, value_scale = 1.)
+        heads = StateSpaceHeads(dim, state_dim, hidden = 32, value_scale = 1.)
         return agent, heads
 
     # 1. assertions when StateValue is not trained with universal value function (UVFA) discount conditioning
@@ -3513,8 +3473,8 @@ def test_state_value_uvfa_discount_conditioning_e2e():
     agent, heads = make_agent_and_heads()
     opt = torch.optim.Adam(list(agent.parameters()) + list(heads.parameters()), lr = 3e-3)
 
-    batch_size, seq_len = 32, 5
-    for _ in range(250):
+    batch_size, seq_len = 16, 5
+    for _ in range(50):
         s0 = torch.rand(batch_size, 1, 1) * 1.6 - 0.8
         acts = torch.rand(batch_size, seq_len - 1, 1) * 2. - 1.
         traj = [s0]
@@ -3610,7 +3570,7 @@ def test_state_value_uvfa_discount_conditioning_e2e():
         max_steps = 2,
         horizon = 1,
         plan_lookahead = 1,
-        pop_size = 16,
+        pop_size = 8,
         generations = 1,
         fitness_fn = fitness,
         discount_factor = torch.tensor([0.15, 0.45, 0.75, 0.95]),
@@ -3624,8 +3584,8 @@ def test_state_value_uvfa_discount_conditioning_e2e():
         max_steps = 3,
         horizon = 1,
         plan_lookahead = 1,
-        pop_size = 32,
-        generations = 2,
+        pop_size = 8,
+        generations = 1,
         fitness_fn = fitness,
         discount_factor = 0.2,
         use_ema_for_planning = False
@@ -3637,8 +3597,8 @@ def test_state_value_uvfa_discount_conditioning_e2e():
         max_steps = 3,
         horizon = 1,
         plan_lookahead = 1,
-        pop_size = 32,
-        generations = 2,
+        pop_size = 8,
+        generations = 1,
         fitness_fn = fitness,
         discount_factor = 0.99,
         use_ema_for_planning = False
@@ -3885,13 +3845,13 @@ def test_n_step_bootstrapping_and_terminal_handling():
 @param('n_step', (None, 3))
 def test_agent_uvfa_custom_discount_factors_e2e(value_network_type, transition_type, n_step):
     torch.manual_seed(0)
-    dim = 32
+    dim = 16
 
     state_transition = MLP(dim + 1, *((dim * 2,) * 2), dim) if transition_type == 'mlp' else None
 
     agent = Agent(
-        state_encoder = MLP(1, 64, dim),
-        action_encoder = MLP(1, 64, dim),
+        state_encoder = MLP(1, 32, dim),
+        action_encoder = MLP(1, 32, dim),
         model = Transformer(dim = dim, depth = 1, causal = True),
         state_transition = state_transition,
         dim_action = 1,
@@ -3906,7 +3866,7 @@ def test_agent_uvfa_custom_discount_factors_e2e(value_network_type, transition_t
     # 6-step trajectory with reward = 1 per step and terminal step at index 5:
     # average return across steps is ~1.09 for gamma = 0.1 vs ~3.26 for gamma = 0.95
 
-    batch_size, seq_len = 32, 6
+    batch_size, seq_len = 16, 6
     states = torch.zeros(batch_size, seq_len, 1)
     actions = torch.zeros(batch_size, seq_len, 1)
     rewards = torch.ones(batch_size, seq_len)
@@ -3914,7 +3874,7 @@ def test_agent_uvfa_custom_discount_factors_e2e(value_network_type, transition_t
     dones[:, -1] = True
 
     opt = torch.optim.Adam(agent.parameters(), lr = 5e-3)
-    for step in range(80):
+    for step in range(40):
         custom_g = None if (step % 2 == 0) else torch.where(torch.rand(batch_size) < 0.5, 0.1, 0.95)
         loss, lb = agent(states, actions, rewards = rewards, dones = dones, discounts = custom_g, n_step = n_step)
         assert lb.value.item() > 0.

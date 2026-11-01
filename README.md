@@ -319,3 +319,25 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
     url     = {https://arxiv.org/abs/2609.30063}
 }
 ```
+
+```bibtex
+@misc{park2026hyperspherical,
+    title   = {Hyperspherical Contrastive Representations Unlock Planning and Exploration},
+    author  = {Jonghae Park and Sungil Son and Jonghun Shin and Junseo Lee and H. Jin Kim and Benjamin Eysenbach},
+    year    = {2026},
+    eprint  = {2610.20409},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2610.20409},
+}
+```
+
+```bibtex
+@inproceedings{eysenbach2022contrastive,
+    title   = {Contrastive Learning as Goal-Conditioned Reinforcement Learning},
+    author  = {Benjamin Eysenbach and Tianjun Zhang and Sergey Levine and Ruslan Salakhutdinov},
+    booktitle = {Advances in Neural Information Processing Systems},
+    year    = {2022},
+    url     = {https://arxiv.org/abs/2206.07568},
+}
+```
