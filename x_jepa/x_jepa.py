@@ -57,6 +57,7 @@ from x_jepa.goals import GoalGenerator
 from x_jepa.flow_matching import FlowMatching
 from x_jepa.intrinsic import SkillLatents, SkillDiscriminator
 from x_jepa.rl import coerce_experience
+from x_jepa.usf import UniversalSuccessorFeatures
 
 # constants
 
@@ -102,7 +103,8 @@ Losses = namedtuple('Losses', [
     'cross_sensory_align_sigreg',
     'cross_sensory_align_breakdown',
     'intrinsics',
-    'intrinsics_breakdown'
+    'intrinsics_breakdown',
+    'usf'
 ])
 
 CrossSensoryPairLoss = namedtuple('CrossSensoryPairLoss', ['src', 'tgt', 'loss'])
@@ -2176,7 +2178,15 @@ class Agent(Module):
         num_skills = 8,
         dim_skill = 32,
         diayn_l2norm_skills = False,
-        diayn_discriminator_depth = 2
+        diayn_discriminator_depth = 2,
+        # universal successor features - reward-free TD off the final contextual state latent
+        use_usf = False,
+        usf_loss_weight = 0.1,
+        usf_hidden_dim = None,
+        usf_ema_beta = None,
+        usf_discount_factor = None,
+        usf_frac_gradient = 0.,
+        usf_reg_weight = 0.
     ):
         super().__init__()
 
@@ -2526,6 +2536,24 @@ class Agent(Module):
         self.has_action_latent_wasserstein_loss = action_latent_wasserstein_loss_weight > 0.
         self.has_temporal_straightening_loss = temporal_straightening_loss_weight > 0.
 
+        # universal successor features over the final contextual state latent
+
+        self.usf_loss_weight = usf_loss_weight
+        self.usf_discount_factor = usf_discount_factor
+
+        self.usf = None
+        if use_usf:
+            self.usf = UniversalSuccessorFeatures(
+                dim_state_latent = dim_state_latent,
+                dim_action = dim_transition_action_input,
+                hidden_dim = usf_hidden_dim,
+                ema_beta = default(usf_ema_beta, ema_beta),
+                discount_factor = default(usf_discount_factor, discount_factor),
+                frac_gradient = usf_frac_gradient,
+                reg = self.reg if usf_reg_weight > 0. else None,
+                reg_weight = usf_reg_weight
+            )
+
         # DIAYN skill discovery
 
         self.use_diayn = use_diayn
@@ -2751,6 +2779,9 @@ class Agent(Module):
             params.extend(self.value_state_encoder.parameters())
         return params
 
+    def get_usf_parameters(self):
+        return list(self.usf.parameters()) if exists(self.usf) else []
+
     def get_value_state_tokens(
         self,
         states: States,
@@ -2811,6 +2842,9 @@ class Agent(Module):
 
         if exists(self.value_network):
             self.value_network.update()
+
+        if exists(self.usf):
+            self.usf.update()
 
     @torch.no_grad()
     def q_latents(
@@ -4594,6 +4628,23 @@ class Agent(Module):
             sample = True
         )
 
+        # universal successor features - reward-free TD on the final contextual state latents
+
+        usf_loss = self.zero
+
+        if exists(self.usf) and self.usf_loss_weight != 0. and state_latents_full.shape[1] > 1:
+            m = min(state_latents_full.shape[1] - 1, action_cond.shape[1])
+
+            if m > 0:
+                usf_loss = self.usf.compute_loss(
+                    state_latents_full[:, :m + 1],
+                    action_cond[:, :m],
+                    next_actions = action_cond[:, 1:m + 1] if m > 1 else None,
+                    discount = default(self.usf_discount_factor, discounts),
+                    mask = mask[:, :m + 1] if exists(mask) else None,
+                    dones = dones[:, :m] if exists(dones) else None
+                )
+
         # behavior clone
         # with a per-batch weight, the weighted per-batch loss stays for the caller and the aggregate stays zero
 
@@ -4812,7 +4863,8 @@ class Agent(Module):
             cross_sensory_align_sigreg_loss,
             cross_sensory_align_breakdown,
             intrinsics_loss,
-            intrinsics_breakdown
+            intrinsics_breakdown,
+            usf_loss
         )
 
         total_loss = (
@@ -4827,7 +4879,8 @@ class Agent(Module):
             align_pre_state_action_repr_sigreg_loss * self.align_pre_state_action_repr_sigreg_weight +
             cross_sensory_align_loss * self.cross_sensory_align_loss_weight +
             cross_sensory_align_sigreg_loss * self.cross_sensory_align_sigreg_weight +
-            intrinsics_loss * self.intrinsic_loss_weight
+            intrinsics_loss * self.intrinsic_loss_weight +
+            usf_loss * self.usf_loss_weight
         )
 
         out = (total_loss, loss_breakdown)
