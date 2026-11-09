@@ -3507,6 +3507,7 @@ class Agent(Module):
             seeded_actions = stack(seeded_actions, dim = 2)
 
         encoded_goal = None
+        goal_latent = None
 
         if exists(goal_state):
             if is_tensor(goal_state):
@@ -3514,6 +3515,10 @@ class Agent(Module):
 
             encoded_goal, _, _ = self.encode_states(self.ema_state_encoder, goal_state)
             encoded_goal = rearrange(encoded_goal, 'b d -> b 1 1 d')
+
+            goal_tokens, _, _ = self.encode_states(self.state_encoder, [rearrange(g, 'b ... -> b 1 ...') if g.ndim == 2 else g for g in goal_state])
+            goal_embeds = prompt_model(self.state_linear_rnn(goal_tokens))
+            goal_latent = rearrange(self.to_state_latent(goal_embeds[:, -1]), 'b d -> b 1 1 d')
 
         # introspect fitness_fn once
 
@@ -3701,6 +3706,10 @@ class Agent(Module):
                     pred_discounts = pred_discounts,
                     pred_values = pred_values,
                     encoded_goal = encoded_goal,
+                    goal_latent = goal_latent,
+                    state_latents = state_latents,
+                    actions = actions_cond,
+                    usf = self.usf,
                     pred_state_entropies = pred_state_entropies,
                     skill_discriminator = self.skill_discriminator,
                     discount_factor = discount_factor
@@ -4632,18 +4641,14 @@ class Agent(Module):
 
         usf_loss = self.zero
 
-        if exists(self.usf) and self.usf_loss_weight != 0. and state_latents_full.shape[1] > 1:
-            m = min(state_latents_full.shape[1] - 1, action_cond.shape[1])
-
-            if m > 0:
-                usf_loss = self.usf.compute_loss(
-                    state_latents_full[:, :m + 1],
-                    action_cond[:, :m],
-                    next_actions = action_cond[:, 1:m + 1] if m > 1 else None,
-                    discount = default(self.usf_discount_factor, discounts),
-                    mask = mask[:, :m + 1] if exists(mask) else None,
-                    dones = dones[:, :m] if exists(dones) else None
-                )
+        if exists(self.usf) and self.usf_loss_weight != 0.:
+            usf_loss = self.usf.compute_loss(
+                state_latents_full,
+                action_cond,
+                discount = default(self.usf_discount_factor, discounts),
+                mask = mask,
+                dones = dones
+            )
 
         # behavior clone
         # with a per-batch weight, the weighted per-batch loss stays for the caller and the aggregate stays zero

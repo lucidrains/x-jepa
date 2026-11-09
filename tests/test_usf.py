@@ -64,6 +64,17 @@ def test_usf_td_loss_and_uvfa_readout():
     per_step_discount = torch.rand(2, 5)
     assert torch.isfinite(usf.compute_loss(states, actions, discount = per_step_discount))
 
+    # discount conditioning changes successor feature predictions
+
+    psi_low = usf.successor_features(states[:, :4], actions, discount = 0.5)
+    psi_high = usf.successor_features(states[:, :4], actions, discount = 0.99)
+    assert not torch.allclose(psi_low, psi_high)
+
+    # dones with full state sequence length (m + 1) are sliced cleanly
+
+    full_dones = torch.zeros(2, 5, dtype = torch.bool)
+    assert torch.isfinite(usf.compute_loss(states, actions, dones = full_dones))
+
     # ema target update
 
     usf.update()
@@ -155,3 +166,52 @@ def test_agent_usf_trains_alongside_world_model():
 
     _, loss_breakdown = agent_no_usf(states, actions)
     assert loss_breakdown.usf == 0.
+
+
+def test_usf_infer_task_generalizes_to_different_rewards():
+    torch.manual_seed(0)
+
+    usf = UniversalSuccessorFeatures(
+        dim_state_latent = 8,
+        dim_action = 2,
+        hidden_dim = 16,
+        discount_factor = 0.95
+    )
+
+    state_latents = torch.randn(4, 32, 8)
+    actions = torch.randn(4, 32, 2)
+
+    true_w1 = torch.randn(8)
+    true_w2 = torch.randn(8)
+
+    rewards_1 = einx.dot('b n d, d -> b n', state_latents, true_w1)
+    rewards_2 = einx.dot('b n d, d -> b n', state_latents, true_w2)
+
+    # single reward function recovery via ridge regression (test-time adjustment)
+
+    inferred_w1 = usf.infer_task(state_latents, rewards_1, ridge_lambda = 1e-5)
+    assert_close(inferred_w1, true_w1, atol = 1e-3, rtol = 1e-3)
+
+    # zero-shot Gaussian estimator (ridge_lambda = None)
+
+    zs_w1 = usf.infer_task(state_latents, rewards_1, ridge_lambda = None)
+    assert F.cosine_similarity(zs_w1, true_w1, dim = 0) > 0.85
+
+    # multiple simultaneous reward functions (k = 3) in one call
+
+    true_multi = torch.stack((true_w1, true_w2, -true_w1), dim = 0)
+    multi_rewards = einx.dot('b n d, k d -> b n k', state_latents, true_multi)
+
+    mask = torch.ones(4, 32, dtype = torch.bool)
+    mask[:, -4:] = False
+
+    inferred_multi = usf.infer_task(state_latents, multi_rewards, mask = mask, ridge_lambda = 1e-5)
+    assert inferred_multi.shape == (3, 8)
+    assert_close(inferred_multi, true_multi, atol = 1e-3, rtol = 1e-3)
+
+    # evaluating Q across all k reward tasks simultaneously
+
+    q_multi = usf.q(state_latents, actions, inferred_multi)
+    assert q_multi.shape == (4, 32, 3)
+    assert_close(q_multi[..., 0], -q_multi[..., 2], atol = 1e-3, rtol = 1e-3)
+
