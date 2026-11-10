@@ -341,3 +341,15 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
     url     = {https://arxiv.org/abs/2206.07568},
 }
 ```
+
+```bibtex
+@misc{wang2026adajepaadaptivelatentworld,
+    title   = {AdaJEPA: An Adaptive Latent World Model},
+    author  = {Ying Wang and Oumayma Bounou and Yann LeCun and Mengye Ren},
+    year    = {2026},
+    eprint  = {2606.32026},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2606.32026},
+}
+```

@@ -8,6 +8,14 @@ from x_jepa.x_jepa import (
     make_rollout_fitness
 )
 
+from x_jepa.test_time import (
+    LoRAHook,
+    TestTimeAdapter,
+    adajepa_module_paths,
+    gradient_path_module_paths,
+    last_swiglu_ffn_lora_paths
+)
+
 from x_jepa.regularizers import (
     OrthogonalSubspaces,
     factor_activity_loss,

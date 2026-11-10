@@ -3920,6 +3920,10 @@ class Agent(Module):
         from x_jepa.crl_planning import XJepaCRLPlanner
         return XJepaCRLPlanner(self, *args, **kwargs)
 
+    def test_time_adapter(self, *args, **kwargs):
+        from x_jepa.test_time import TestTimeAdapter
+        return TestTimeAdapter(self, *args, **kwargs)
+
     @torch.no_grad()
     def update_memories_with_action(
         self,
@@ -4046,6 +4050,7 @@ class Agent(Module):
             # single timestep
 
             state_seq = tree_map_tensor(lambda t: rearrange(t, 'b ... -> b 1 ...'), state)
+            prev_memories = memories
 
             if exists(action_fn):
                 kwargs = filter_kwargs_for_fn(action_fn, step = step, state = state, env = env, info = info)
@@ -4183,6 +4188,9 @@ class Agent(Module):
                     step = step,
                     state = state,
                     action = action,
+                    next_state = next_state,
+                    prev_memories = prev_memories,
+                    memories = memories,
                     reward = reward,
                     terminated = terminated,
                     truncated = truncated,
