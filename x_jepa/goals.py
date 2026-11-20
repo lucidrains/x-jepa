@@ -75,5 +75,3 @@ class GoalGenerator(Module):
         returns_embed = self.returns_emb(returns)
 
         return self.net(cat((state, time_embed, returns_embed), dim = -1))
-
-

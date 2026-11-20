@@ -2937,6 +2937,31 @@ def test_hierarchical_temporal_refinement_plan():
     )
     assert actions_1x.shape == (batch, horizon, dim_action)
 
+@param('custom_reservoir', (False, True))
+def test_learnable_novelty(custom_reservoir):
+    from x_jepa.intrinsic import LearnableNovelty
+
+    torch.manual_seed(0)
+
+    dim_data, dim_target, batch = 8, 4, 4096
+    reservoir = nn.Sequential(nn.Linear(dim_data, 32), nn.ELU()) if custom_reservoir else None
+    ln = LearnableNovelty(dim_data = dim_data, dim_target = dim_target, reservoir = reservoir)
+
+    data = torch.randn(batch, dim_data, requires_grad = True)
+    structured = data @ torch.randn(dim_data, dim_target)
+    noise = torch.randn(batch, dim_target)
+    dark = torch.zeros(batch, dim_target)
+
+    structured_score, noise_score, dark_score = (ln(data, target) for target in (structured, noise, dark))
+
+    assert structured_score > noise_score
+    assert noise_score > dark_score
+    assert dark_score.item() == 0.
+
+    structured_score.backward()
+    assert exists(data.grad)
+    assert all(not exists(p.grad) for p in ln.reservoir.parameters())
+
 # coin-flip network: a frequent state's bonus should collapse, a novel state's stay high
 # (Lobel et al. 2023)
 

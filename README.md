@@ -353,3 +353,15 @@ Explorations into some of the approaches advocated by Yann LeCun, and just a mor
     url     = {https://arxiv.org/abs/2606.32026},
 }
 ```
+
+```bibtex
+@misc{zhang2026intelligencelearnablenovelty,
+    title   = {Intelligence from Learnable Novelty},
+    author  = {Yanbo Zhang and Michael Levin},
+    year    = {2026},
+    eprint  = {2607.18433},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2607.18433},
+}
+```

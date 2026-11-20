@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from functools import partial
 import math
+from math import sqrt
 
 import torch
-from torch import nn, is_tensor, cat
+from torch import nn, is_tensor, cat, einsum
 import torch.nn.functional as F
-from torch.nn import Module
+from torch.nn import Module, Linear, LayerNorm, Sequential
+from torch.linalg import qr, solve_triangular, svdvals
+
+from torch_einops_utils import z_score
 
 from einops import rearrange, repeat
 from x_mlps_pytorch import MLP
@@ -21,6 +26,99 @@ def divisible_by(num, den):
 
 def l2norm(t, dim = -1):
     return F.normalize(t, p = 2, dim = dim)
+
+LinearNoBias = partial(Linear, bias = False)
+ParameterlessLayerNorm = partial(LayerNorm, elementwise_affine = False, bias = False)
+
+# Yanbo Zhang and Michael Levin - https://arxiv.org/abs/2607.18433
+
+class LearnableNovelty(Module):
+    def __init__(
+        self,
+        *,
+        dim_data,
+        dim_target,
+        reservoir: Module | None = None,
+        mlp_reservoir_dim = 32,
+        mlp_reservoir_layers = 4,
+        mlp_reservoir_activation = nn.ELU(),
+        ridge_penalty = 0.03,
+        target_scale = 1.,
+        eta = 1. # scale on singular values
+    ):
+        super().__init__()
+
+        if not exists(reservoir):
+            assert mlp_reservoir_layers > 1
+
+            dim = mlp_reservoir_dim
+
+            reservoir = Sequential(
+                LinearNoBias(dim_data, dim),
+                ParameterlessLayerNorm(dim),
+                mlp_reservoir_activation,
+                *[Sequential(LinearNoBias(dim, dim), ParameterlessLayerNorm(dim), mlp_reservoir_activation) for _ in range(mlp_reservoir_layers - 1)]
+            )
+
+        self.reservoir = reservoir
+        self.reservoir.requires_grad_(False)
+
+        # the target scale, divided by in denominator
+
+        self.target_scale = target_scale
+
+        # ridge penalty
+
+        self.ridge_penalty = ridge_penalty
+
+        # singular value scale
+
+        self.eta = eta
+
+    def forward(
+        self,
+        data,
+        targets
+    ):
+        batch, eta, target_scale = data.shape[0], self.eta, self.target_scale
+
+        data = rearrange(data, 'n ... -> n (...)')
+        targets = rearrange(targets, 'n ... -> n (...)')
+
+        self.reservoir.eval()
+        reservoir_out = self.reservoir(data)
+
+        dim = reservoir_out.shape[-1]
+
+        # H in paper
+
+        H = z_score(reservoir_out, dim = 0) * (dim ** -0.5)
+
+        # target
+
+        Y = (targets - targets.mean(dim = 0, keepdim = True)) / target_scale
+
+        # following Appendix E for differentiable ridge solve
+
+        # eq (21)
+
+        I = torch.eye(dim, device = H.device, dtype = H.dtype)
+        H_aug = cat((H, I * sqrt(self.ridge_penalty)))
+
+        # eq (22)
+
+        Q, R = qr(H_aug)
+        rhs = einsum('n d, n e -> d e', Q[:batch], Y)
+
+        # linear readout being solved for
+
+        W = solve_triangular(R, rhs, upper = True)
+
+        # then finally, eq (9), using log of squared singular values
+
+        epiplexity = 0.5 * torch.log2(1. + eta * svdvals(W).square())
+
+        return epiplexity.sum()
 
 # Sam Lobel et al. https://arxiv.org/abs/2306.03186
 # learns f(s) predicting a rademacher vector c(s) such that ||f(s)|| ~ 1/sqrt(N(s)),
