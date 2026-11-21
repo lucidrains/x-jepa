@@ -14,6 +14,7 @@ from torch.linalg import qr, solve_triangular, svdvals
 from torch_einops_utils import z_score
 
 from einops import rearrange, repeat
+from einops.layers.torch import Rearrange
 from x_mlps_pytorch import MLP
 
 # functions
@@ -27,7 +28,6 @@ def divisible_by(num, den):
 def l2norm(t, dim = -1):
     return F.normalize(t, p = 2, dim = dim)
 
-LinearNoBias = partial(Linear, bias = False)
 ParameterlessLayerNorm = partial(LayerNorm, elementwise_affine = False, bias = False)
 
 # Yanbo Zhang and Michael Levin - https://arxiv.org/abs/2607.18433
@@ -44,7 +44,8 @@ class LearnableNovelty(Module):
         mlp_reservoir_activation = nn.ELU(),
         ridge_penalty = 0.03,
         target_scale = 1.,
-        eta = 1. # scale on singular values
+        eta = 1., # scale on singular values
+        channel_first = False
     ):
         super().__init__()
 
@@ -54,14 +55,19 @@ class LearnableNovelty(Module):
             dim = mlp_reservoir_dim
 
             reservoir = Sequential(
-                LinearNoBias(dim_data, dim),
+                Linear(dim_data, dim),
                 ParameterlessLayerNorm(dim),
                 mlp_reservoir_activation,
-                *[Sequential(LinearNoBias(dim, dim), ParameterlessLayerNorm(dim), mlp_reservoir_activation) for _ in range(mlp_reservoir_layers - 1)]
+                *[Sequential(Linear(dim, dim), ParameterlessLayerNorm(dim), mlp_reservoir_activation) for _ in range(mlp_reservoir_layers - 2)],
+                Linear(dim, dim)
             )
 
         self.reservoir = reservoir
         self.reservoir.requires_grad_(False)
+
+        # fold spatial axes into samples
+
+        self.to_samples = Rearrange('n d ... -> (n ...) d' if channel_first else '... d -> (...) d')
 
         # the target scale, divided by in denominator
 
@@ -78,21 +84,22 @@ class LearnableNovelty(Module):
     def forward(
         self,
         data,
-        targets
+        targets,
+        z_score_eps = 1e-6
     ):
-        batch, eta, target_scale = data.shape[0], self.eta, self.target_scale
-
-        data = rearrange(data, 'n ... -> n (...)')
-        targets = rearrange(targets, 'n ... -> n (...)')
+        eta, target_scale = self.eta, self.target_scale
 
         self.reservoir.eval()
         reservoir_out = self.reservoir(data)
 
-        dim = reservoir_out.shape[-1]
+        reservoir_out = self.to_samples(reservoir_out)
+        targets = self.to_samples(targets)
+
+        num_samples, dim = reservoir_out.shape
 
         # H in paper
 
-        H = z_score(reservoir_out, dim = 0) * (dim ** -0.5)
+        H = z_score(reservoir_out, dim = 0, eps = z_score_eps) * (dim ** -0.5)
 
         # target
 
@@ -108,7 +115,7 @@ class LearnableNovelty(Module):
         # eq (22)
 
         Q, R = qr(H_aug)
-        rhs = einsum('n d, n e -> d e', Q[:batch], Y)
+        rhs = einsum('n d, n e -> d e', Q[:num_samples], Y)
 
         # linear readout being solved for
 
@@ -116,7 +123,7 @@ class LearnableNovelty(Module):
 
         # then finally, eq (9), using log of squared singular values
 
-        epiplexity = 0.5 * torch.log2(1. + eta * svdvals(W).square())
+        epiplexity = 0.5 * torch.log1p(eta * svdvals(W).square()) / math.log(2.)
 
         return epiplexity.sum()
 
