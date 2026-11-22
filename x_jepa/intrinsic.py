@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from functools import partial
 import math
 from math import sqrt
 
@@ -28,8 +27,6 @@ def divisible_by(num, den):
 def l2norm(t, dim = -1):
     return F.normalize(t, p = 2, dim = dim)
 
-ParameterlessLayerNorm = partial(LayerNorm, elementwise_affine = False, bias = False)
-
 # Yanbo Zhang and Michael Levin - https://arxiv.org/abs/2607.18433
 
 class LearnableNovelty(Module):
@@ -37,11 +34,11 @@ class LearnableNovelty(Module):
         self,
         *,
         dim_data,
-        dim_target,
+        dim_target = None,
         reservoir: Module | None = None,
         mlp_reservoir_dim = 32,
         mlp_reservoir_layers = 4,
-        mlp_reservoir_activation = nn.ELU(),
+        mlp_reservoir_activation: Module | None = None,
         ridge_penalty = 0.03,
         target_scale = 1.,
         eta = 1., # scale on singular values
@@ -49,16 +46,19 @@ class LearnableNovelty(Module):
     ):
         super().__init__()
 
-        if not exists(reservoir):
+        self.has_custom_reservoir = exists(reservoir)
+
+        if not self.has_custom_reservoir:
             assert mlp_reservoir_layers > 1
 
             dim = mlp_reservoir_dim
+            act = mlp_reservoir_activation if exists(mlp_reservoir_activation) else nn.ELU()
 
             reservoir = Sequential(
                 Linear(dim_data, dim),
-                ParameterlessLayerNorm(dim),
-                mlp_reservoir_activation,
-                *[Sequential(Linear(dim, dim), ParameterlessLayerNorm(dim), mlp_reservoir_activation) for _ in range(mlp_reservoir_layers - 2)],
+                LayerNorm(dim, elementwise_affine = False),
+                deepcopy(act),
+                *[Sequential(Linear(dim, dim), LayerNorm(dim, elementwise_affine = False), deepcopy(act)) for _ in range(mlp_reservoir_layers - 2)],
                 Linear(dim, dim)
             )
 
@@ -90,10 +90,10 @@ class LearnableNovelty(Module):
         eta, target_scale = self.eta, self.target_scale
 
         self.reservoir.eval()
-        reservoir_out = self.reservoir(data)
-
-        reservoir_out = self.to_samples(reservoir_out)
+        reservoir_out = self.to_samples(self.reservoir(data)) if self.has_custom_reservoir else self.reservoir(self.to_samples(data))
         targets = self.to_samples(targets)
+
+        reservoir_out, targets = reservoir_out.float(), targets.float()
 
         num_samples, dim = reservoir_out.shape
 

@@ -2938,19 +2938,31 @@ def test_hierarchical_temporal_refinement_plan():
     assert actions_1x.shape == (batch, horizon, dim_action)
 
 @param('custom_reservoir', (False, True))
-def test_learnable_novelty(custom_reservoir):
+@param('channel_first', (False, True))
+def test_learnable_novelty(custom_reservoir, channel_first):
     from x_jepa.intrinsic import LearnableNovelty
 
     torch.manual_seed(0)
 
     dim_data, dim_target, batch = 8, 4, 4096
-    reservoir = nn.Sequential(nn.Linear(dim_data, 32), nn.ELU()) if custom_reservoir else None
-    ln = LearnableNovelty(dim_data = dim_data, dim_target = dim_target, reservoir = reservoir)
+    if custom_reservoir:
+        reservoir = nn.Sequential(nn.Conv1d(dim_data, 32, 3, padding = 1), nn.ELU()) if channel_first else nn.Sequential(nn.Linear(dim_data, 32), nn.ELU())
+    else:
+        reservoir = None
 
-    data = torch.randn(batch, dim_data, requires_grad = True)
-    structured = data @ torch.randn(dim_data, dim_target)
-    noise = torch.randn(batch, dim_target)
-    dark = torch.zeros(batch, dim_target)
+    ln = LearnableNovelty(dim_data = dim_data, reservoir = reservoir, channel_first = channel_first)
+
+    if channel_first:
+        data = torch.randn(64, dim_data, 64, requires_grad = True)
+        w = torch.randn(dim_data, dim_target)
+        structured = torch.einsum('n d l, d e -> n e l', data, w)
+        noise = torch.randn(64, dim_target, 64)
+        dark = torch.zeros(64, dim_target, 64)
+    else:
+        data = torch.randn(batch, dim_data, requires_grad = True)
+        structured = data @ torch.randn(dim_data, dim_target)
+        noise = torch.randn(batch, dim_target)
+        dark = torch.zeros(batch, dim_target)
 
     structured_score, noise_score, dark_score = (ln(data, target) for target in (structured, noise, dark))
 
@@ -2961,6 +2973,10 @@ def test_learnable_novelty(custom_reservoir):
     structured_score.backward()
     assert exists(data.grad)
     assert all(not exists(p.grad) for p in ln.reservoir.parameters())
+
+    # float32 safety with low-precision targets
+    bf16_score = ln(data.detach(), structured.detach().bfloat16())
+    assert bf16_score.dtype == torch.float32 and torch.isfinite(bf16_score)
 
 # coin-flip network: a frequent state's bonus should collapse, a novel state's stay high
 # (Lobel et al. 2023)
