@@ -49,7 +49,7 @@ from ema_pytorch import EMA
 from torch_einops_utils import lens_to_mask
 from x_mlps_pytorch import MLP
 
-from faster_pusht_env import PushTEnv, render
+from env_faster_pusht import PushTEnv, render
 from x_jepa import Agent, StateSpaceHeads
 from x_jepa.intrinsic import LearnableNovelty
 from x_jepa.state_heads import StateValue, n_step_returns

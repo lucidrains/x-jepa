@@ -34,6 +34,8 @@ from x_jepa.log_depth_recurrent import LogDepthRecurrentModel
 
 from x_jepa.usf import UniversalSuccessorFeatures
 
+from x_jepa.intrinsic import LearnableNovelty
+
 from x_jepa.crl_planning import (
     HypersphericalInfoNCE,
     cayley_rotation,

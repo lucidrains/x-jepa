@@ -12,9 +12,9 @@ from torch.linalg import qr, solve_triangular, svdvals
 
 from torch_einops_utils import z_score
 
+import einx
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
-import einx
 from x_mlps_pytorch import MLP
 
 # functions
