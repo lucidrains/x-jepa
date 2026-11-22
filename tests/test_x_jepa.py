@@ -2939,7 +2939,8 @@ def test_hierarchical_temporal_refinement_plan():
 
 @param('custom_reservoir', (False, True))
 @param('channel_first', (False, True))
-def test_learnable_novelty(custom_reservoir, channel_first):
+@param('use_loo', (False, True))
+def test_learnable_novelty(custom_reservoir, channel_first, use_loo):
     from x_jepa.intrinsic import LearnableNovelty
 
     torch.manual_seed(0)
@@ -2950,7 +2951,7 @@ def test_learnable_novelty(custom_reservoir, channel_first):
     else:
         reservoir = None
 
-    ln = LearnableNovelty(dim_data = dim_data, reservoir = reservoir, channel_first = channel_first)
+    ln = LearnableNovelty(dim_data = dim_data, reservoir = reservoir, channel_first = channel_first, use_loo = use_loo)
 
     if channel_first:
         data = torch.randn(64, dim_data, 64, requires_grad = True)
@@ -2967,11 +2968,11 @@ def test_learnable_novelty(custom_reservoir, channel_first):
     structured_score, noise_score, dark_score = (ln(data, target) for target in (structured, noise, dark))
 
     assert structured_score > noise_score
-    assert noise_score > dark_score
+    assert (noise_score <= dark_score) if use_loo else (noise_score > dark_score)
     assert dark_score.item() == 0.
 
     structured_score.backward()
-    assert exists(data.grad)
+    assert exists(data.grad) and torch.isfinite(data.grad).all()
     assert all(not exists(p.grad) for p in ln.reservoir.parameters())
 
     # float32 safety with low-precision targets

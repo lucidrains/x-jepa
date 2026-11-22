@@ -5,7 +5,7 @@ import math
 from math import sqrt
 
 import torch
-from torch import nn, is_tensor, cat, einsum
+from torch import nn, is_tensor, cat, stack, einsum
 import torch.nn.functional as F
 from torch.nn import Module, Linear, LayerNorm, Sequential
 from torch.linalg import qr, solve_triangular, svdvals
@@ -14,6 +14,7 @@ from torch_einops_utils import z_score
 
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
+import einx
 from x_mlps_pytorch import MLP
 
 # functions
@@ -26,6 +27,12 @@ def divisible_by(num, den):
 
 def l2norm(t, dim = -1):
     return F.normalize(t, p = 2, dim = dim)
+
+def safe_div(num, den, eps = 1e-4):
+    return einx.divide('... d, ... -> ... d', num, den.clamp(min = eps))
+
+def logdet_epiplexity(t, scale = 1.):
+    return (0.5 * torch.log1p(scale * svdvals(t).square()) / math.log(2.)).sum(dim = -1)
 
 # Yanbo Zhang and Michael Levin - https://arxiv.org/abs/2607.18433
 
@@ -42,7 +49,8 @@ class LearnableNovelty(Module):
         ridge_penalty = 0.03,
         target_scale = 1.,
         eta = 1., # scale on singular values
-        channel_first = False
+        channel_first = False,
+        use_loo = False
     ):
         super().__init__()
 
@@ -81,6 +89,10 @@ class LearnableNovelty(Module):
 
         self.eta = eta
 
+        # leave-one-out predictive information gain
+
+        self.use_loo = use_loo
+
     def forward(
         self,
         data,
@@ -115,17 +127,26 @@ class LearnableNovelty(Module):
         # eq (22)
 
         Q, R = qr(H_aug)
-        rhs = einsum('n d, n e -> d e', Q[:num_samples], Y)
+        Q = Q[:num_samples]
+        rhs = einsum('n d, n e -> d e', Q, Y)
 
-        # linear readout being solved for
+        if self.use_loo:
+            # leave-one-out predictive information gain
+            # undo each sample's self-leverage and batch mean to get held-out residuals
 
-        W = solve_triangular(R, rhs, upper = True)
+            residuals = Y - einsum('n d, d e -> n e', Q, rhs)
+            error_scale = 1. - Q.square().sum(dim = -1) - 1. / num_samples
+            loo_residuals = safe_div(residuals, error_scale)
 
-        # then finally, eq (9), using log of squared singular values
+            # bits saved on held-out samples
 
-        epiplexity = 0.5 * torch.log1p(eta * svdvals(W).square()) / math.log(2.)
+            total, loo = logdet_epiplexity(stack((Y, loo_residuals)), eta / num_samples)
+            return total - loo
+        else:
+            # linear readout being solved for, eq (9) in paper
 
-        return epiplexity.sum()
+            W = solve_triangular(R, rhs, upper = True)
+            return logdet_epiplexity(W, eta)
 
 # Sam Lobel et al. https://arxiv.org/abs/2306.03186
 # learns f(s) predicting a rademacher vector c(s) such that ||f(s)|| ~ 1/sqrt(N(s)),
