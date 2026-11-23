@@ -2979,6 +2979,84 @@ def test_learnable_novelty(custom_reservoir, channel_first, use_loo):
     bf16_score = ln(data.detach(), structured.detach().bfloat16())
     assert bf16_score.dtype == torch.float32 and torch.isfinite(bf16_score)
 
+@param('use_loo', (False, True))
+@param('horizon', (1, 3))
+@param('stride', (1, 4))
+@param('max_window', (None, 12))
+def test_learnable_novelty_reward(use_loo, horizon, stride, max_window):
+    from x_jepa import LearnableNovelty, LearnableNoveltyReward
+
+    torch.manual_seed(0)
+
+    dim, scale = 6, 4.
+    novelty = LearnableNovelty(dim_data = dim, use_loo = use_loo, eta = 4.)
+    novelty_reward = LearnableNoveltyReward(novelty, horizon = horizon, scale = scale, stride = stride, max_window = max_window)
+
+    times = rearrange(torch.linspace(0., 8., 33), 'time -> time 1')
+    trajectory = torch.sin(times + torch.arange(dim) * 0.5)
+
+    # unbatched score, telescoping sum, and max_window invariance
+
+    full_epiplexity = novelty_reward.score(trajectory)
+    assert full_epiplexity.ndim == 0 and full_epiplexity > 0.
+
+    rewards, epiplexity = novelty_reward(trajectory[:-1], trajectory[1:], return_epiplexity = True)
+    assert rewards.shape == (32,) and epiplexity.ndim == 0
+
+    if not exists(max_window):
+        assert_close(epiplexity, full_epiplexity)
+        assert_close(rewards.sum(), full_epiplexity / scale)
+    else:
+        perturbed_trajectory = cat((torch.randn(4, dim) * 10., trajectory[4:]))
+        perturbed_rewards = novelty_reward(perturbed_trajectory[:-1], perturbed_trajectory[1:])
+        unaffected_start = max_window + 4 + stride
+        assert_close(rewards[unaffected_start:], perturbed_rewards[unaffected_start:])
+
+        if stride == 1:
+            expected_step_reward = novelty_reward.continuation_reward(trajectory[20 - max_window : 20], trajectory[20:21])
+            assert_close(rewards[19], expected_step_reward)
+
+    # batched states with variable lengths
+
+    batch_trajectories = torch.stack((trajectory, trajectory * 0.5))
+    batch_rewards, batch_epiplexities = novelty_reward(batch_trajectories, lens = tensor([33, 12]), return_epiplexity = True)
+    assert batch_rewards.shape == (2, 33) and batch_epiplexities.shape == (2,)
+    assert_close(batch_rewards[1, :12].sum(), novelty_reward.score(trajectory[:12] * 0.5) / scale)
+    assert (batch_rewards[1, 12:] == 0.).all()
+
+    # dones isolate episodes
+
+    first_episode, second_episode = trajectory[:16], trajectory[16:]
+    dones = torch.arange(31) == 14
+
+    joined_rewards = novelty_reward(
+        cat((first_episode[:-1], second_episode[:-1])),
+        cat((first_episode[1:], second_episode[1:])),
+        dones = dones
+    )
+    separate_rewards = cat((
+        novelty_reward(first_episode[:-1], first_episode[1:]),
+        novelty_reward(second_episode[:-1], second_episode[1:])
+    ))
+    assert_close(joined_rewards, separate_rewards)
+
+    # continuation reward over (batch, population, horizon, dim)
+
+    history = batch_trajectories[:, :20]
+    future = torch.randn(2, 5, 6, dim)
+    continuation_gain = novelty_reward.continuation_reward(history, future)
+    assert continuation_gain.shape == (2, 5)
+
+    expected_history = history[0, -max_window:] if exists(max_window) else history[0]
+    expected_gain = (novelty_reward.score(cat((expected_history, future[0, 0]))) - novelty_reward.score(expected_history)) / scale
+    assert_close(continuation_gain[0, 0], expected_gain)
+
+    # short trajectories return zero
+
+    short_trajectory = trajectory[:novelty_reward.min_len - 1]
+    assert novelty_reward.score(short_trajectory).item() == 0.
+    assert (novelty_reward(short_trajectory) == 0.).all()
+
 # coin-flip network: a frequent state's bonus should collapse, a novel state's stay high
 # (Lobel et al. 2023)
 

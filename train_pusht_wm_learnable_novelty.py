@@ -50,8 +50,7 @@ from torch_einops_utils import lens_to_mask
 from x_mlps_pytorch import MLP
 
 from env_faster_pusht import PushTEnv, render
-from x_jepa import Agent, StateSpaceHeads
-from x_jepa.intrinsic import LearnableNovelty
+from x_jepa import Agent, StateSpaceHeads, LearnableNovelty, LearnableNoveltyReward
 from x_jepa.state_heads import StateValue, n_step_returns
 from x_jepa.utils import exists, default, divisible_by
 from x_jepa.x_jepa import Transformer
@@ -173,41 +172,6 @@ class SparsePushT:
         num_saved = min(self.num_envs, max_envs)
         return {name: torch.stack([frame[idx][:num_saved] for frame in self.trace]) for idx, name in enumerate(('agent_pos', 'block_pose', 'won', 'coverage'))}
 
-# trajectory learnable novelty built on x_jepa.intrinsic.LearnableNovelty
-
-class TrajectoryLearnableNovelty:
-    def __init__(self, state_dim, window_horizon, reservoir_dim, reservoir_layers, ridge_penalty, eta, novelty_scale, seed):
-        with torch.random.fork_rng():
-            torch.manual_seed(seed + 101)
-            self.estimator = LearnableNovelty(dim_data = state_dim, mlp_reservoir_dim = reservoir_dim, mlp_reservoir_layers = reservoir_layers, ridge_penalty = ridge_penalty, eta = eta).eval()
-        self.window_horizon, self.novelty_scale = window_horizon, novelty_scale
-        self._batched_score = torch.vmap(self.estimator)
-
-    def _window_pairs(self, trajectory):
-        windows = trajectory.unfold(-2, self.window_horizon + 1, 1)
-        return windows[..., 0], rearrange(windows[..., 1:], '... d horizon -> ... (horizon d)')
-
-    @torch.no_grad()
-    def score_trajectories(self, trajectories):
-        orig_device = trajectories.device
-        trajectories_cpu = trajectories.detach().cpu().float()
-        if trajectories_cpu.shape[1] <= self.window_horizon + 1:
-            return torch.zeros(trajectories_cpu.shape[0], device = orig_device)
-        scores = self._batched_score(*self._window_pairs(trajectories_cpu))
-        return torch.nan_to_num(scores, nan = 0., posinf = 0., neginf = 0.).to(orig_device)
-
-    @torch.no_grad()
-    def step_increments(self, trajectory):
-        trajectory_cpu = trajectory.detach().cpu().float()
-        num_steps = trajectory_cpu.shape[0] - 1
-        cumulative = torch.zeros(num_steps + 1)
-        for prefix_len in range(self.window_horizon + 2, num_steps + 2):
-            score = self.estimator(*self._window_pairs(trajectory_cpu[:prefix_len]))
-            prev = cumulative[prefix_len - 2].item()
-            cumulative[prefix_len - 1] = torch.nan_to_num(score, nan = prev, posinf = prev, neginf = prev)
-        increments = torch.nan_to_num((cumulative[1:] - cumulative[:-1]) / self.novelty_scale, nan = 0., posinf = 0., neginf = 0.)
-        return increments, float(cumulative[-1])
-
 # decoupled novelty critic heads & episode replay
 
 class NoveltyHeads(nn.Module):
@@ -237,7 +201,7 @@ class EpisodeReplay:
         self.episodes = deque(maxlen = capacity)
         self.seq_len, self.recent_capacity, self.num_successes = seq_len, recent_capacity, 0
 
-    def add_batch(self, experience, final_obs, won_mask, novelty_scorer, gamma):
+    def add_batch(self, experience, final_obs, won_mask, novelty_reward, gamma):
         full_states = torch.cat((experience.states.cpu(), final_obs.cpu()[:, None]), dim = 1)
         actions, episode_lens = experience.actions.cpu(), experience.episode_len.cpu().reshape(-1)
         epiplexities = []
@@ -249,8 +213,8 @@ class EpisodeReplay:
             padded_len = ep_len + 1 + win_pad
 
             real_states = full_states[idx, :ep_len + 1]
-            nov_rewards, epiplexity = novelty_scorer.step_increments(real_states)
-            epiplexities.append(epiplexity)
+            nov_rewards, epiplexity = novelty_reward(real_states[:-1], next_states = real_states[1:], return_epiplexity = True)
+            epiplexities.append(epiplexity.item())
 
             states = torch.zeros(self.seq_len, STATE_DIM)
             states[:ep_len + 1] = real_states
@@ -312,7 +276,7 @@ def build_models(dim, hidden_dim, depth, horizon, ema_beta, gamma, device):
     novelty_heads = NoveltyHeads(dim, STATE_DIM, ACTION_DIM, hidden_dim = hidden_dim, ema_beta = ema_beta).to(device)
     return agent, task_heads, novelty_heads
 
-def make_planner_fitness(task_heads, novelty_heads, env, novelty_scorer, task_weight, novelty_weight, imagined_novelty_weight, gamma, history_len):
+def make_planner_fitness(task_heads, novelty_heads, env, novelty_reward, task_weight, novelty_weight, imagined_novelty_weight, gamma, history_len):
     def fitness(pred_state_latents, state_latents, actions, pred_rewards, pred_discounts, pred_values, discount_factor = None):
         batch_size, pop_size, horizon, _ = pred_state_latents.shape
         device, dtype = pred_state_latents.device, pred_state_latents.dtype
@@ -337,10 +301,7 @@ def make_planner_fitness(task_heads, novelty_heads, env, novelty_scorer, task_we
 
             if imagined_novelty_weight > 0. and len(env.obs_history) > 0:
                 recent_history = torch.stack(env.obs_history[-history_len:], dim = 1).to(device = device, dtype = dtype)
-                imagined_trajs = torch.cat((recent_history.unsqueeze(1).expand(batch_size, pop_size, -1, -1), decoded_states.clamp(-1., 1.)), dim = 2)
-                future_epiplexity = novelty_scorer.score_trajectories(rearrange(imagined_trajs, 'b p t d -> (b p) t d')).reshape(batch_size, pop_size)
-                history_epiplexity = novelty_scorer.score_trajectories(recent_history).unsqueeze(1)
-                novelty_score = novelty_score + imagined_novelty_weight * (future_epiplexity - history_epiplexity) / novelty_scorer.novelty_scale
+                novelty_score = novelty_score + imagined_novelty_weight * novelty_reward.continuation_reward(recent_history, decoded_states.clamp(-1., 1.))
 
             total_score = total_score + novelty_weight * novelty_score
 
@@ -537,7 +498,19 @@ def main(
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-        novelty_scorer = TrajectoryLearnableNovelty(STATE_DIM, window_horizon, reservoir_dim, reservoir_layers, ridge_penalty, eta, novelty_scale, seed)
+        with torch.random.fork_rng():
+            torch.manual_seed(seed + 101)
+            novelty_reward = LearnableNoveltyReward(
+                LearnableNovelty(
+                    dim_data = STATE_DIM,
+                    mlp_reservoir_dim = reservoir_dim,
+                    mlp_reservoir_layers = reservoir_layers,
+                    ridge_penalty = ridge_penalty,
+                    eta = eta
+                ),
+                horizon = window_horizon,
+                scale = novelty_scale
+            )
         agent, task_heads, novelty_heads = build_models(dim, hidden_dim, depth, horizon, ema_beta, gamma, device)
         optimizer = Adam(list(agent.parameters()) + list(task_heads.parameters()) + list(novelty_heads.parameters()), lr = lr)
 
@@ -562,12 +535,12 @@ def main(
             task_heads.eval()
             novelty_heads.eval()
 
-            train_fitness = None if is_warmup else make_planner_fitness(task_heads, novelty_heads, train_env, novelty_scorer, active_task_weight, active_novelty_weight, active_imagined_weight, gamma, history_len)
+            train_fitness = None if is_warmup else make_planner_fitness(task_heads, novelty_heads, train_env, novelty_reward, active_task_weight, active_novelty_weight, active_imagined_weight, gamma, history_len)
             experience = agent.interact_with_environment(train_env, max_steps = max_steps, fitness_fn = train_fitness, action_fn = train_env.sample_correlated_action if is_warmup else None, discount_factor = rollout_discounts, **plan_kwargs)
 
             won_flags = train_env.won.cpu().numpy().copy()
             recent_wins.extend(won_flags.tolist())
-            epiplexities = replay.add_batch(experience, train_env.last_obs, won_flags, novelty_scorer, gamma)
+            epiplexities = replay.add_batch(experience, train_env.last_obs, won_flags, novelty_reward, gamma)
 
             if divisible_by(batch_idx, eval_every) or batch_idx == max_batches:
                 torch.save(train_env.snapshot_trace(max_envs = 4), trace_dir / f'train_b{batch_idx:03d}.pt')
@@ -591,7 +564,7 @@ def main(
                 agent.eval()
                 task_heads.eval()
                 novelty_heads.eval()
-                eval_fitness = make_planner_fitness(task_heads, novelty_heads, eval_env, novelty_scorer, 1., 0., 0., gamma, history_len)
+                eval_fitness = make_planner_fitness(task_heads, novelty_heads, eval_env, novelty_reward, 1., 0., 0., gamma, history_len)
                 with torch.random.fork_rng():
                     torch.manual_seed(seed + 50_000)
                     agent.interact_with_environment(eval_env, max_steps = max_steps, fitness_fn = eval_fitness, discount_factor = eval_discounts, **eval_plan_kwargs)

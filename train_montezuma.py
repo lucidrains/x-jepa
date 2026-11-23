@@ -42,10 +42,10 @@ from accelerate import Accelerator
 import gymnasium as gym
 import ale_py # noqa: F401 - registers ALE envs with gymnasium
 
-from einops import rearrange, repeat, pack, unpack
+from einops import rearrange, pack, unpack
 from torch_einops_utils import tree_map_tensor_to_device
 
-from x_jepa import Agent, LearnableNovelty, rollout_return
+from x_jepa import Agent, LearnableNovelty, LearnableNoveltyReward, rollout_return
 from x_jepa.x_jepa import Transformer, calc_returns
 from x_jepa.utils import store_experience_in_replay_buffer, divisible_by, exists
 
@@ -185,87 +185,9 @@ class CNNEncoder(nn.Module):
         out = self.to_latent(self.conv(x))
         return unpack(out, ps, '* d')[0]
 
-# trajectory learnable novelty
-
-class TrajectoryLearnableNovelty:
-    def __init__(
-        self,
-        dim,
-        window_horizon = 1,
-        reservoir_dim = 32,
-        reservoir_layers = 4,
-        ridge_penalty = 0.03,
-        target_scale = 0.1,
-        eta = 1.,
-        use_loo = True,
-        novelty_scale = 10.,
-        increment_stride = 4,
-        seed = 0
-    ):
-        with torch.random.fork_rng():
-            torch.manual_seed(seed + 101)
-            self.estimator = LearnableNovelty(
-                dim_data = dim,
-                mlp_reservoir_dim = reservoir_dim,
-                mlp_reservoir_layers = reservoir_layers,
-                ridge_penalty = ridge_penalty,
-                target_scale = target_scale,
-                eta = eta,
-                use_loo = use_loo
-            ).eval()
-
-        self.window_horizon = window_horizon
-        self.novelty_scale = novelty_scale
-        self.increment_stride = increment_stride
-        self._batched_score = torch.vmap(self.estimator)
-
-    def _window_pairs(self, trajectory):
-        windows = trajectory.unfold(-2, self.window_horizon + 1, 1)
-        return windows[..., 0], rearrange(windows[..., 1:], '... d h -> ... (h d)')
-
-    @torch.no_grad()
-    def score_trajectories(self, trajectories):
-        orig_device = trajectories.device
-        trajs_cpu = trajectories.detach().cpu().float()
-
-        if trajs_cpu.shape[1] <= self.window_horizon + 1:
-            return torch.zeros(trajs_cpu.shape[0], device = orig_device)
-
-        scores = self._batched_score(*self._window_pairs(trajs_cpu)).clamp(min = 0.)
-        return torch.nan_to_num(scores, nan = 0., posinf = 0., neginf = 0.).to(orig_device)
-
-    @torch.no_grad()
-    def step_increments(self, latents, episode_lens):
-        batch_size, max_steps, _ = latents.shape
-        bonuses = torch.zeros(batch_size, max_steps)
-        epiplexities = []
-        min_prefix = self.window_horizon + 2
-
-        for i in range(batch_size):
-            ep_len = min(int(episode_lens[i]), max_steps)
-            traj = latents[i, :ep_len].detach().cpu().float()
-
-            if ep_len < min_prefix:
-                epiplexities.append(0.)
-                continue
-
-            eval_ends = list(range(min_prefix, ep_len, self.increment_stride)) + [ep_len]
-            prev_end, prev_score = 0, 0.
-
-            for end in eval_ends:
-                score = float(self.estimator(*self._window_pairs(traj[:end])).clamp(min = 0.))
-                score = score if np.isfinite(score) else prev_score
-                delta = (score - prev_score) / self.novelty_scale
-                bonuses[i, prev_end:end] = delta / max(end - prev_end, 1)
-                prev_end, prev_score = end, score
-
-            epiplexities.append(prev_score)
-
-        return bonuses, float(np.mean(epiplexities))
-
 # planning fitness
 
-def make_fitness(gamma = 0.99, novelty_scorer = None, imagined_novelty_weight = 0.25, history_len = 32):
+def make_fitness(gamma = 0.99, novelty_reward = None, imagined_novelty_weight = 0.25, history_len = 32):
     latent_history = deque(maxlen = history_len)
 
     def reset_history():
@@ -280,21 +202,14 @@ def make_fitness(gamma = 0.99, novelty_scorer = None, imagined_novelty_weight = 
             termination_threshold = 0.5
         )
 
-        if exists(novelty_scorer) and imagined_novelty_weight > 0.:
+        if exists(novelty_reward) and imagined_novelty_weight > 0.:
             curr = state_latents[:, 0].detach()
             if len(latent_history) == 0 or not torch.equal(latent_history[-1], curr):
                 latent_history.append(curr)
 
             if len(latent_history) >= 2:
                 history = torch.stack(list(latent_history), dim = 1)
-                batch_size, pop_size = pred_state_latents.shape[:2]
-                imagined = cat((repeat(history, 'b t d -> b p t d', p = pop_size), pred_state_latents), dim = 2)
-
-                future_epx = novelty_scorer.score_trajectories(rearrange(imagined, 'b p t d -> (b p) t d'))
-                future_epx = rearrange(future_epx, '(b p) -> b p', b = batch_size)
-                history_epx = rearrange(novelty_scorer.score_trajectories(history), 'b -> b 1')
-
-                score = score + imagined_novelty_weight * (future_epx - history_epx) / novelty_scorer.novelty_scale
+                score = score + imagined_novelty_weight * novelty_reward.continuation_reward(history, pred_state_latents)
 
         return score
 
@@ -471,23 +386,28 @@ def main(
 
     optimizer = Adam(wm.parameters(), lr = lr)
 
-    novelty_scorer = TrajectoryLearnableNovelty(
-        dim = dim,
-        window_horizon = window_horizon,
-        reservoir_dim = reservoir_dim,
-        reservoir_layers = reservoir_layers,
-        ridge_penalty = ridge_penalty,
-        target_scale = target_scale,
-        eta = eta,
-        use_loo = use_loo,
-        novelty_scale = novelty_scale,
-        increment_stride = increment_stride,
-        seed = seed
-    ) if use_intrinsic else None
+    novelty_reward = None
+    if use_intrinsic:
+        with torch.random.fork_rng():
+            torch.manual_seed(seed + 101)
+            novelty_reward = LearnableNoveltyReward(
+                LearnableNovelty(
+                    dim_data = dim,
+                    mlp_reservoir_dim = reservoir_dim,
+                    mlp_reservoir_layers = reservoir_layers,
+                    ridge_penalty = ridge_penalty,
+                    target_scale = target_scale,
+                    eta = eta,
+                    use_loo = use_loo
+                ),
+                horizon = window_horizon,
+                scale = novelty_scale,
+                stride = increment_stride
+            )
 
     fitness_fn, reset_history = make_fitness(
         gamma = gamma,
-        novelty_scorer = novelty_scorer,
+        novelty_reward = novelty_reward,
         imagined_novelty_weight = imagined_novelty_weight,
         history_len = history_len
     )
@@ -534,9 +454,10 @@ def main(
             base_rewards = experience.rewards.to(device)
             rewards = base_rewards.clone()
 
-            if exists(novelty_scorer):
-                bonus, epiplexity = novelty_scorer.step_increments(experience.state_latents, episode_lens)
+            if exists(novelty_reward):
+                bonus, epiplexities = novelty_reward(experience.state_latents, lens = episode_lens, return_epiplexity = True)
                 rewards = rewards + bonus.to(device) * intrinsic_reward_scale
+                epiplexity = epiplexities.mean().item()
                 mean_bonus = bonus.mean().item()
             else:
                 epiplexity = mean_bonus = 0.

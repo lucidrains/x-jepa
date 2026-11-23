@@ -1,6 +1,6 @@
 [project]
 name = "x-jepa"
-version = "0.2.6"
+version = "0.2.7"
 description = "Explorations into JEPA"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -30,12 +30,13 @@ dependencies = [
     "einx>=0.3.0",
     "ema-pytorch>=0.8.3",
     "env-ssl-wrapper>=0.6.3",
+    "hl-gauss-pytorch>=0.2.2",
     "log-depth-recurrent-modeling>=0.1.5",
     "loguru",
     "memmap-replay-buffer>=0.1.10",
     "PoPE-pytorch",
     "torch>=2.4",
-    "torch-einops-utils>=0.1.11",
+    "torch-einops-utils>=0.2.0",
     "x-mlps-pytorch"
 ]
 

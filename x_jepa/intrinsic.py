@@ -10,7 +10,9 @@ import torch.nn.functional as F
 from torch.nn import Module, Linear, LayerNorm, Sequential
 from torch.linalg import qr, solve_triangular, svdvals
 
-from torch_einops_utils import z_score
+from torch_einops_utils import z_score, pack_with_inverse
+from torch_einops_utils.device import module_device
+from torch_einops_utils.shape import shape, size, assert_shape
 
 import einx
 from einops import rearrange, repeat
@@ -21,6 +23,9 @@ from x_mlps_pytorch import MLP
 
 def exists(val):
     return val is not None
+
+def default(val, d):
+    return val if exists(val) else d
 
 def divisible_by(num, den):
     return (num % den) == 0
@@ -147,6 +152,182 @@ class LearnableNovelty(Module):
 
             W = solve_triangular(R, rhs, upper = True)
             return logdet_epiplexity(W, eta)
+
+# trajectory reward wrapper for LearnableNovelty
+# forms per-step intrinsic rewards as marginal epiplexity gain over growing prefixes
+
+def window_pairs(states, horizon = 1):
+    windows = states.unfold(-2, horizon + 1, 1)
+    return windows[..., 0], rearrange(windows[..., 1:], '... dim horizon -> ... (horizon dim)')
+
+def episode_spans(length, dones = None):
+    if length <= 0:
+        return []
+
+    if not exists(dones):
+        return [(0, length)]
+
+    ends = (torch.where(dones[:length])[0] + 1).tolist()
+    if not ends or ends[-1] < length:
+        ends.append(length)
+
+    return list(zip([0, *ends[:-1]], ends))
+
+class LearnableNoveltyReward(Module):
+    def __init__(
+        self,
+        novelty: LearnableNovelty,
+        *,
+        horizon = 1,
+        scale = 1.,
+        stride = 1,
+        max_window: int | None = None,
+        clamp_min: float | None = 0.,
+        z_score_eps = 1e-6
+    ):
+        super().__init__()
+        assert horizon >= 1 and stride >= 1 and scale > 0.
+
+        self.novelty = novelty
+        self.novelty.eval()
+
+        self.horizon = horizon
+        self.scale = scale
+        self.stride = stride
+        self.max_window = max_window
+        self.clamp_min = clamp_min
+        self.z_score_eps = z_score_eps
+
+        assert not exists(max_window) or max_window >= self.min_len
+
+        self._batched_score = torch.vmap(self._score_single)
+
+    @property
+    def min_len(self):
+        return self.horizon + 2
+
+    @property
+    def device(self):
+        return default(module_device(self.novelty), torch.device('cpu'))
+
+    def _score_single(self, data, targets):
+        return self.novelty(data, targets, z_score_eps = self.z_score_eps)
+
+    @torch.no_grad()
+    def score(self, trajectories):
+        orig_device = trajectories.device
+
+        if size(trajectories, '... [time] dim') < self.min_len:
+            batch_shape = tuple(shape(trajectories, '[...] time dim'))
+            return trajectories.new_zeros(batch_shape, dtype = torch.float32)
+
+        packed, inverse_pack = pack_with_inverse(trajectories.detach().to(self.device, torch.float32), '* time dim')
+        data, targets = window_pairs(packed, self.horizon)
+
+        if size(packed, '[batch] time dim') == 1:
+            scores = rearrange(self._score_single(data[0], targets[0]), '-> 1')
+        else:
+            scores = self._batched_score(data, targets)
+
+        if exists(self.clamp_min):
+            scores = scores.clamp(min = self.clamp_min)
+
+        scores = torch.nan_to_num(scores, nan = 0., posinf = 0., neginf = 0.)
+        return inverse_pack(scores, '*').to(orig_device)
+
+    @torch.no_grad()
+    def continuation_reward(self, history, future):
+        history_batch = tuple(shape(history, '[...] time dim'))
+        future_batch = tuple(shape(future, '[...] time dim'))
+        assert future_batch[:len(history_batch)] == history_batch
+
+        if exists(self.max_window):
+            history = history[..., -self.max_window:, :]
+
+        base_score = self.score(history)
+
+        for extra_size in future_batch[len(history_batch):]:
+            history = repeat(history, '... time dim -> ... extra time dim', extra = extra_size)
+            base_score = rearrange(base_score, '... -> ... 1')
+
+        combined = cat((history, future), dim = -2)
+        return (self.score(combined) - base_score) / self.scale
+
+    def _segment_rewards(self, trajectory):
+        num_states = size(trajectory, '[time] dim')
+        num_steps = num_states - 1
+        rewards = trajectory.new_zeros(num_steps)
+
+        if num_states < self.min_len:
+            return rewards, 0.
+
+        first = min(self.horizon + self.stride, num_steps)
+        eval_steps = [*range(first, num_steps, self.stride), num_steps]
+        prev_step, prev_score = self.horizon, 0.
+
+        for step in eval_steps:
+            left = max(0, prev_step + 1 - self.max_window) if exists(self.max_window) else 0
+            before = prev_score if left == 0 else self.score(trajectory[left : prev_step + 1]).item()
+            after = self.score(trajectory[left : step + 1]).item()
+
+            rewards[prev_step:step] = (after - before) / (self.scale * (step - prev_step))
+            prev_step, prev_score = step, after
+
+        return rewards, prev_score
+
+    @torch.no_grad()
+    def forward(
+        self,
+        states,
+        next_states = None,
+        *,
+        lens = None,
+        dones = None,
+        return_epiplexity = False
+    ):
+        orig_device = states.device
+        has_next = exists(next_states)
+        offset = 0 if has_next else 1
+
+        states, inverse_pack = pack_with_inverse(states.detach().to(self.device, torch.float32), '* time dim')
+        batch, max_steps = shape(states, '[batch time] dim')
+
+        if has_next:
+            next_states, _ = pack_with_inverse(next_states.detach().to(self.device, torch.float32), '* time dim')
+            assert_shape([(states, 'batch time dim'), (next_states, 'batch time dim')])
+
+        lens = rearrange(torch.as_tensor(lens), '... -> (...)').clamp(0, max_steps).tolist() if exists(lens) else [max_steps] * batch
+        assert len(lens) == batch
+
+        if exists(dones):
+            dones, _ = pack_with_inverse(torch.as_tensor(dones, dtype = torch.bool, device = 'cpu'), '* time')
+            assert_shape([(states, 'batch time dim'), (dones, 'batch time')])
+
+        rewards = states.new_zeros(batch, max_steps)
+        epiplexities = states.new_zeros(batch)
+
+        for batch_index, episode_len in enumerate(lens):
+            row_dones = dones[batch_index] if exists(dones) else None
+            segment_epiplexities = []
+
+            for start, end in episode_spans(episode_len, row_dones):
+                trajectory = states[batch_index, start:end]
+                if has_next:
+                    trajectory = cat((trajectory, next_states[batch_index, end - 1 : end]))
+
+                segment_rewards, segment_epiplexity = self._segment_rewards(trajectory)
+                rewards[batch_index, start + offset : end] = segment_rewards
+                segment_epiplexities.append(segment_epiplexity)
+
+            if segment_epiplexities:
+                epiplexities[batch_index] = sum(segment_epiplexities) / len(segment_epiplexities)
+
+        rewards = inverse_pack(rewards, '* time').to(orig_device)
+
+        if not return_epiplexity:
+            return rewards
+
+        return rewards, inverse_pack(epiplexities, '*').to(orig_device)
 
 # Sam Lobel et al. https://arxiv.org/abs/2306.03186
 # learns f(s) predicting a rademacher vector c(s) such that ||f(s)|| ~ 1/sqrt(N(s)),
